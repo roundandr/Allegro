@@ -1,0 +1,639 @@
+// ============================================================================
+// File Name   : fp8_dot_prod.sv
+// Author      : Codex
+// Date        : 2026-04-22
+// Description : 32-element FP8 dot-product with FP32 accumulate. The datapath
+//               follows the 5-stage FDA pipeline defined in doc/FP8_DotProd.md.
+//
+// Revision History:
+//   Date        Version   Author      Description
+//   ----------  --------  ----------  ----------------------------------------
+//   2026-04-22  v0.1      Codex       Initial version
+// ============================================================================
+
+module fp8_dot_prod (
+    input  logic         clk,
+    input  logic         rst_n,
+    input  logic         in_vld_i,
+    output logic         in_rdy_o,
+    input  logic [255:0] a_vec_i,
+    input  logic [255:0] b_vec_i,
+    input  logic [31:0]  c_i,
+    input  logic         fp8_format_i,
+    output logic         out_vld_o,
+    input  logic         out_rdy_i,
+    output logic [31:0]  d_o
+);
+
+    localparam int FP8_W            = 8;
+    localparam int NUM_ELEMS        = 32;
+    localparam int FP8_SIG_W        = 4;
+    localparam int PROD_SIG_W       = 8;
+    localparam int C_SIG_W          = 24;
+    localparam int EXP_W            = 9;
+    localparam int ALIGN_FRAC_BITS  = 25;
+    localparam int ALIGN_W          = 28;
+    localparam int SUM_W            = 33;
+    localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = ALIGN_FRAC_BITS;
+    localparam logic signed [EXP_W-1:0] PROD_SIG_FRAC_BITS_EXP = 9'sd6;
+
+    typedef struct packed {
+        logic                      sign;
+        logic [FP8_SIG_W-1:0]      sig;
+        logic signed [EXP_W-1:0]   exp;
+        logic                      is_zero;
+        logic                      is_inf;
+        logic                      is_nan;
+    } fp8_dec_t;
+
+    typedef struct packed {
+        logic                      sign;
+        logic [C_SIG_W-1:0]        sig;
+        logic signed [EXP_W-1:0]   exp;
+        logic                      is_zero;
+        logic                      is_inf;
+        logic                      is_nan;
+    } fp32_dec_t;
+
+    typedef struct packed {
+        logic                           special_vld;
+        logic [31:0]                    special_result;
+        logic [NUM_ELEMS-1:0]           prod_sign_flat;
+        logic [NUM_ELEMS*PROD_SIG_W-1:0] prod_sig_flat;
+        logic [NUM_ELEMS*EXP_W-1:0]     prod_exp_flat;
+        logic [NUM_ELEMS-1:0]           prod_zero_flat;
+        logic                           c_sign;
+        logic [C_SIG_W-1:0]             c_sig;
+        logic signed [EXP_W-1:0]        c_exp;
+        logic                           c_zero;
+    } stage0_data_t;
+
+    typedef struct packed {
+        logic                           special_vld;
+        logic [31:0]                    special_result;
+        logic [NUM_ELEMS-1:0]           prod_sign_flat;
+        logic [NUM_ELEMS*PROD_SIG_W-1:0] prod_sig_flat;
+        logic [NUM_ELEMS*EXP_W-1:0]     prod_exp_flat;
+        logic [NUM_ELEMS-1:0]           prod_zero_flat;
+        logic                           c_sign;
+        logic [C_SIG_W-1:0]             c_sig;
+        logic signed [EXP_W-1:0]        c_exp;
+        logic                           c_zero;
+        logic signed [EXP_W-1:0]        emax;
+        logic                           emax_vld;
+    } stage1_data_t;
+
+    typedef struct packed {
+        logic                           special_vld;
+        logic [31:0]                    special_result;
+        logic [NUM_ELEMS*ALIGN_W-1:0]   aligned_prod_flat;
+        logic signed [ALIGN_W-1:0]      c_aligned;
+        logic signed [EXP_W-1:0]        base_exp;
+    } stage2_data_t;
+
+    typedef struct packed {
+        logic                           special_vld;
+        logic [31:0]                    special_result;
+        logic signed [SUM_W-1:0]        sum;
+        logic signed [EXP_W-1:0]        base_exp;
+    } stage3_data_t;
+
+    typedef struct packed {
+        logic [31:0] result;
+    } stage4_data_t;
+
+    stage0_data_t s0_d;
+    stage1_data_t s1_d;
+    stage2_data_t s2_d;
+    stage3_data_t s3_d;
+    stage4_data_t s4_d;
+
+    stage0_data_t s0_q;
+    stage1_data_t s1_q;
+    stage2_data_t s2_q;
+    stage3_data_t s3_q;
+    stage4_data_t s4_q;
+
+    logic s0_vld_q;
+    logic s1_vld_q;
+    logic s2_vld_q;
+    logic s3_vld_q;
+    logic s4_vld_q;
+
+    logic s1_rdy;
+    logic s2_rdy;
+    logic s3_rdy;
+    logic s4_rdy;
+
+    logic [NUM_ELEMS-1:0]            s0_prod_sign_flat_tmp;
+    logic [NUM_ELEMS*PROD_SIG_W-1:0] s0_prod_sig_flat_tmp;
+    logic [NUM_ELEMS*EXP_W-1:0]      s0_prod_exp_flat_tmp;
+    logic [NUM_ELEMS-1:0]            s0_prod_zero_flat_tmp;
+
+    logic [NUM_ELEMS-1:0]            s0_prod_sign_flat_hold;
+    logic [NUM_ELEMS*PROD_SIG_W-1:0] s0_prod_sig_flat_hold;
+    logic [NUM_ELEMS*EXP_W-1:0]      s0_prod_exp_flat_hold;
+    logic [NUM_ELEMS-1:0]            s0_prod_zero_flat_hold;
+
+    logic [NUM_ELEMS-1:0]            s1_prod_sign_flat_hold;
+    logic [NUM_ELEMS*PROD_SIG_W-1:0] s1_prod_sig_flat_hold;
+    logic [NUM_ELEMS*EXP_W-1:0]      s1_prod_exp_flat_hold;
+    logic [NUM_ELEMS-1:0]            s1_prod_zero_flat_hold;
+
+    logic [NUM_ELEMS*ALIGN_W-1:0]    s2_aligned_prod_flat_tmp;
+    logic [NUM_ELEMS*ALIGN_W-1:0]    s2_aligned_prod_flat_hold;
+
+    assign s0_prod_sign_flat_hold = s0_q.prod_sign_flat;
+    assign s0_prod_sig_flat_hold  = s0_q.prod_sig_flat;
+    assign s0_prod_exp_flat_hold  = s0_q.prod_exp_flat;
+    assign s0_prod_zero_flat_hold = s0_q.prod_zero_flat;
+    assign s1_prod_sign_flat_hold = s1_q.prod_sign_flat;
+    assign s1_prod_sig_flat_hold  = s1_q.prod_sig_flat;
+    assign s1_prod_exp_flat_hold  = s1_q.prod_exp_flat;
+    assign s1_prod_zero_flat_hold = s1_q.prod_zero_flat;
+    assign s2_aligned_prod_flat_hold = s2_q.aligned_prod_flat;
+
+    function automatic fp8_dec_t decode_fp8(
+        input logic [FP8_W-1:0] fp8_i,
+        input logic             fp8_format_i
+    );
+        fp8_dec_t dec;
+        logic [4:0] exp_raw;
+        logic [2:0] mant_raw;
+        begin
+            dec      = '0;
+            dec.sign = fp8_i[7];
+
+            if (!fp8_format_i) begin
+                exp_raw  = {1'b0, fp8_i[6:3]};
+                mant_raw = fp8_i[2:0];
+
+                dec.is_zero = (fp8_i[6:3] == 4'b0000) && (mant_raw == 3'b000);
+                dec.is_inf  = 1'b0;
+                dec.is_nan  = (fp8_i[6:3] == 4'b1111) && (mant_raw == 3'b111);
+
+                if (dec.is_zero || dec.is_nan) begin
+                    dec.sig = '0;
+                    dec.exp = '0;
+                end else if (fp8_i[6:3] == 4'b0000) begin
+                    dec.sig = {1'b0, mant_raw};
+                    dec.exp = -9'sd9;
+                end else begin
+                    dec.sig = {1'b1, mant_raw};
+                    dec.exp = $signed({5'd0, fp8_i[6:3]}) - 9'sd10;
+                end
+            end else begin
+                exp_raw  = fp8_i[6:2];
+                mant_raw = {1'b0, fp8_i[1:0]};
+
+                dec.is_zero = (fp8_i[6:2] == 5'b00000) && (fp8_i[1:0] == 2'b00);
+                dec.is_inf  = (fp8_i[6:2] == 5'b11111) && (fp8_i[1:0] == 2'b00);
+                dec.is_nan  = (fp8_i[6:2] == 5'b11111) && (fp8_i[1:0] != 2'b00);
+
+                if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                    dec.sig = '0;
+                    dec.exp = '0;
+                end else if (fp8_i[6:2] == 5'b00000) begin
+                    dec.sig = {1'b0, fp8_i[1:0], 1'b0};
+                    dec.exp = -9'sd17;
+                end else begin
+                    dec.sig = {1'b1, fp8_i[1:0], 1'b0};
+                    dec.exp = $signed({4'd0, fp8_i[6:2]}) - 9'sd18;
+                end
+            end
+
+            return dec;
+        end
+    endfunction
+
+    function automatic fp32_dec_t decode_fp32(
+        input logic [31:0] fp32_i
+    );
+        fp32_dec_t dec;
+        logic [7:0] exp_raw;
+        logic [22:0] frac_raw;
+        begin
+            dec      = '0;
+            dec.sign = fp32_i[31];
+            exp_raw  = fp32_i[30:23];
+            frac_raw = fp32_i[22:0];
+
+            dec.is_zero = (exp_raw == 8'h00) && (frac_raw == 23'h0);
+            dec.is_inf  = (exp_raw == 8'hff) && (frac_raw == 23'h0);
+            dec.is_nan  = (exp_raw == 8'hff) && (frac_raw != 23'h0);
+
+            if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                dec.sig = '0;
+                dec.exp = '0;
+            end else if (exp_raw == 8'h00) begin
+                dec.sig = {1'b0, frac_raw};
+                dec.exp = -9'sd149;
+            end else begin
+                dec.sig = {1'b1, frac_raw};
+                dec.exp = $signed({1'b0, exp_raw}) - 9'sd150;
+            end
+
+            return dec;
+        end
+    endfunction
+
+    function automatic logic signed [ALIGN_W-1:0] align_fixed_rz(
+        input logic signed [ALIGN_W-1:0] term_i,
+        input integer                    shift_i
+    );
+        logic term_sign;
+        logic [ALIGN_W-1:0] term_mag;
+        logic [ALIGN_W-1:0] term_mag_shift;
+        logic signed [ALIGN_W-1:0] aligned_val;
+        begin
+            term_sign = term_i[ALIGN_W-1];
+            if (term_sign) begin
+                term_mag = -term_i;
+            end else begin
+                term_mag = term_i;
+            end
+
+            if (shift_i >= 0) begin
+                if (shift_i >= ALIGN_W) begin
+                    term_mag_shift = '0;
+                end else begin
+                    term_mag_shift = term_mag << shift_i;
+                end
+            end else begin
+                if ((-shift_i) >= ALIGN_W) begin
+                    term_mag_shift = '0;
+                end else begin
+                    term_mag_shift = term_mag >> (-shift_i);
+                end
+            end
+
+            aligned_val = $signed(term_mag_shift);
+            align_fixed_rz = term_sign ? -aligned_val : aligned_val;
+        end
+    endfunction
+
+    function automatic logic [31:0] pack_fp32_rz(
+        input logic signed [SUM_W-1:0] sum_i,
+        input logic signed [EXP_W-1:0] base_exp_i
+    );
+        logic             sign_bit;
+        logic [SUM_W-1:0] abs_sum;
+        logic [63:0]      mag64;
+        logic [63:0]      sig64;
+        logic [23:0]      sig24;
+        logic [22:0]      frac_field;
+        logic [7:0]       exp_field;
+        integer           msb_idx;
+        integer           unbiased_exp;
+        integer           shift_sub;
+        integer           idx;
+        begin
+            sign_bit = sum_i[SUM_W-1];
+
+            if (sum_i == '0) begin
+                pack_fp32_rz = 32'h0000_0000;
+            end else begin
+                if (sign_bit) begin
+                    abs_sum = -sum_i;
+                end else begin
+                    abs_sum = sum_i;
+                end
+                mag64 = {{(64-SUM_W){1'b0}}, abs_sum};
+
+                msb_idx = 0;
+                for (idx = SUM_W-1; idx >= 0; idx = idx - 1) begin
+                    if (mag64[idx]) begin
+                        msb_idx = idx;
+                        idx = -1;
+                    end
+                end
+
+                unbiased_exp = $signed({{(32-EXP_W){base_exp_i[EXP_W-1]}}, base_exp_i}) + msb_idx;
+
+                if (msb_idx >= 23) begin
+                    sig64 = mag64 >> (msb_idx - 23);
+                end else begin
+                    sig64 = mag64 << (23 - msb_idx);
+                end
+
+                sig24 = sig64[23:0];
+
+                if (unbiased_exp > 127) begin
+                    exp_field  = 8'hff;
+                    frac_field = 23'h0;
+                end else if (unbiased_exp >= -126) begin
+                    exp_field  = unbiased_exp + 127;
+                    frac_field = sig24[22:0];
+                end else if (unbiased_exp < -149) begin
+                    exp_field  = 8'h00;
+                    frac_field = 23'h0;
+                end else begin
+                    shift_sub  = -126 - unbiased_exp;
+                    sig24      = sig24 >> shift_sub;
+                    exp_field  = 8'h00;
+                    frac_field = sig24[22:0];
+                end
+
+                pack_fp32_rz = {sign_bit, exp_field, frac_field};
+            end
+        end
+    endfunction
+
+    function automatic logic signed [EXP_W-1:0] fp32_effective_exp(
+        input logic [C_SIG_W-1:0]      sig_i,
+        input logic signed [EXP_W-1:0] exp_i
+    );
+        integer idx;
+        begin
+            fp32_effective_exp = '0;
+            if (sig_i != '0) begin
+                idx = 0;
+                for (idx = C_SIG_W-1; idx >= 0; idx = idx - 1) begin
+                    if (sig_i[idx]) begin
+                        fp32_effective_exp = exp_i + idx;
+                        idx = -1;
+                    end
+                end
+            end
+        end
+    endfunction
+
+    integer idx0;
+    fp8_dec_t a_dec_tmp;
+    fp8_dec_t b_dec_tmp;
+    fp32_dec_t c_dec_tmp;
+    logic any_nan_tmp;
+    logic has_pos_inf_tmp;
+    logic has_neg_inf_tmp;
+    logic has_zero_mul_inf_tmp;
+    logic lane_has_inf_tmp;
+    logic lane_prod_sign_tmp;
+
+    always @(*) begin
+        s0_d = '0;
+        s0_prod_sign_flat_tmp = '0;
+        s0_prod_sig_flat_tmp  = '0;
+        s0_prod_exp_flat_tmp  = '0;
+        s0_prod_zero_flat_tmp = '0;
+
+        c_dec_tmp            = decode_fp32(c_i);
+        any_nan_tmp          = c_dec_tmp.is_nan;
+        has_pos_inf_tmp      = c_dec_tmp.is_inf && !c_dec_tmp.sign;
+        has_neg_inf_tmp      = c_dec_tmp.is_inf && c_dec_tmp.sign;
+        has_zero_mul_inf_tmp = 1'b0;
+
+        s0_d.c_sign = c_dec_tmp.sign;
+        s0_d.c_sig  = c_dec_tmp.sig;
+        s0_d.c_exp  = c_dec_tmp.exp;
+        s0_d.c_zero = c_dec_tmp.is_zero;
+
+        for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
+            a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
+            b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
+
+            lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
+            lane_has_inf_tmp   = ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
+                                  (b_dec_tmp.is_inf && !a_dec_tmp.is_zero && !a_dec_tmp.is_nan));
+
+            any_nan_tmp = any_nan_tmp | a_dec_tmp.is_nan | b_dec_tmp.is_nan;
+            has_zero_mul_inf_tmp = has_zero_mul_inf_tmp |
+                                   ((a_dec_tmp.is_zero && b_dec_tmp.is_inf) ||
+                                    (a_dec_tmp.is_inf && b_dec_tmp.is_zero));
+
+            if (lane_has_inf_tmp) begin
+                if (lane_prod_sign_tmp) begin
+                    has_neg_inf_tmp = 1'b1;
+                end else begin
+                    has_pos_inf_tmp = 1'b1;
+                end
+            end
+
+            if (a_dec_tmp.is_nan || b_dec_tmp.is_nan || a_dec_tmp.is_inf || b_dec_tmp.is_inf) begin
+                s0_prod_sign_flat_tmp[idx0] = 1'b0;
+                s0_prod_sig_flat_tmp[idx0*PROD_SIG_W +: PROD_SIG_W] = '0;
+                s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = '0;
+                s0_prod_zero_flat_tmp[idx0] = 1'b1;
+            end else begin
+                s0_prod_sign_flat_tmp[idx0] = lane_prod_sign_tmp;
+                s0_prod_sig_flat_tmp[idx0*PROD_SIG_W +: PROD_SIG_W] = a_dec_tmp.sig * b_dec_tmp.sig;
+                s0_prod_zero_flat_tmp[idx0] = a_dec_tmp.is_zero || b_dec_tmp.is_zero;
+
+                if (a_dec_tmp.is_zero || b_dec_tmp.is_zero) begin
+                    s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = '0;
+                end else begin
+                    s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = a_dec_tmp.exp + b_dec_tmp.exp;
+                end
+            end
+        end
+
+        s0_d.prod_sign_flat = s0_prod_sign_flat_tmp;
+        s0_d.prod_sig_flat  = s0_prod_sig_flat_tmp;
+        s0_d.prod_exp_flat  = s0_prod_exp_flat_tmp;
+        s0_d.prod_zero_flat = s0_prod_zero_flat_tmp;
+
+        if (any_nan_tmp || has_zero_mul_inf_tmp || (has_pos_inf_tmp && has_neg_inf_tmp)) begin
+            s0_d.special_vld    = 1'b1;
+            s0_d.special_result = 32'h7fff_ffff;
+        end else if (has_pos_inf_tmp) begin
+            s0_d.special_vld    = 1'b1;
+            s0_d.special_result = 32'h7f80_0000;
+        end else if (has_neg_inf_tmp) begin
+            s0_d.special_vld    = 1'b1;
+            s0_d.special_result = 32'hff80_0000;
+        end else begin
+            s0_d.special_vld    = 1'b0;
+            s0_d.special_result = 32'h0000_0000;
+        end
+    end
+
+    integer idx1;
+    logic signed [EXP_W-1:0] prod_exp_s1_tmp;
+    logic signed [EXP_W-1:0] term_eff_exp_tmp;
+    logic signed [EXP_W-1:0] emax_tmp;
+    logic                    emax_vld_tmp;
+
+    always @(*) begin
+        s1_d = '0;
+        s1_d.special_vld    = s0_q.special_vld;
+        s1_d.special_result = s0_q.special_result;
+        s1_d.prod_sign_flat = s0_q.prod_sign_flat;
+        s1_d.prod_sig_flat  = s0_q.prod_sig_flat;
+        s1_d.prod_exp_flat  = s0_q.prod_exp_flat;
+        s1_d.prod_zero_flat = s0_q.prod_zero_flat;
+        s1_d.c_sign         = s0_q.c_sign;
+        s1_d.c_sig          = s0_q.c_sig;
+        s1_d.c_exp          = s0_q.c_exp;
+        s1_d.c_zero         = s0_q.c_zero;
+
+        emax_tmp     = '0;
+        emax_vld_tmp = 1'b0;
+
+        if (!s0_q.c_zero) begin
+            emax_tmp     = fp32_effective_exp(s0_q.c_sig, s0_q.c_exp);
+            emax_vld_tmp = 1'b1;
+        end
+
+        for (idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
+            if (!s0_prod_zero_flat_hold[idx1]) begin
+                prod_exp_s1_tmp = $signed(s0_prod_exp_flat_hold[idx1*EXP_W +: EXP_W]);
+                term_eff_exp_tmp = prod_exp_s1_tmp + PROD_SIG_FRAC_BITS_EXP;
+                if (!emax_vld_tmp || (term_eff_exp_tmp > emax_tmp)) begin
+                    emax_tmp     = term_eff_exp_tmp;
+                    emax_vld_tmp = 1'b1;
+                end
+            end
+        end
+
+        s1_d.emax     = emax_tmp;
+        s1_d.emax_vld = emax_vld_tmp;
+    end
+
+    integer idx2;
+    logic signed [ALIGN_W-1:0] prod_term_ext_tmp;
+    logic signed [ALIGN_W-1:0] c_term_ext_tmp;
+    logic signed [EXP_W-1:0]   prod_exp_s2_tmp;
+    integer                    shift_tmp;
+
+    always @(*) begin
+        s2_d = '0;
+        s2_aligned_prod_flat_tmp = '0;
+        s2_d.special_vld    = s1_q.special_vld;
+        s2_d.special_result = s1_q.special_result;
+
+        if (s1_q.emax_vld) begin
+            s2_d.base_exp = s1_q.emax - ALIGN_FRAC_BITS_EXP;
+
+            for (idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
+                if (!s1_prod_zero_flat_hold[idx2]) begin
+                    prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
+                    prod_term_ext_tmp = $signed({{(ALIGN_W-PROD_SIG_W){1'b0}},
+                                                  s1_prod_sig_flat_hold[idx2*PROD_SIG_W +: PROD_SIG_W]});
+                    if (s1_prod_sign_flat_hold[idx2]) begin
+                        prod_term_ext_tmp = -prod_term_ext_tmp;
+                    end
+
+                    shift_tmp = ALIGN_FRAC_BITS
+                              + $signed({{(32-EXP_W){prod_exp_s2_tmp[EXP_W-1]}}, prod_exp_s2_tmp})
+                              - $signed({{(32-EXP_W){s1_q.emax[EXP_W-1]}}, s1_q.emax});
+                    s2_aligned_prod_flat_tmp[idx2*ALIGN_W +: ALIGN_W] =
+                        align_fixed_rz(prod_term_ext_tmp, shift_tmp);
+                end
+            end
+
+            c_term_ext_tmp = $signed({{(ALIGN_W-C_SIG_W){1'b0}}, s1_q.c_sig});
+            if (s1_q.c_sign) begin
+                c_term_ext_tmp = -c_term_ext_tmp;
+            end
+
+            shift_tmp = ALIGN_FRAC_BITS
+                      + $signed({{(32-EXP_W){s1_q.c_exp[EXP_W-1]}}, s1_q.c_exp})
+                      - $signed({{(32-EXP_W){s1_q.emax[EXP_W-1]}}, s1_q.emax});
+            if (s1_q.c_zero) begin
+                s2_d.c_aligned = '0;
+            end else begin
+                s2_d.c_aligned = align_fixed_rz(c_term_ext_tmp, shift_tmp);
+            end
+        end else begin
+            s2_d.base_exp = '0;
+            s2_d.c_aligned = '0;
+        end
+
+        s2_d.aligned_prod_flat = s2_aligned_prod_flat_tmp;
+    end
+
+    integer idx3;
+    logic signed [SUM_W-1:0] sum_acc_tmp;
+
+    always @(*) begin
+        s3_d = '0;
+        s3_d.special_vld    = s2_q.special_vld;
+        s3_d.special_result = s2_q.special_result;
+        s3_d.base_exp       = s2_q.base_exp;
+
+        sum_acc_tmp = $signed({{(SUM_W-ALIGN_W){s2_q.c_aligned[ALIGN_W-1]}}, s2_q.c_aligned});
+        for (idx3 = 0; idx3 < NUM_ELEMS; idx3 = idx3 + 1) begin
+            sum_acc_tmp = sum_acc_tmp
+                        + $signed({{(SUM_W-ALIGN_W){s2_aligned_prod_flat_hold[idx3*ALIGN_W + ALIGN_W-1]}},
+                                   s2_aligned_prod_flat_hold[idx3*ALIGN_W +: ALIGN_W]});
+        end
+        s3_d.sum = sum_acc_tmp;
+    end
+
+    always @(*) begin
+        s4_d = '0;
+        if (s3_q.special_vld) begin
+            s4_d.result = s3_q.special_result;
+        end else begin
+            s4_d.result = pack_fp32_rz(s3_q.sum, s3_q.base_exp);
+        end
+    end
+
+    pipeline_reg #(
+        .W($bits(stage0_data_t))
+    ) u_stage0_reg (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .in_valid (in_vld_i),
+        .in_ready (in_rdy_o),
+        .in_data  (s0_d),
+        .out_valid(s0_vld_q),
+        .out_ready(s1_rdy),
+        .out_data (s0_q)
+    );
+
+    pipeline_reg #(
+        .W($bits(stage1_data_t))
+    ) u_stage1_reg (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .in_valid (s0_vld_q),
+        .in_ready (s1_rdy),
+        .in_data  (s1_d),
+        .out_valid(s1_vld_q),
+        .out_ready(s2_rdy),
+        .out_data (s1_q)
+    );
+
+    pipeline_reg #(
+        .W($bits(stage2_data_t))
+    ) u_stage2_reg (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .in_valid (s1_vld_q),
+        .in_ready (s2_rdy),
+        .in_data  (s2_d),
+        .out_valid(s2_vld_q),
+        .out_ready(s3_rdy),
+        .out_data (s2_q)
+    );
+
+    pipeline_reg #(
+        .W($bits(stage3_data_t))
+    ) u_stage3_reg (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .in_valid (s2_vld_q),
+        .in_ready (s3_rdy),
+        .in_data  (s3_d),
+        .out_valid(s3_vld_q),
+        .out_ready(s4_rdy),
+        .out_data (s3_q)
+    );
+
+    pipeline_reg #(
+        .W($bits(stage4_data_t))
+    ) u_stage4_reg (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .in_valid (s3_vld_q),
+        .in_ready (s4_rdy),
+        .in_data  (s4_d),
+        .out_valid(s4_vld_q),
+        .out_ready(out_rdy_i),
+        .out_data (s4_q)
+    );
+
+    assign out_vld_o = s4_vld_q;
+    assign d_o       = s4_q.result;
+
+endmodule
