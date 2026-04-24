@@ -42,10 +42,15 @@ module fp4_dot_prod (
     localparam int GAMMA_EXP_W    = 6;
     localparam int C_SIG_W        = 24;
     localparam int C_EXP_W        = 9;
-    localparam int ACC_FRAC_BITS  = 35;
-    localparam int ALIGN_W        = C_SIG_W + ACC_FRAC_BITS;
-    localparam int SUM_W          = ALIGN_W + 3;
-    localparam logic signed [C_EXP_W-1:0] ACC_FRAC_BITS_EXP = ACC_FRAC_BITS;
+    localparam int EXP_DIFF_W     = C_EXP_W + 1;
+    // ALIGN_W is the retained fractional precision in the fused accumulator domain.
+    localparam int ALIGN_W        = 29;
+    // Each aligned term is represented as sign + Q1.35 normalized significand.
+    localparam int ALIGN_MAG_W    = ALIGN_W + 1;
+    localparam int ALIGN_TERM_W   = ALIGN_MAG_W + 1;
+    localparam int ALIGN_SHIFT_W  = $clog2(ALIGN_MAG_W + 1);
+    localparam int SUM_W          = ALIGN_TERM_W + 3;
+    localparam logic signed [C_EXP_W-1:0] ALIGN_W_EXP = ALIGN_W;
 
     typedef struct packed {
         logic                    special_valid;
@@ -63,19 +68,19 @@ module fp4_dot_prod (
     typedef struct packed {
         logic                    special_valid;
         logic [31:0]             special_result;
-        logic [NUM_BLOCKS*SIGMA_W-1:0]       sigma_flat;
-        logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] sf_sig_prod_flat;
-        logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  sf_exp_sum_flat;
+        logic [NUM_BLOCKS-1:0]              gamma_sign_flat;
+        logic [NUM_BLOCKS*ALIGN_MAG_W-1:0]  gamma_mag_flat;
+        logic [NUM_BLOCKS*C_EXP_W-1:0]      gamma_exp_flat;
         logic                    c_sign;
-        logic [C_SIG_W-1:0]      c_sig;
+        logic [ALIGN_MAG_W-1:0]  c_mag;
         logic signed [C_EXP_W-1:0] c_exp;
     } stage1_data_t;
 
     typedef struct packed {
         logic                    special_valid;
         logic [31:0]             special_result;
-        logic [NUM_BLOCKS*ALIGN_W-1:0] gamma_aligned_flat;
-        logic signed [ALIGN_W-1:0] c_aligned;
+        logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] gamma_aligned_flat;
+        logic signed [ALIGN_TERM_W-1:0] c_aligned;
         logic signed [C_EXP_W-1:0] emax;
     } stage2_data_t;
 
@@ -126,25 +131,25 @@ module fp4_dot_prod (
     logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_a_sf_exp_flat_hold;
     logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_b_sf_exp_flat_hold;
 
-    logic [NUM_BLOCKS*SIGMA_W-1:0]       s1_sigma_flat_tmp;
-    logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] s1_sf_sig_prod_flat_tmp;
-    logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  s1_sf_exp_sum_flat_tmp;
+    logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_tmp;
+    logic [NUM_BLOCKS*ALIGN_MAG_W-1:0]  s1_gamma_mag_flat_tmp;
+    logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_exp_flat_tmp;
 
-    logic [NUM_BLOCKS*SIGMA_W-1:0]       s1_sigma_flat_hold;
-    logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] s1_sf_sig_prod_flat_hold;
-    logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  s1_sf_exp_sum_flat_hold;
+    logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_hold;
+    logic [NUM_BLOCKS*ALIGN_MAG_W-1:0]  s1_gamma_mag_flat_hold;
+    logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_exp_flat_hold;
 
-    logic [NUM_BLOCKS*ALIGN_W-1:0] s2_gamma_aligned_flat_tmp;
-    logic [NUM_BLOCKS*ALIGN_W-1:0] s2_gamma_aligned_flat_hold;
+    logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_tmp;
+    logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_hold;
 
     assign s0_prod_flat_hold     = s0_q.prod_flat;
     assign s0_a_sf_sig_flat_hold = s0_q.a_sf_sig_flat;
     assign s0_b_sf_sig_flat_hold = s0_q.b_sf_sig_flat;
     assign s0_a_sf_exp_flat_hold = s0_q.a_sf_exp_flat;
     assign s0_b_sf_exp_flat_hold = s0_q.b_sf_exp_flat;
-    assign s1_sigma_flat_hold       = s1_q.sigma_flat;
-    assign s1_sf_sig_prod_flat_hold = s1_q.sf_sig_prod_flat;
-    assign s1_sf_exp_sum_flat_hold  = s1_q.sf_exp_sum_flat;
+    assign s1_gamma_sign_flat_hold = s1_q.gamma_sign_flat;
+    assign s1_gamma_mag_flat_hold  = s1_q.gamma_mag_flat;
+    assign s1_gamma_exp_flat_hold  = s1_q.gamma_exp_flat;
     assign s2_gamma_aligned_flat_hold = s2_q.gamma_aligned_flat;
 
     function automatic logic [3:0] fp4_mag2(input logic [2:0] code_i);
@@ -244,38 +249,60 @@ module fp4_dot_prod (
         end
     endfunction
 
-    function automatic logic signed [ALIGN_W-1:0] align_fixed_rz(
-        input logic signed [ALIGN_W-1:0] term_i,
-        input integer shift_i
-    );
-        logic term_sign;
-        logic [ALIGN_W-1:0] term_mag;
-        logic [ALIGN_W-1:0] term_mag_shift;
-        logic signed [ALIGN_W-1:0] aligned_val;
+    function automatic logic [4:0] msb_index24(input logic [23:0] val_i);
+        integer idx;
         begin
-            term_sign = term_i[ALIGN_W-1];
-            if (term_sign) begin
-                term_mag = -term_i;
-            end else begin
-                term_mag = term_i;
-            end
-
-            if (shift_i >= 0) begin
-                if (shift_i >= ALIGN_W) begin
-                    term_mag_shift = '0;
-                end else begin
-                    term_mag_shift = term_mag << shift_i;
-                end
-            end else begin
-                if ((-shift_i) >= ALIGN_W) begin
-                    term_mag_shift = '0;
-                end else begin
-                    term_mag_shift = term_mag >> (-shift_i);
+            msb_index24 = '0;
+            for (idx = 23; idx >= 0; idx = idx - 1) begin
+                if (val_i[idx]) begin
+                    msb_index24 = idx[4:0];
+                    idx = -1;
                 end
             end
+        end
+    endfunction
 
-            aligned_val = $signed(term_mag_shift);
-            align_fixed_rz = term_sign ? -aligned_val : aligned_val;
+    function automatic logic [4:0] msb_index20(input logic [19:0] val_i);
+        integer idx;
+        begin
+            msb_index20 = '0;
+            for (idx = 19; idx >= 0; idx = idx - 1) begin
+                if (val_i[idx]) begin
+                    msb_index20 = idx[4:0];
+                    idx = -1;
+                end
+            end
+        end
+    endfunction
+
+    function automatic logic signed [ALIGN_TERM_W-1:0] align_fixed_rz(
+        input logic                           term_sign_i,
+        input logic [ALIGN_MAG_W-1:0]         term_mag_i,
+        input logic signed [C_EXP_W-1:0]      term_exp_i,
+        input logic signed [C_EXP_W-1:0]      emax_i
+    );
+        logic [ALIGN_MAG_W-1:0] aligned_mag;
+        logic signed [ALIGN_TERM_W-1:0] aligned_val;
+        logic signed [EXP_DIFF_W-1:0] align_shift;
+        logic [ALIGN_SHIFT_W-1:0] shift_amt;
+        begin
+            if (term_mag_i == '0) begin
+                align_fixed_rz = '0;
+            end else begin
+                // After raw-exponent emax search, alignment itself is only an
+                // RZ right shift to emax.
+                align_shift = $signed({emax_i[C_EXP_W-1], emax_i})
+                            - $signed({term_exp_i[C_EXP_W-1], term_exp_i});
+                if (align_shift >= ALIGN_MAG_W) begin
+                    aligned_mag = '0;
+                end else begin
+                    shift_amt = align_shift[ALIGN_SHIFT_W-1:0];
+                    aligned_mag = term_mag_i >> shift_amt;
+                end
+
+                aligned_val = $signed({1'b0, aligned_mag});
+                align_fixed_rz = term_sign_i ? -aligned_val : aligned_val;
+            end
         end
     endfunction
 
@@ -283,17 +310,17 @@ module fp4_dot_prod (
         input logic signed [SUM_W-1:0] sum_i,
         input logic signed [C_EXP_W-1:0] base_exp_i
     );
-        logic        sign_bit;
+        logic             sign_bit;
         logic [SUM_W-1:0] abs_sum;
-        logic [63:0] mag64;
-        logic [63:0] sig64;
-        logic [23:0] sig24;
-        logic [22:0] frac_field;
-        logic [7:0]  exp_field;
-        integer      msb_idx;
-        integer      unbiased_exp;
-        integer      shift_sub;
-        integer      i;
+        logic [SUM_W-1:0] norm_sum;
+        logic [23:0]      sig24;
+        logic [22:0]      frac_field;
+        logic [7:0]       exp_field;
+        integer           msb_idx;
+        integer           norm_lshift;
+        integer           unbiased_exp;
+        integer           shift_sub;
+        integer           i;
         begin
             sign_bit = sum_i[SUM_W-1];
 
@@ -305,25 +332,19 @@ module fp4_dot_prod (
                 end else begin
                     abs_sum = sum_i;
                 end
-                mag64 = {{(64-SUM_W){1'b0}}, abs_sum};
 
                 msb_idx = 0;
                 for (i = SUM_W-1; i >= 0; i = i - 1) begin
-                    if (mag64[i]) begin
+                    if (abs_sum[i]) begin
                         msb_idx = i;
                         i = -1;
                     end
                 end
 
-                unbiased_exp = $signed({{(32-C_EXP_W){base_exp_i[C_EXP_W-1]}}, base_exp_i}) + msb_idx;
-
-                if (msb_idx >= 23) begin
-                    sig64 = mag64 >> (msb_idx - 23);
-                end else begin
-                    sig64 = mag64 << (23 - msb_idx);
-                end
-
-                sig24 = sig64[23:0];
+                unbiased_exp = base_exp_i + msb_idx;
+                norm_lshift  = (SUM_W - 1) - msb_idx;
+                norm_sum     = abs_sum << norm_lshift;
+                sig24        = norm_sum[SUM_W-1 -: 24];
 
                 if (unbiased_exp > 127) begin
                     exp_field   = 8'hff;
@@ -405,22 +426,39 @@ module fp4_dot_prod (
         end
     end
 
-    logic signed [SIGMA_W-1:0] sigma_tmp;
-    logic signed [15:0] sigma_acc;
-    logic signed [SF_EXP_W-1:0] a_sf_exp_tmp;
-    logic signed [SF_EXP_W-1:0] b_sf_exp_tmp;
-    logic signed [FP4_PROD_W-1:0] prod_s0_tmp;
+    logic signed [SIGMA_W-1:0]      sigma_tmp;
+    logic signed [15:0]             sigma_acc;
+    logic signed [SF_EXP_W-1:0]     a_sf_exp_tmp;
+    logic signed [SF_EXP_W-1:0]     b_sf_exp_tmp;
+    logic signed [FP4_PROD_W-1:0]   prod_s0_tmp;
+    logic [SF_SIG_PROD_W-1:0]       sf_sig_prod_tmp;
+    logic signed [SF_EXP_SUM_W-1:0] sf_exp_sum_tmp_s1;
+    logic signed [GAMMA_SIG_W-1:0]  gamma_sig_tmp_s1;
+    logic signed [C_EXP_W-1:0]      gamma_exp_tmp_s1;
+    logic                           gamma_sign_tmp_s1;
+    logic [GAMMA_SIG_W-1:0]         gamma_abs_tmp_s1;
+    logic [4:0]                     gamma_msb_idx_tmp_s1;
+    logic [4:0]                     c_msb_idx_tmp_s1;
+    logic [ALIGN_MAG_W-1:0]         gamma_mag_tmp_s1;
+    logic [ALIGN_MAG_W-1:0]         c_mag_tmp_s1;
 
     always_comb begin
         s1_d = '0;
-        s1_sigma_flat_tmp       = '0;
-        s1_sf_sig_prod_flat_tmp = '0;
-        s1_sf_exp_sum_flat_tmp  = '0;
+        s1_gamma_sign_flat_tmp = '0;
+        s1_gamma_mag_flat_tmp  = '0;
+        s1_gamma_exp_flat_tmp  = '0;
         s1_d.special_valid  = s0_q.special_valid;
         s1_d.special_result = s0_q.special_result;
         s1_d.c_sign         = s0_q.c_sign;
-        s1_d.c_sig          = s0_q.c_sig;
-        s1_d.c_exp          = s0_q.c_exp;
+        if (s0_q.c_sig == '0) begin
+            s1_d.c_exp = '0;
+            s1_d.c_mag = '0;
+        end else begin
+            c_msb_idx_tmp_s1 = msb_index24(s0_q.c_sig);
+            s1_d.c_exp       = s0_q.c_exp + $signed({4'd0, c_msb_idx_tmp_s1});
+            c_mag_tmp_s1     = s0_q.c_sig << (ALIGN_W - c_msb_idx_tmp_s1);
+            s1_d.c_mag       = c_mag_tmp_s1;
+        end
 
         for (g1 = 0; g1 < NUM_BLOCKS; g1 = g1 + 1) begin
             sigma_acc = '0;
@@ -430,29 +468,45 @@ module fp4_dot_prod (
                           + $signed({{(16-FP4_PROD_W){prod_s0_tmp[FP4_PROD_W-1]}}, prod_s0_tmp});
             end
             sigma_tmp = sigma_acc[SIGMA_W-1:0];
-            s1_sigma_flat_tmp[g1*SIGMA_W +: SIGMA_W] = sigma_tmp;
-            s1_sf_sig_prod_flat_tmp[g1*SF_SIG_PROD_W +: SF_SIG_PROD_W] =
+            sf_sig_prod_tmp =
                 s0_a_sf_sig_flat_hold[g1*SF_SIG_W +: SF_SIG_W]
               * s0_b_sf_sig_flat_hold[g1*SF_SIG_W +: SF_SIG_W];
-
             a_sf_exp_tmp = $signed(s0_a_sf_exp_flat_hold[g1*SF_EXP_W +: SF_EXP_W]);
             b_sf_exp_tmp = $signed(s0_b_sf_exp_flat_hold[g1*SF_EXP_W +: SF_EXP_W]);
-            s1_sf_exp_sum_flat_tmp[g1*SF_EXP_SUM_W +: SF_EXP_SUM_W] = a_sf_exp_tmp + b_sf_exp_tmp;
+            sf_exp_sum_tmp_s1 = a_sf_exp_tmp + b_sf_exp_tmp;
+
+            gamma_sig_tmp_s1 = sigma_tmp * $signed({1'b0, sf_sig_prod_tmp});
+            gamma_exp_tmp_s1 = $signed({{(C_EXP_W-SF_EXP_SUM_W){sf_exp_sum_tmp_s1[SF_EXP_SUM_W-1]}},
+                                        sf_exp_sum_tmp_s1})
+                             - 9'sd2;
+            gamma_sign_tmp_s1 = gamma_sig_tmp_s1[GAMMA_SIG_W-1];
+            if (gamma_sig_tmp_s1 == '0) begin
+                gamma_mag_tmp_s1 = '0;
+                gamma_exp_tmp_s1 = '0;
+            end else begin
+                if (gamma_sign_tmp_s1) begin
+                    gamma_abs_tmp_s1 = -gamma_sig_tmp_s1;
+                end else begin
+                    gamma_abs_tmp_s1 = gamma_sig_tmp_s1;
+                end
+                gamma_msb_idx_tmp_s1 = msb_index20(gamma_abs_tmp_s1);
+                gamma_exp_tmp_s1 = gamma_exp_tmp_s1 + $signed({4'd0, gamma_msb_idx_tmp_s1});
+                gamma_mag_tmp_s1 = gamma_abs_tmp_s1 << (ALIGN_W - gamma_msb_idx_tmp_s1);
+            end
+
+            s1_gamma_sign_flat_tmp[g1] = gamma_sign_tmp_s1;
+            s1_gamma_mag_flat_tmp[g1*ALIGN_MAG_W +: ALIGN_MAG_W] = gamma_mag_tmp_s1;
+            s1_gamma_exp_flat_tmp[g1*C_EXP_W +: C_EXP_W] = gamma_exp_tmp_s1;
         end
 
-        s1_d.sigma_flat       = s1_sigma_flat_tmp;
-        s1_d.sf_sig_prod_flat = s1_sf_sig_prod_flat_tmp;
-        s1_d.sf_exp_sum_flat  = s1_sf_exp_sum_flat_tmp;
+        s1_d.gamma_sign_flat = s1_gamma_sign_flat_tmp;
+        s1_d.gamma_mag_flat  = s1_gamma_mag_flat_tmp;
+        s1_d.gamma_exp_flat  = s1_gamma_exp_flat_tmp;
     end
 
-    logic signed [GAMMA_SIG_W-1:0] gamma_sig_tmp;
-    logic signed [SIGMA_W-1:0]     sigma_s1_tmp;
-    logic signed [SF_EXP_SUM_W-1:0] sf_exp_sum_tmp;
-    logic signed [C_EXP_W-1:0]     gamma_exp_ext;
-    logic signed [C_EXP_W-1:0]     emax_tmp;
-    logic signed [ALIGN_W-1:0]     gamma_term_ext;
-    logic signed [ALIGN_W-1:0]     c_term_ext;
-    integer                        shift_tmp;
+    logic signed [C_EXP_W-1:0] gamma_exp_ext;
+    logic signed [C_EXP_W-1:0] emax_tmp;
+    logic                      emax_vld_tmp_s2;
 
     always_comb begin
         s2_d = '0;
@@ -460,40 +514,36 @@ module fp4_dot_prod (
         s2_d.special_valid  = s1_q.special_valid;
         s2_d.special_result = s1_q.special_result;
 
-        emax_tmp = s1_q.c_exp;
+        // S1 already normalized each term into a compact Q1.35 significand.
+        // S2 only searches exponents and right-shifts magnitudes to emax.
+        emax_tmp = '0;
+        emax_vld_tmp_s2 = 1'b0;
+        if (s1_q.c_mag != '0) begin
+            emax_tmp = s1_q.c_exp;
+            emax_vld_tmp_s2 = 1'b1;
+        end
         for (g2 = 0; g2 < NUM_BLOCKS; g2 = g2 + 1) begin
-            sf_exp_sum_tmp = $signed(s1_sf_exp_sum_flat_hold[g2*SF_EXP_SUM_W +: SF_EXP_SUM_W]);
-            gamma_exp_ext  = $signed({{(C_EXP_W-SF_EXP_SUM_W){sf_exp_sum_tmp[SF_EXP_SUM_W-1]}}, sf_exp_sum_tmp})
-                           - 9'sd2;
-            if (gamma_exp_ext > emax_tmp) begin
-                emax_tmp = gamma_exp_ext;
+            if (s1_gamma_mag_flat_hold[g2*ALIGN_MAG_W +: ALIGN_MAG_W] != '0) begin
+                gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g2*C_EXP_W +: C_EXP_W]);
+                if (!emax_vld_tmp_s2 || (gamma_exp_ext > emax_tmp)) begin
+                    emax_tmp = gamma_exp_ext;
+                    emax_vld_tmp_s2 = 1'b1;
+                end
             end
         end
         s2_d.emax = emax_tmp;
 
         for (g3 = 0; g3 < NUM_BLOCKS; g3 = g3 + 1) begin
-            sigma_s1_tmp = $signed(s1_sigma_flat_hold[g3*SIGMA_W +: SIGMA_W]);
-            gamma_sig_tmp = sigma_s1_tmp
-                          * $signed({1'b0, s1_sf_sig_prod_flat_hold[g3*SF_SIG_PROD_W +: SF_SIG_PROD_W]});
-            sf_exp_sum_tmp = $signed(s1_sf_exp_sum_flat_hold[g3*SF_EXP_SUM_W +: SF_EXP_SUM_W]);
-            gamma_exp_ext  = $signed({{(C_EXP_W-SF_EXP_SUM_W){sf_exp_sum_tmp[SF_EXP_SUM_W-1]}}, sf_exp_sum_tmp})
-                           - 9'sd2;
-            shift_tmp      = ACC_FRAC_BITS
-                           + $signed({{(32-C_EXP_W){gamma_exp_ext[C_EXP_W-1]}}, gamma_exp_ext})
-                           - $signed({{(32-C_EXP_W){emax_tmp[C_EXP_W-1]}}, emax_tmp});
-            gamma_term_ext = $signed({{(ALIGN_W-GAMMA_SIG_W){gamma_sig_tmp[GAMMA_SIG_W-1]}}, gamma_sig_tmp});
-            s2_gamma_aligned_flat_tmp[g3*ALIGN_W +: ALIGN_W] = align_fixed_rz(gamma_term_ext, shift_tmp);
+            gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g3*C_EXP_W +: C_EXP_W]);
+            s2_gamma_aligned_flat_tmp[g3*ALIGN_TERM_W +: ALIGN_TERM_W] =
+                align_fixed_rz(s1_gamma_sign_flat_hold[g3],
+                               s1_gamma_mag_flat_hold[g3*ALIGN_MAG_W +: ALIGN_MAG_W],
+                               gamma_exp_ext,
+                               emax_tmp);
         end
         s2_d.gamma_aligned_flat = s2_gamma_aligned_flat_tmp;
 
-        c_term_ext = $signed({{(ALIGN_W-C_SIG_W){1'b0}}, s1_q.c_sig});
-        if (s1_q.c_sign) begin
-            c_term_ext = -c_term_ext;
-        end
-        shift_tmp = ACC_FRAC_BITS
-                  + $signed({{(32-C_EXP_W){s1_q.c_exp[C_EXP_W-1]}}, s1_q.c_exp})
-                  - $signed({{(32-C_EXP_W){emax_tmp[C_EXP_W-1]}}, emax_tmp});
-        s2_d.c_aligned = align_fixed_rz(c_term_ext, shift_tmp);
+        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, s1_q.c_mag, s1_q.c_exp, emax_tmp);
     end
 
     logic signed [SUM_W-1:0] sum_acc;
@@ -502,13 +552,14 @@ module fp4_dot_prod (
         s3_d = '0;
         s3_d.special_valid  = s2_q.special_valid;
         s3_d.special_result = s2_q.special_result;
-        s3_d.base_exp       = s2_q.emax - ACC_FRAC_BITS_EXP;
+        // Q*.35 alignment moves 35 bits into the significand, so compensate in exponent.
+        s3_d.base_exp       = s2_q.emax - ALIGN_W_EXP;
 
-        sum_acc = $signed({{(SUM_W-ALIGN_W){s2_q.c_aligned[ALIGN_W-1]}}, s2_q.c_aligned});
+        sum_acc = $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}}, s2_q.c_aligned});
         for (g4 = 0; g4 < NUM_BLOCKS; g4 = g4 + 1) begin
             sum_acc = sum_acc
-                    + $signed({{(SUM_W-ALIGN_W){s2_gamma_aligned_flat_hold[g4*ALIGN_W + ALIGN_W-1]}},
-                               s2_gamma_aligned_flat_hold[g4*ALIGN_W +: ALIGN_W]});
+                    + $signed({{(SUM_W-ALIGN_TERM_W){s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
+                               s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W +: ALIGN_TERM_W]});
         end
         s3_d.sum = sum_acc;
     end

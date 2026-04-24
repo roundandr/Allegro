@@ -211,17 +211,25 @@ $$
 | `GAMMA_EXP_W` | 6 | `gamma` 的有符号指数 |
 | `C_SIG_W` | 24 | FP32 `c` 的 24-bit significand |
 | `C_EXP_W` | 9 | FP32 `c` 的有符号指数 |
-| `ACC_FRAC_BITS` | 35 | 融合累加域保留的 fractional bits |
-| `ALIGN_W` | 59 | 对齐后的统一 signed fixed-point 位宽，格式为 `S23.35` |
-| `SUM_W` | 62 | 5 路对齐后求和结果位宽 |
+| `EXP_DIFF_W` | 10 | 两个 9-bit signed exponent 相减得到的 shift 位宽 |
+| `ALIGN_W` | 29 | 融合累加对齐时保留的 fractional bits |
+| `ALIGN_MAG_W` | 30 | 归一化后单项 magnitude 位宽，Q1.29 |
+| `ALIGN_TERM_W` | 31 | 对齐后的 signed fixed-point term 位宽，含符号和 Q1.29 magnitude |
+| `ALIGN_SHIFT_W` | 5 | 对 `ALIGN_MAG_W` 宽度数据右移的 shift amount 位宽 |
+| `SUM_W` | 34 | 5 路对齐后求和结果位宽 |
+| `ALIGN_W_EXP` | 29 | `ALIGN_W` 转成 signed exponent 后用于计算 `base_exp` |
 
 位宽来源说明：
 
 * `SIGMA_W = 13`，因为 `16 × 36 = 576`，并保留 2 个 fractional bits；
 * `SF_SIG_PROD_W = 8`，因为 `max(15 × 15) = 225`；
 * `GAMMA_SIG_W = 20`，因为内部整数编码最大值为 `2304 × 225 = 518400`；
-* `ALIGN_W = C_SIG_W + ACC_FRAC_BITS = 24 + 35 = 59`，用于把 `gamma` 和 `c` 统一对齐到 `Q*.35` 融合累加域；
-* `SUM_W = ALIGN_W + ceil(log2(5)) = 59 + 3 = 62`，可覆盖 5 路同宽 signed 加法。
+* `ALIGN_W = 29`，是当前 RTL 与本地 MMA-Sim 测试对齐后采用的 fractional bits；
+* `ALIGN_MAG_W = ALIGN_W + 1 = 30`，表示归一化后的 Q1.29 magnitude；
+* `ALIGN_TERM_W = ALIGN_MAG_W + 1 = 31`，表示带符号的对齐结果；
+* `ALIGN_SHIFT_W = ceil(log2(ALIGN_MAG_W + 1)) = 5`，用于表达 `0..30` 的右移量；
+* `SUM_W = ALIGN_TERM_W + ceil(log2(5)) = 31 + 3 = 34`，可覆盖 5 路同宽 signed 加法；
+* `ALIGN_W_EXP = 29`，用于在 S3 中计算 `base_exp = emax - 29`。
 
 ---
 
@@ -443,45 +451,36 @@ $$
 c,\gamma_0,\gamma_1,\gamma_2,\gamma_3
 $$
 
-首先提取它们的指数：
+首先提取它们的原始指数：
 
 $$
 e_c,e_0,e_1,e_2,e_3
 $$
 
-然后计算最大指数：
+然后计算最大原始 exponent：
 
 $$
 e_{\max} = \max(e_c,e_0,e_1,e_2,e_3)
 $$
 
-然后对每一项按 `RZ` 规则对齐到同一个 `Q*.35` 融合累加域。对 `gamma_g`：
+S1 先将每一项规约为 compact significand + exponent 形式，其中 significand 固定为 `Q1.29`：
 
 $$
-\text{shift}_g = 35 + e_g - e_{\max}
+sig^{norm} \in [1,2), \quad width = Q1.29
 $$
 
-$$
-\hat{s}_g =
-\operatorname{align\_fixed\_rz}(\gamma^{sig}_g,\text{shift}_g)
-$$
-
-对 `c`：
+然后只根据 exponent 差右移：
 
 $$
-\text{shift}_c = 35 + e_c - e_{\max}
-$$
-
-$$
-\hat{s}_c =
-\operatorname{align\_fixed\_rz}((-1)^{c_{sign}} \times c_{sig},\text{shift}_c)
+\hat{s} =
+\operatorname{RZ}\left(sig^{norm} \gg (e_{\max} - e)\right)
 $$
 
 规则：
 
-* `shift >= 0` 时左移，`shift < 0` 时对 magnitude 右移并执行 `RZ` 截断；
+* 因为 $e_{\max}$ 是最大原始 exponent，对齐阶段只需要根据 `emax - e` 右移；
 * 舍入模式固定为 RZ；
-* 对齐后所有数共享同一个基准指数 $e_{\max} - 35$；
+* 对齐后所有数共享同一个基准指数 $e_{\max} - 29$；
 * 若右移量大于等于操作数位宽，则对齐结果为 0；
 * 不能直接使用 signed arithmetic shift 代替 RZ，因为负数算术右移会向负无穷取整。
 
@@ -505,7 +504,7 @@ $$
 此时结果可以表示为：
 
 $$
-S \times 2^{e_{\max}-35}
+S \times 2^{e_{\max}-29}
 $$
 
 该步骤使用定点加法树完成。为了更低延迟可使用 5:2 compressor / carry-save tree：
@@ -520,7 +519,7 @@ $$
    final CPA
 ```
 
-`SUM_W = 62`，能够无损覆盖 5 路 `ALIGN_W = 59` 的 signed 求和。
+`SUM_W = 34`，能够无损覆盖 5 路 `ALIGN_TERM_W = 31` 的 signed 求和。
 
 ---
 
@@ -529,7 +528,7 @@ $$
 Step 6 得到：
 
 $$
-S \times 2^{base\_exp}, \quad base\_exp = e_{\max} - 35
+S \times 2^{base\_exp}, \quad base\_exp = e_{\max} - 29
 $$
 
 需要将其重新规格化为 FP32。
@@ -846,47 +845,44 @@ $$
 
 ### 功能
 
-将 4 个 gamma significand 和 c significand 对齐到同一个 `Q*.35` 融合累加域：
+将 4 个 gamma significand 和 c significand 对齐到同一个最大原始 exponent：
 
 $$
-base\_exp = e_{\max} - 35
+base\_exp = e_{\max} - 29
 $$
 
 ### 接口定义
 
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
-| `gamma_sig_i` | 4 × 20 | 4 个 gamma significand |
+| `gamma_mag_i` | 4 × 30 | 4 个 gamma magnitude，Q1.29 |
 | `gamma_exp_i` | 4 × 6 | 4 个 gamma exponent |
-| `c_sig_i` | 24 | c significand |
+| `c_mag_i` | 30 | c magnitude，Q1.29 |
 | `c_sign_i` | 1 | c 的符号 |
 | `c_exp_i` | 9 | c exponent |
-| `emax_i` | 9 | 最大 exponent |
-| `gamma_aligned_o` | 4 × 59 | 对齐后的 gamma fixed-point 值 |
-| `c_aligned_o` | 59 | 对齐后的 c fixed-point 值 |
+| `emax_i` | 9 | 最大原始 exponent |
+| `gamma_aligned_o` | 4 × 31 | 对齐后的 gamma fixed-point 值 |
+| `c_aligned_o` | 31 | 对齐后的 c fixed-point 值 |
 
 ### 行为
 
-RTL 中对齐统一调用 `align_fixed_rz(term, shift)`。其语义为：
+RTL 中对齐统一调用 `align_fixed_rz(term_mag, term_exp, emax)`：
 
-* `shift >= 0` 时左移；
-* `shift < 0` 时按 magnitude 右移，并在移位量超出位宽时输出 0；
+* `term_mag` 在进入对齐级之前已经在 S1 规约为 `Q1.29`；
+* 再计算 `align_shift = emax - term_exp`；
+* 因为 `emax` 是最大原始 exponent，`align_shift >= 0`，对齐阶段只右移；
 * 右移始终执行 `RZ`，即直接截断 shifted-out 低位。
 
 对于 gamma：
 
 ```text
-shift_g = 35 + gamma_exp_i[g] - emax_i
-gamma_term_g = sign-extend(gamma_sig_i[g]) to 59 bits
-gamma_aligned_g = align_fixed_rz(gamma_term_g, shift_g)
+gamma_aligned_g = align_fixed_rz(gamma_mag_i[g], gamma_exp_i[g], emax_i)
 ```
 
 对于 c：
 
 ```text
-shift_c = 35 + c_exp_i - emax_i
-c_term = c_sign_i ? -zero_extend(c_sig_i) : zero_extend(c_sig_i)
-c_aligned = align_fixed_rz(c_term, shift_c)
+c_aligned = align_fixed_rz(c_mag_i, c_exp_i, emax_i)
 ```
 
 ---
@@ -910,9 +906,9 @@ $$
 
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
-| `gamma_aligned_i` | 4 × 59 | 4 个对齐后的 gamma fixed-point 值 |
-| `c_aligned_i` | 59 | 对齐后的 c fixed-point 值 |
-| `sum_o` | 62 | 定点求和结果 |
+| `gamma_aligned_i` | 4 × 31 | 4 个对齐后的 gamma fixed-point 值 |
+| `c_aligned_i` | 31 | 对齐后的 c fixed-point 值 |
+| `sum_o` | 34 | 定点求和结果 |
 | `sum_zero_o` | 1 | 求和结果是否为 0 |
 | `sum_sign_o` | 1 | 求和结果符号 |
 
@@ -951,7 +947,7 @@ $$
 
 | 接口名称 | 位宽 | 说明 |
 | --- | -: | --- |
-| `sum_i` | 62 | 定点求和结果 |
+| `sum_i` | 34 | 定点求和结果 |
 | `base_exp_i` | 9 | 融合累加域的基准指数 |
 | `d_fp32_o` | 32 | FP32 输出 |
 
@@ -983,8 +979,8 @@ RZ 舍入规则：
 | ----: | --- | --- | --- | ---- |
 | S0 | Input Register & Decode & Special Check & FP4 Product | 输入寄存；FP4 decode/product；UE4M3 scale decode；FP32 C decode；scale/C 特殊值检查 | `prod[63:0]`, scale sig/exp, `c_sign/c_sig/c_exp`, special flags | 中 |
 | S1 | Group Sum & Scale Product | 4 组 16-element product sum；scale significand product；scale exponent sum | `sigma[3:0]`, `sfSig[3:0]`, `sfExp[3:0]` | 中 |
-| S2 | Gamma Form & Emax Search & Alignment | `sigma × sfSig` 生成 gamma；搜索最大指数；5 路 significand 按 RZ 对齐 | aligned gamma/c, `emax` | 高 |
-| S3 | Accumulate | 5-input fixed-point accumulation | `sum`, `emax` | 中 |
+| S2 | Gamma Form & Emax Search & Alignment | `sigma × sfSig` 生成 gamma；搜索最大原始 exponent；5 路 significand 按 RZ 对齐 | aligned gamma/c, `emax` | 高 |
+| S3 | Accumulate | 5-input fixed-point accumulation | `sum`, `base_exp` | 中 |
 | S4 | FP32 Normalize | zero/sign 处理；LOD；指数修正；RZ 截断；FP32 pack；special mux | `d_fp32_o` | 中-高 |
 
 ---
@@ -1169,15 +1165,14 @@ c_exp_s1  <= c_exp_s0
 S2 完成：
 
 ```text
-1. gamma significand 生成
-2. gamma exponent 生成
+1. 4 路 gamma 的 compact magnitude 生成，固定为 `Q1.29`
+2. 4 路 gamma exponent 生成
 3. 5-input maximum exponent search
-4. 生成 `Q*.35` 融合累加域的 shift amount
-5. c 和 4 个 gamma 对齐到 `base_exp = emax - 35`
-6. `align_fixed_rz` 执行左移或 RZ 右移截断
+4. 生成原始 exponent 的 `emax`
+5. 相对 `emax` 只执行 RZ 右移对齐
 ```
 
-## Gamma form
+## Gamma form / Pre-normalize
 
 每个 group 生成：
 
@@ -1198,13 +1193,13 @@ $$
 输出：
 
 ```text
-gamma_sig_s2[g] : signed integer, width = 20
+gamma_mag_s1[g] : unsigned Q1.29, width = 30
 gamma_exp_s2[g] : signed integer, width = 6
 ```
 
 ## Emax search
 
-S2 搜索：
+S2 搜索原始 exponent：
 
 $$
 e_{\max} = \max(e_c,e_0,e_1,e_2,e_3)
@@ -1212,23 +1207,22 @@ $$
 
 ## Alignment
 
-对齐按 `Q*.35` 融合累加域执行：
+进入 S2 前，`c` 和 4 个 `gamma` 已在 S1 规约为 compact `Q1.29` magnitude。
+
+对齐按最大原始 exponent 执行：
 
 ```text
-shift = 35 + term_exp - emax
-if shift >= 0:
-    aligned = term <<< shift
-else:
-    aligned = rz_right_shift(term, -shift)
+shift = emax - term_exp
+aligned = rz_right_shift(term_mag, shift)
 ```
 
 ## S2 输出
 
 | 信号 | 位宽 / 格式 | 说明 |
 | --- | --: | --- |
-| `gamma_aligned_s2[3:0]` | 4 × 59 | 对齐后的 gamma fixed-point 值 |
-| `c_aligned_s2` | 59 | 对齐后的 C fixed-point 值 |
-| `emax_s2` | 9 | 最大 exponent |
+| `gamma_aligned_s2[3:0]` | 4 × 31 | 对齐后的 gamma fixed-point 值 |
+| `c_aligned_s2` | 31 | 对齐后的 C fixed-point 值 |
+| `emax_s2` | 9 | 最大原始 exponent |
 | `special_valid_s2` | 1 | 特殊值旁路有效 |
 | `special_result_s2` | 32 | 特殊值旁路结果 |
 
@@ -1258,15 +1252,15 @@ $$
 输出：
 
 ```text
-sum_s3  : signed integer, width = 62
-base_exp_s3 = emax_s2 - 35
+sum_s3  : signed integer, width = 34
+base_exp_s3 = emax_s2 - 29
 ```
 
 ## S3 输出
 
 | 信号 | 位宽 / 格式 | 说明 |
 | --- | --: | --- |
-| `sum_s3` | 62 | 对齐后的 5 输入定点求和结果 |
+| `sum_s3` | 34 | 对齐后的 5 输入定点求和结果 |
 | `base_exp_s3` | 9 | 公共基准指数 |
 | `special_valid_s3` | 1 | 特殊值旁路有效 |
 | `special_result_s3` | 32 | 特殊值旁路结果 |

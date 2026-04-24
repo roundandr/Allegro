@@ -356,18 +356,18 @@ $$
 
 ---
 
-## 5.3 Step 3：Effective Exponent Search and Alignment
+## 5.3 Step 3：Max Exponent Search and Alignment
 
 该阶段寻找：
 
 $$
-e_{\max} = \max { e^{eff}_c, e^{eff}_0, e^{eff}_1, \dots, e^{eff}_{31} }
+e_{\max} = \max { e_c, e_0, e_1, \dots, e_{31} }
 $$
 
 其中：
 
-* `e^{eff}_c` 来自 FP32 输入 C 的 effective exponent
-* `e^{eff}_k` 来自第 k 个 FP8 乘积的 effective exponent
+* `e_c` 来自 FP32 输入 C 的原始 signed exponent
+* `e_k` 来自第 k 个 FP8 乘积的原始 signed exponent
 
 ---
 
@@ -403,8 +403,8 @@ $$
 
 输入比较项数量为 33 个：
 
-* 32 个 product effective exponent
-* 1 个 C effective exponent
+* 32 个 product exponent
+* 1 个 C exponent
 
 推荐使用比较树实现：
 
@@ -421,26 +421,8 @@ Level 5: final max
 
 | 接口名称         | 位宽 | 说明                  |
 | ------------ | -: | ------------------- |
-| `emax_o`     |  8 | products 和 C 中的最大 effective exponent |
+| `emax_o`     |  8 | products 和 C 中的最大原始 exponent |
 | `emax_vld_o` |  1 | emax 有效             |
-
-RTL 中比较的并不是原始 exponent，而是每一项的 effective exponent：
-
-对 product：
-
-$$
-e^{eff}_k = e_k + 6
-$$
-
-这里 `6` 来自 `prod_sig_o[7:0]` 的二进制定点尺度，即 product significand 按 `Q*.6` 解释。
-
-对 C：
-
-$$
-e^{eff}_c = e_c + \operatorname{msb\_index}(c_{sig})
-$$
-
-其中 `msb_index(c_sig)` 是 24-bit `c_sig` 中最高位 `1` 的位置。RTL 通过 `fp32_effective_exp()` 计算该值。
 
 由于 FP8 product exponent 范围较小，而 C 是 FP32，统一使用 signed 8-bit exponent 即可覆盖：
 
@@ -464,32 +446,23 @@ $$
 base\_exp = e_{\max} - 25
 $$
 
-对 product：
+在当前 RTL 中，product 和 C 会先被编码到固定 `F=25` fractional-bit 域，然后再进入对齐级。
+
+因此对齐级本身只需要：
 
 $$
-\text{shift}_k = 25 + e_k - e_{\max}
-$$
-
-对 C：
-
-$$
-\text{shift}_c = 25 + e_c - e_{\max}
-$$
-
-RTL 中对齐统一调用 `align_fixed_rz(term, shift)`：
-
-$$
-\hat{s}_k = \operatorname{align\_fixed\_rz}(s_k,\text{shift}_k)
+\text{shift} = e_{\max} - e
 $$
 
 $$
-\hat{s}_c = \operatorname{align\_fixed\_rz}(s_c,\text{shift}_c)
+\hat{s} = \operatorname{RZ}(s^{frac} \gg \text{shift})
 $$
 
 其行为为：
 
-* `shift >= 0` 时左移；
-* `shift < 0` 时对 magnitude 右移，并直接丢弃 shifted-out bits；
+* `emax` 搜索只比较原始 exponent；
+* 对齐级本身不再执行左移；
+* magnitude 只按 `emax - e` 右移，并直接丢弃 shifted-out bits；
 * 右移始终执行 `round-to-zero`；
 * 若右移量大于等于操作数位宽，则输出 0。
 
@@ -761,7 +734,7 @@ $$
 | Stage | 名称                                      | 主要功能                                     |
 | --- | --- | --- |
 | S0    | Input Register / Decode / Product Generation | 输入寄存、FP8 解码、FP32 C 解码、特殊值检查、32 路 FP8 significand 精确乘法并生成非归一化 product |
-| S1    | Effective Exponent Search               | 搜索 32 个 product 与 C 的 effective exponent 最大值 |
+| S1    | Max Exponent Search                     | 搜索 32 个 product 与 C 的原始 exponent 最大值 |
 | S2    | Alignment                               | 计算 shift amount，对齐到 `S2.25`，并输出 `base_exp = emax - 25` |
 | S3    | Fixed-Point Accumulation                | 33 输入 fixed-point 加法树，得到 `S7.25` 累加结果 |
 | S4    | FP32 Normalize / RZ Round               | 归一化、溢出处理、subnormal 处理、RZ 输出 FP32         |
@@ -919,7 +892,7 @@ $$
 
 ### 功能
 
-搜索 33 个有效项中的最大 effective exponent。
+搜索 33 个有效项中的最大原始 exponent。
 
 ### 接口定义
 
@@ -929,14 +902,13 @@ $$
 | `prod_is_zero_i[31:0]` |     32 | 32 个 product 是否为 0 |
 | `c_exp_i`              |      8 | C exponent            |
 | `c_is_zero_i`          |      1 | C 是否为 0            |
-| `c_sig_i`              |     24 | C significand，用于求 effective exponent |
-| `emax_o`               |      8 | 最大 effective exponent |
+| `emax_o`               |      8 | 最大原始 exponent |
 | `emax_vld_o`           |      1 | 最大指数有效                |
 
 实现要点：
 
-* 仅对 `prod_is_zero_i[k] = 0` 的 product 参与比较，比较值为 `prod_exp_i[k] + 6`；
-* 仅当 `c_is_zero_i = 0` 时，C 才参与比较，比较值为 `c_exp_i + msb_index(c_sig_i)`；
+* 仅对 `prod_is_zero_i[k] = 0` 的 product 参与比较，比较值为 `prod_exp_i[k]`；
+* 仅当 `c_is_zero_i = 0` 时，C 才参与比较，比较值为 `c_exp_i`；
 * 若所有输入项都为零，则 `emax_vld_o = 0`，后级按全零数据路径处理。
 
 ---
@@ -952,21 +924,21 @@ $$
 | 接口名称                   |      位宽 | 说明                               |
 | ---------------------- | ------: | -------------------------------- |
 | `prod_sign_i[31:0]`    |      32 | product sign                     |
-| `prod_sig_i[31:0]`     |  32 × 8 | product significand              |
+| `prod_mag_i[31:0]`     | 32 × 27 | 已编码到 `F=25` fixed-point 域的 product magnitude |
 | `prod_exp_i[31:0]`     |  32 × 8 | product exponent                 |
 | `c_sign_i`             |       1 | C sign                           |
-| `c_sig_i`              |      24 | C significand                    |
+| `c_mag_i`              |      27 | 已编码到 `F=25` fixed-point 域的 C magnitude |
 | `c_exp_i`              |       8 | C exponent                       |
-| `emax_i`               |       8 | 最大 effective exponent              |
+| `emax_i`               |       8 | 最大原始 exponent                |
 | `aligned_prod_o[31:0]` | 32 × 28 | 对齐后的 product fixed-point 值，S2.25 |
 | `aligned_c_o`          |      28 | 对齐后的 C fixed-point 值，S2.25       |
 | `base_exp_o`           |       8 | 公共基准指数，`base_exp_o = emax_i - 25` |
 
 实现要点：
 
-* product 的移位量为 `25 + prod_exp_i[k] - emax_i`；
-* C 的移位量为 `25 + c_exp_i - emax_i`；
-* `shift >= 0` 时左移，`shift < 0` 时按 magnitude 右移并执行 `RZ`；
+* product 的移位量为 `emax_i - prod_exp_i[k]`；
+* C 的移位量为 `emax_i - c_exp_i`；
+* 对齐级只按 magnitude 右移并执行 `RZ`；
 * 若 `emax_vld = 0`，则 `aligned_prod_o`、`aligned_c_o` 和 `base_exp_o` 全部输出 0。
 
 ---
