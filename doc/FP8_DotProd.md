@@ -2,7 +2,7 @@
 
 ## 1. 设计目标
 
-该单元用于实现 32 个 FP8 元素的点积累加：
+该单元用于实现 32 个 FP8 / MXFP8 元素的点积累加。普通 FP8 模式：
 
 $$
 D = C + \sum_{k=0}^{31} A_k \times B_k
@@ -14,6 +14,7 @@ $$
 * 输入数据格式：FP8
 
   * 支持 E4M3 / E5M2，可通过参数选择
+  * 可选 MXFP8 模式，使用 32-lane block 的 A/B E8M0 scale
 * 累加输入：FP32 `C`
 * 输出格式：FP32 `D`
 * 内部对齐累加精度：
@@ -41,6 +42,9 @@ $$
 | `b_vec_i`      | 32 × 8 | FP8 输入向量 B，共 32 个元素           |
 | `c_i`          |     32 | FP32 累加输入 C                   |
 | `fp8_format_i` |      1 | FP8 格式选择，0 表示 E4M3，1 表示 E5M2  |
+| `mxfp8_en_i`   |      1 | MXFP8 使能，0 表示普通 FP8，1 表示 MXFP8 |
+| `a_mx_scale_i` |      8 | A 向量 E8M0 block scale，仅 MXFP8 模式有效 |
+| `b_mx_scale_i` |      8 | B 向量 E8M0 block scale，仅 MXFP8 模式有效 |
 | `out_vld_o`    |      1 | 输出有效信号                        |
 | `out_rdy_i`    |      1 | 下游就绪信号                        |
 | `d_o`          |     32 | FP32 输出结果 D                   |
@@ -83,6 +87,34 @@ E5M2 通常支持 Inf / NaN 编码，因此 Special Check 阶段需要完整处�
 
 ---
 
+### 3.3 MXFP8 E8M0 Scale
+
+MXFP8 模式沿用 32 个 FP8 element 的 E4M3 / E5M2 decode，仅额外引入 A/B 两个 8-bit E8M0 block scale。当前点积宽度为 32，因此一个 dot 正好对应一个 MX block：
+
+$$
+D = C + 2^{e_{sa} + e_{sb}} \times \sum_{k=0}^{31} A_k B_k
+$$
+
+其中：
+
+$$
+e_{sa} = a\_mx\_scale\_i - 127
+$$
+
+$$
+e_{sb} = b\_mx\_scale\_i - 127
+$$
+
+E8M0 scale 语义：
+
+* `8'hff` 为 NaN；
+* 其余编码均表示 power-of-two scale；
+* 无 zero 编码；
+* 无 infinity 编码；
+* scale 只改变 product exponent，不改变 product significand。
+
+---
+
 ## 4. 运算语义
 
 目标计算为：
@@ -90,6 +122,14 @@ E5M2 通常支持 Inf / NaN 编码，因此 Special Check 阶段需要完整处�
 $$
 D = C + \sum_{k=0}^{31} A_k B_k
 $$
+
+当 `mxfp8_en_i = 1` 时，目标计算改为：
+
+$$
+D = C + \sum_{k=0}^{31} A_k B_k \times 2^{e_{sa} + e_{sb}}
+$$
+
+`C` 不参与 MX scale。
 
 FDA 内部将每个输入拆成：
 
@@ -144,12 +184,14 @@ $$
 * 32 个 `A_k`
 * 32 个 `B_k`
 * FP32 输入 `C`
+* MXFP8 模式下的 `a_mx_scale_i` / `b_mx_scale_i`
 
 需要检测：
 
 | 条件                           | 输出结果             |
 | ---------------------------- | ---------------- |
 | 任意输入为 NaN                    | 输出 canonical NaN |
+| MXFP8 模式下任意 E8M0 scale 为 `8'hff` | 输出 canonical NaN |
 | 存在 `0 × Inf`                 | 输出 canonical NaN |
 | 乘积项和 C 中同时存在 `+Inf` 与 `-Inf` | 输出 canonical NaN |
 | 只存在 `+Inf`                   | 输出 `+Inf`        |
@@ -311,8 +353,20 @@ $$
 s_k = s_{a,k} \times s_{b,k}
 $$
 
-$$
+$$ 
 e_k = e_{a,k} + e_{b,k}
+$$
+
+当 `mxfp8_en_i = 1` 且 product 非零时：
+
+$$
+e_k = e_{a,k} + e_{b,k} + e_{sa} + e_{sb}
+$$
+
+由于 E8M0 scale 为 power-of-two，`s_k` 仍然保持：
+
+$$
+s_k = s_{a,k} \times s_{b,k}
 $$
 
 该阶段的乘积尾数必须保持精确，不允许：
@@ -331,7 +385,7 @@ $$
 | ----------------- | --: | ----------------------- |
 | `prod_sign[k]`    |   1 | 第 k 个乘积符号               |
 | `prod_sig[k]`     | 参数化 | 第 k 个非归一化乘积 significand |
-| `prod_exp[k]`     |   8 | 第 k 个乘积指数               |
+| `prod_exp[k]`     |  10 | 第 k 个乘积指数               |
 | `prod_is_zero[k]` |   1 | 第 k 个乘积是否为 0            |
 
 对于 E4M3：
@@ -354,6 +408,12 @@ $$
 
 为了统一硬件路径，可以统一扩展为 8-bit product significand。
 
+MXFP8 模式下 product exponent 需要覆盖 FP8 product exponent 加两路 E8M0 scale exponent，因此内部 signed exponent 宽度至少为 10 bit。当前 RTL 统一采用：
+
+```text
+EXP_W = 10
+```
+
 ---
 
 ## 5.3 Step 3：Max Exponent Search and Alignment
@@ -367,7 +427,7 @@ $$
 其中：
 
 * `e_c` 来自 FP32 输入 C 的原始 signed exponent
-* `e_k` 来自第 k 个 FP8 乘积的原始 signed exponent
+* `e_k` 来自第 k 个 FP8 乘积的 signed exponent；MXFP8 模式下该 exponent 已包含 A/B scale exponent
 
 ---
 
@@ -421,19 +481,15 @@ Level 5: final max
 
 | 接口名称         | 位宽 | 说明                  |
 | ------------ | -: | ------------------- |
-| `emax_o`     |  8 | products 和 C 中的最大原始 exponent |
+| `emax_o`     | 10 | products 和 C 中的最大原始 exponent |
 | `emax_vld_o` |  1 | emax 有效             |
 
-由于 FP8 product exponent 范围较小，而 C 是 FP32，统一使用 signed 8-bit exponent 即可覆盖：
-
-$$
-[-126, 127]
-$$
+普通 FP8 模式下 FP8 product exponent 与 FP32 C exponent 可由 9-bit signed exponent 覆盖。MXFP8 模式下，E8M0 scale exponent 范围扩大 product exponent，统一使用 signed 10-bit exponent。
 
 零项不参与 `emax` 搜索。若 32 个 product 和 `C` 全为零，则：
 
 * `emax_vld_o = 0`
-* `emax_o` 推荐输出 `8'sd0`
+* `emax_o` 推荐输出 `10'sd0`
 * `align_unit` 直接输出全零 fixed-point 项
 
 ---
@@ -574,22 +630,22 @@ $$
 2^7 = 128 > 100
 $$
 
-因此 accumulator fixed-point 格式为：
+因此 accumulator fixed-point 至少需要：
 
 ```text
 S7.25
 ```
 
-总位宽为：
+最小总位宽为：
 
 $$
 1 + 7 + 25 = 33 \text{ bits}
 $$
 
-RTL 采用：
+当前 RTL 额外保留 guard bits，采用：
 
 ```text
-SUM_W = 33
+SUM_W = 35
 ```
 
 ---
@@ -733,8 +789,8 @@ $$
 
 | Stage | 名称                                      | 主要功能                                     |
 | --- | --- | --- |
-| S0    | Input Register / Decode / Product Generation | 输入寄存、FP8 解码、FP32 C 解码、特殊值检查、32 路 FP8 significand 精确乘法并生成非归一化 product |
-| S1    | Max Exponent Search                     | 搜索 32 个 product 与 C 的原始 exponent 最大值 |
+| S0    | Input Register / Decode / Product Generation | 输入寄存、FP8 解码、E8M0 scale decode、FP32 C 解码、特殊值检查、32 路 FP8 significand 精确乘法并生成非归一化 product |
+| S1    | Max Exponent Search                     | 搜索 32 个 product 与 C 的 exponent 最大值；MXFP8 product exponent 已包含 scale exponent |
 | S2    | Alignment                               | 计算 shift amount，对齐到 `S2.25`，并输出 `base_exp = emax - 25` |
 | S3    | Fixed-Point Accumulation                | 33 输入 fixed-point 加法树，得到 `S7.25` 累加结果 |
 | S4    | FP32 Normalize / RZ Round               | 归一化、溢出处理、subnormal 处理、RZ 输出 FP32         |
@@ -761,7 +817,7 @@ $$
 | `fp8_format_i`   |  1 | 0: E4M3，1: E5M2    |
 | `sign_o`         |  1 | 符号位                |
 | `sig_o`          |  4 | 统一扩展后的 significand |
-| `exp_o`          |  8 | signed exponent    |
+| `exp_o`          | 10 | signed exponent    |
 | `is_zero_o`      |  1 | 是否为 zero           |
 | `is_subnormal_o` |  1 | 是否为 subnormal      |
 | `is_inf_o`       |  1 | 是否为 Inf            |
@@ -793,13 +849,13 @@ $$
 | ------------- | -: | ------------------------- |
 | `a_sign_i`    |  1 | A 符号                      |
 | `a_sig_i`     |  4 | A significand             |
-| `a_exp_i`     |  8 | A exponent                |
+| `a_exp_i`     | 10 | A exponent                |
 | `b_sign_i`    |  1 | B 符号                      |
 | `b_sig_i`     |  4 | B significand             |
-| `b_exp_i`     |  8 | B exponent                |
+| `b_exp_i`     | 10 | B exponent                |
 | `prod_sign_o` |  1 | product 符号                |
 | `prod_sig_o`  |  8 | exact product significand |
-| `prod_exp_o`  |  8 | product exponent          |
+| `prod_exp_o`  | 10 | product exponent          |
 | `prod_zero_o` |  1 | product 是否为 0             |
 
 ### 内部逻辑
@@ -822,6 +878,14 @@ $$
 s_k = s_{a,k} \times s_{b,k}
 $$
 
+MXFP8 模式下：
+
+$$
+e_k = e_{a,k} + e_{b,k} + e_{sa} + e_{sb}
+$$
+
+其中 E8M0 scale 只参与指数相加。
+
 ---
 
 ## 7.3 `fp32_c_decode_unit`
@@ -841,7 +905,7 @@ $$
 | `c_i`              | 32 | FP32 输入 C                  |
 | `c_sign_o`         |  1 | C 符号                       |
 | `c_sig_o`          | 24 | C significand，含 hidden bit |
-| `c_exp_o`          |  8 | C signed exponent          |
+| `c_exp_o`          | 10 | C signed exponent          |
 | `c_is_zero_o`      |  1 | C 是否为 zero                 |
 | `c_is_subnormal_o` |  1 | C 是否为 subnormal            |
 | `c_is_inf_o`       |  1 | C 是否为 Inf                  |
@@ -870,6 +934,9 @@ $$
 | `c_sign_i`          |  1 | C 符号位 |
 | `c_is_inf_i`        |  1 | C 是否为 Inf  |
 | `c_is_nan_i`        |  1 | C 是否为 NaN  |
+| `mxfp8_en_i`        |  1 | MXFP8 模式使能 |
+| `a_mx_scale_i`      |  8 | A 侧 E8M0 scale |
+| `b_mx_scale_i`      |  8 | B 侧 E8M0 scale |
 | `has_nan_o`         |  1 | 输入中存在 NaN |
 | `has_pos_inf_o`     |  1 | 结果路径中存在 +Inf |
 | `has_neg_inf_o`     |  1 | 结果路径中存在 -Inf |
@@ -883,6 +950,7 @@ $$
 * 对每一路 `k`，若存在有限非零数与 Inf 相乘，则用 `a_sign_i[k] ^ b_sign_i[k]` 判定 product infinity 极性；
 * `c_is_inf_i` 通过 `c_sign_i` 参与 `has_pos_inf_o` / `has_neg_inf_o` 聚合；
 * 若 `has_nan_o || has_zero_mul_inf_o || (has_pos_inf_o && has_neg_inf_o)`，则 `special_result_o = 32'h7fff_ffff`；
+* MXFP8 模式下若任意 E8M0 scale 为 `8'hff`，并入 `has_nan_o`；
 * 若仅 `has_pos_inf_o`，则 `special_result_o = 32'h7f80_0000`；
 * 若仅 `has_neg_inf_o`，则 `special_result_o = 32'hff80_0000`。
 
@@ -898,11 +966,11 @@ $$
 
 | 接口名称               |     位宽 | 说明                    |
 | ------------------ | -----: | --------------------- |
-| `prod_exp_i[31:0]`     | 32 × 8 | 32 个 product exponent |
+| `prod_exp_i[31:0]`     | 32 × 10 | 32 个 product exponent |
 | `prod_is_zero_i[31:0]` |     32 | 32 个 product 是否为 0 |
-| `c_exp_i`              |      8 | C exponent            |
+| `c_exp_i`              |     10 | C exponent            |
 | `c_is_zero_i`          |      1 | C 是否为 0            |
-| `emax_o`               |      8 | 最大原始 exponent |
+| `emax_o`               |     10 | 最大原始 exponent |
 | `emax_vld_o`           |      1 | 最大指数有效                |
 
 实现要点：
@@ -925,14 +993,14 @@ $$
 | ---------------------- | ------: | -------------------------------- |
 | `prod_sign_i[31:0]`    |      32 | product sign                     |
 | `prod_mag_i[31:0]`     | 32 × 27 | 已编码到 `F=25` fixed-point 域的 product magnitude |
-| `prod_exp_i[31:0]`     |  32 × 8 | product exponent                 |
+| `prod_exp_i[31:0]`     | 32 × 10 | product exponent                 |
 | `c_sign_i`             |       1 | C sign                           |
 | `c_mag_i`              |      27 | 已编码到 `F=25` fixed-point 域的 C magnitude |
-| `c_exp_i`              |       8 | C exponent                       |
-| `emax_i`               |       8 | 最大原始 exponent                |
+| `c_exp_i`              |      10 | C exponent                       |
+| `emax_i`               |      10 | 最大原始 exponent                |
 | `aligned_prod_o[31:0]` | 32 × 28 | 对齐后的 product fixed-point 值，S2.25 |
 | `aligned_c_o`          |      28 | 对齐后的 C fixed-point 值，S2.25       |
-| `base_exp_o`           |       8 | 公共基准指数，`base_exp_o = emax_i - 25` |
+| `base_exp_o`           |      10 | 公共基准指数，`base_exp_o = emax_i - 25` |
 
 实现要点：
 
@@ -959,7 +1027,7 @@ $$
 | ---------------------- | ------: | ----------------------------------------- |
 | `aligned_prod_i[31:0]` | 32 × 28 | 32 个对齐后的 product                          |
 | `aligned_c_i`          |      28 | 对齐后的 C                                    |
-| `sum_o`                |      33 | fixed-point 累加结果，格式为 `S7.25` |
+| `sum_o`                |      35 | fixed-point 累加结果，至少覆盖 `S7.25`，当前 RTL 保留 guard bits |
 | `sum_zero_o`           |       1 | 累加结果是否为 0                                 |
 
 ---
@@ -974,11 +1042,34 @@ $$
 
 | 接口名称          | 位宽 | 说明                     |
 | ------------- | -: | ---------------------- |
-| `sum_i`       | 33 | fixed-point 累加结果       |
-| `base_exp_i`  |  8 | 对齐使用的公共基准指数         |
+| `sum_i`       | 35 | fixed-point 累加结果       |
+| `base_exp_i`  | 10 | 对齐使用的公共基准指数         |
 | `d_o`         | 32 | FP32 输出                |
 | `overflow_o`  |  1 | 输出是否 overflow 到 Inf    |
 | `underflow_o` |  1 | 输出是否为 subnormal 或 zero |
 | `is_zero_o`   |  1 | 输出是否为 zero             |
 
 ---
+
+# 8. MXFP8 验证要求
+
+普通 FP8 回归：
+
+* `mxfp8_en_i = 0` 时，原 E4M3 / E5M2 directed 和 random case 结果必须保持不变；
+* `a_mx_scale_i` / `b_mx_scale_i` 在普通 FP8 模式下不影响输出。
+
+MXFP8 directed case：
+
+* `a_mx_scale_i = b_mx_scale_i = 8'd127` 时，结果等同普通 FP8；
+* `a_mx_scale_i = 8'd128, b_mx_scale_i = 8'd127` 时，dot contribution 放大 2 倍；
+* `a_mx_scale_i = 8'd126, b_mx_scale_i = 8'd127` 时，dot contribution 缩小 2 倍；
+* A/B scale exponent 按加法组合；
+* 任意 scale 为 `8'hff` 时输出 `32'h7fff_ffff`；
+* 全零 FP8 vector 且 scale 非 NaN 时输出 `C`；
+* 大正 scale 覆盖 FP32 overflow 到 Inf；
+* 大负 scale 覆盖 FP32 underflow / subnormal / RZ 路径。
+
+随机验证：
+
+* E4M3 和 E5M2 均需要覆盖 MXFP8 random case；
+* golden model 使用 E8M0 exponent addition，即仅对 product exponent 加 `a_scale_exp + b_scale_exp`，不改变 significand。

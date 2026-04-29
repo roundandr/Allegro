@@ -1,30 +1,40 @@
-# FP16/BF16 Dot Product FDA Unit Spec
+# TF32 Dot Product FDA Unit Spec
 
 ## 1. 设计目标
 
-实现一个 16-element FP16/BF16 fused-dot-add 单元：
+实现一个 8-element TF32 fused-dot-add 单元：
 
 ```text
-D = C + Σ(A[k] × B[k]), k = 0..15
+D = C + Σ(A[k] × B[k]), k = 0..7
 ```
+
+其中 A/B 外部按 FP32 编码输入，进入乘法 datapath 前截断为 TF32：
+
+```text
+TF32 = FP32 sign + FP32 exponent + FP32 fraction[22:13]
+```
+
+低 13 bit fraction 直接丢弃，不做 RNE。
 
 | 项目 | 规格 |
 | --- | --- |
-| 主 RTL 文件 | `src/main/fp16_dot_prod.sv` |
-| 主模块 | `fp16_dot_prod` |
-| FP16 兼容 wrapper | `fp16_dot16_fda_f25` |
-| BF16 兼容 wrapper | `bf16_dot16_fda_f25` |
-| 输入 A/B | 16 个 FP16 或 16 个 BF16，同一 request 内 A/B 格式相同 |
+| 主 RTL 文件 | `src/main/tf32_dot_prod.sv` |
+| 主模块 | `tf32_dot_prod` |
+| 兼容 wrapper | `tf32_dot8_fda_f25` |
+| 输入 A/B | 8 个 FP32 编码值，内部截断为 TF32 |
 | 输入 C | FP32 |
 | 输出 D | FP32 |
-| Dot width | 16 |
+| Dot width | 8 |
 | 内部对齐小数位 | F = 25 |
-| 乘积计算 | FP16/BF16 significand 统一扩展到 11 bit 后精确定点乘法 |
+| 乘积计算 | TF32 significand × TF32 significand，精确定点乘法 |
+| TF32 输入截断 | FP32 fraction 低 13 bit 截断，即 RZ |
 | 对齐方式 | 以最大指数 `emax` 对齐 |
 | 对齐截断 | shifted-out bits 直接截断，即 RZ |
 | 累加方式 | 对齐后 signed Q7.25 定点累加 |
 | 输出舍入 | FP32 输出，尾数按 RZ 截断到 23 fractional bits |
 | 特殊值处理 | NVIDIA FDA 风格 NaN/Inf 规则 |
+
+说明：TF32 的 significand 有效位宽为 11 bit，和 FP16 相同，因此 product significand 位宽仍为 22 bit Q2.20。不同点是 TF32 复用 FP32 的 8-bit exponent，指数范围和 FP32 一致。
 
 ## 2. 顶层接口
 
@@ -33,12 +43,11 @@ D = C + Σ(A[k] × B[k]), k = 0..15
 实现采用工程内统一 valid-ready 风格，输入向量为 flat packed bus。
 
 ```systemverilog
-module fp16_dot_prod (
+module tf32_dot_prod (
     input  logic         clk,
     input  logic         rst_n,
     input  logic         in_vld_i,
     output logic         in_rdy_o,
-    input  logic         fmt_is_bf16_i,
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
@@ -54,9 +63,8 @@ module fp16_dot_prod (
 | `rst_n` | 1 | input | 低有效异步复位 |
 | `in_vld_i` | 1 | input | 输入有效 |
 | `in_rdy_o` | 1 | output | 输入可接收 |
-| `fmt_is_bf16_i` | 1 | input | `0` 表示 FP16，`1` 表示 BF16 |
-| `a_vec_i` | 256 | input | 16 个 FP16/BF16 A，`a_vec_i[k*16 +: 16]` |
-| `b_vec_i` | 256 | input | 16 个 FP16/BF16 B，`b_vec_i[k*16 +: 16]` |
+| `a_vec_i` | 256 | input | 8 个 FP32 编码 A，`a_vec_i[k*32 +: 32]` |
+| `b_vec_i` | 256 | input | 8 个 FP32 编码 B，`b_vec_i[k*32 +: 32]` |
 | `c_i` | 32 | input | FP32 累加输入 C |
 | `out_vld_o` | 1 | output | 输出有效 |
 | `out_rdy_i` | 1 | input | 下游可接收 |
@@ -74,85 +82,58 @@ in_fire = in_vld_i & in_rdy_o
 out_fire = out_vld_o & out_rdy_i
 ```
 
-模块内部使用 `pipeline_reg` 串接 5 级流水，因此支持 backpressure。各级 payload 在 `valid=1` 且下游 `ready=0` 时保持稳定。
+模块内部建议复用 `pipeline_reg` 串接 4 级流水，支持 backpressure。各级 payload 在 `valid=1` 且下游 `ready=0` 时保持稳定。
 
 ### 2.2 文档兼容接口
 
-为了兼容原 FP16 spec，RTL 同文件提供 FP16 wrapper：
+为了兼容单元级 spec，RTL 同文件提供 wrapper：
 
 ```systemverilog
-module fp16_dot16_fda_f25 (
+module tf32_dot8_fda_f25 (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        in_valid,
-    input  logic [15:0] a_in [16],
-    input  logic [15:0] b_in [16],
+    input  logic [31:0] a_in [8],
+    input  logic [31:0] b_in [8],
     input  logic [31:0] c_in,
     output logic        out_valid,
     output logic [31:0] d_out
 );
 ```
 
-Wrapper 将 `a_in[k]` / `b_in[k]` pack 到 `a_vec_i[k*16 +: 16]` / `b_vec_i[k*16 +: 16]`，把 `fmt_is_bf16_i` 固定为 `1'b0`，并把 `out_rdy_i` 固定为 `1'b1`。该 wrapper 不暴露 backpressure。
-
-RTL 同文件还提供 BF16 wrapper：
-
-```systemverilog
-module bf16_dot16_fda_f25 (
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        in_valid,
-    input  logic [15:0] a_in [16],
-    input  logic [15:0] b_in [16],
-    input  logic [31:0] c_in,
-    output logic        out_valid,
-    output logic [31:0] d_out
-);
-```
-
-BF16 wrapper 的 pack 行为相同，把 `fmt_is_bf16_i` 固定为 `1'b1`。
+Wrapper 将 `a_in[k]` / `b_in[k]` pack 到 `a_vec_i[k*32 +: 32]` / `b_vec_i[k*32 +: 32]`，并把 `out_rdy_i` 固定为 `1'b1`。该 wrapper 不暴露 backpressure。
 
 ## 3. Pipeline
 
-实现为 5-stage FDA pipeline。
+实现为 4-stage FDA pipeline。
 
 | Stage | RTL payload | 功能 |
 | --- | --- | --- |
-| S0 | `stage0_data_t` | 输入寄存；按 `fmt_is_bf16_i` 解码 FP16/BF16 A/B；FP32 C 解码；NaN/Inf/`0*Inf` 特殊值检测 |
-| S1 | `stage1_data_t` | 16 路 11-bit significand 乘法；product sign/exponent/zero 生成 |
-| S2 | `stage2_data_t` | `emax` 搜索；product/C 转换到 F=25；对齐到 signed Q7.25 |
-| S3 | `stage3_data_t` | 16 products + C 的 33-bit signed Q7.25 累加 |
-| S4 | `stage4_data_t` | 特殊值选择或 FP32 normalize + RZ pack |
+| S0 | `stage0_data_t` | 输入寄存；FP32 A/B 解码并截断为 TF32；FP32 C 解码；NaN/Inf/`0*Inf` 特殊值检测；8 路 TF32 significand 乘法；product sign/exponent/zero 生成；`emax` 搜索 |
+| S1 | `stage1_data_t` | product/C 转换到 F=25；按 `emax` 对齐；对齐后再按符号转成 signed Q7.25 补码 |
+| S2 | `stage2_data_t` | 8 products + C 的 33-bit signed Q7.25 累加 |
+| S3 | `stage3_data_t` | 特殊值选择或 FP32 规约化 normalize + RZ pack 输出 |
 
-Latency 为 5 个 `pipeline_reg` stage。无 stall 时，输入 fire 后第 5 个有效流水输出对应结果；持续 ready 时可每周期吞吐 1 个 dot16。
+Latency 为 4 个 `pipeline_reg` stage。无 stall 时，输入 fire 后第 4 个有效流水输出对应结果；持续 ready 时可每周期吞吐 1 个 dot8。
 
-## 4. FP16/BF16 解码
+## 4. TF32 输入解码
 
-FP16 格式：
+TF32 不是独立 32-bit 存储格式。本单元外部接收 FP32 bit pattern，内部只保留 FP32 的 sign、8-bit exponent 和 fraction 高 10 bit：
 
 ```text
-sign: 1 bit
-exp : 5 bits
-frac: 10 bits
-bias: 15
+fp32_sign  = x[31]
+fp32_exp   = x[30:23]
+fp32_frac  = x[22:0]
+tf32_frac  = fp32_frac[22:13]
+tf32_drop  = fp32_frac[12:0]    // ignored
 ```
 
-分类：
-
-| 条件 | 类型 | significand | unbiased exponent |
-| --- | --- | --- | --- |
-| `exp == 0 && frac == 0` | zero | 0 | 0 |
-| `exp == 0 && frac != 0` | subnormal | `{1'b0, frac}` | -14 |
-| `0 < exp < 31` | normal | `{1'b1, frac}` | `exp - 15` |
-| `exp == 31 && frac == 0` | infinity | 0 | 0 |
-| `exp == 31 && frac != 0` | NaN | 0 | 0 |
-
-BF16 格式：
+TF32 计算 significand：
 
 ```text
 sign: 1 bit
 exp : 8 bits
-frac: 7 bits
+frac: 10 bits
 bias: 127
 ```
 
@@ -160,11 +141,17 @@ bias: 127
 
 | 条件 | 类型 | significand | unbiased exponent |
 | --- | --- | --- | --- |
-| `exp == 0 && frac == 0` | zero | 0 | 0 |
-| `exp == 0 && frac != 0` | subnormal | `{1'b0, frac, 3'b000}` | -126 |
-| `0 < exp < 255` | normal | `{1'b1, frac, 3'b000}` | `exp - 127` |
-| `exp == 255 && frac == 0` | infinity | 0 | 0 |
-| `exp == 255 && frac != 0` | NaN | 0 | 0 |
+| `exp == 0 && tf32_frac == 0` | zero | 0 | 0 |
+| `exp == 0 && tf32_frac != 0` | subnormal | `{1'b0, tf32_frac}` | -126 |
+| `0 < exp < 255` | normal | `{1'b1, tf32_frac}` | `exp - 127` |
+| `exp == 255 && fp32_frac == 0` | infinity | 0 | 0 |
+| `exp == 255 && fp32_frac != 0` | NaN | 0 | 0 |
+
+注意：
+
+* NaN 判断使用原始 FP32 fraction，即使 NaN payload 只落在低 13 bit，也必须保持 NaN。
+* 有限输入先做 TF32 RZ 截断再进入乘法；若 FP32 subnormal 的高 10 bit fraction 全 0，则该 lane 在 TF32 datapath 中视为 zero。
+* 本规格不做 FP32 到 TF32 的 RNE，也不保留 sticky bit。
 
 RTL type:
 
@@ -176,12 +163,19 @@ typedef struct packed {
     logic                    is_zero;
     logic                    is_inf;
     logic                    is_nan;
-} fp16_bf16_dec_t;
+} tf32_dec_t;
 ```
 
-说明：FP16 product exponent 理论上 signed 7 bit 足够，BF16 product exponent 范围与 FP32 接近；RTL 统一使用 `EXP_W=10`，与 FP32 C exponent 和 `emax` 对齐，减少符号扩展与拼接复杂度。
+`EXP_W=10` 覆盖 TF32/FP32 exponent 范围和 product exponent 范围：
+
+```text
+TF32 finite exponent:  -126..127
+TF32 product exponent: -252..254
+```
 
 ## 5. FP32 C 解码
+
+FP32 C 不截断为 TF32，直接以 FP32 精度进入 F=25 对齐路径。
 
 FP32 格式：
 
@@ -261,7 +255,7 @@ C 是 NaN
 | 只存在 `-∞` | `32'hff80_0000` |
 | 不存在 Inf / NaN | 进入普通 datapath |
 
-## 7. FP16/BF16 Product
+## 7. TF32 Product
 
 对每个 lane：
 
@@ -271,14 +265,7 @@ sig_p[k]  = sig_a[k] × sig_b[k]
 exp_p[k]  = exp_a[k] + exp_b[k]
 ```
 
-FP16 significand 为 Q1.10。BF16 significand 先从 Q1.7 左移 3 bit 映射为 Q1.10：
-
-```text
-FP16 sig = {hidden, frac[9:0]}
-BF16 sig = {hidden, frac[6:0], 3'b000}
-```
-
-统一乘积为：
+TF32 significand 为 Q1.10，乘积为：
 
 ```text
 Q1.10 × Q1.10 = Q2.20
@@ -287,8 +274,8 @@ Q1.10 × Q1.10 = Q2.20
 | 字段 | RTL 位宽 | 数学说明 |
 | --- | ---: | --- |
 | `sign_p[k]` | 1 | product 符号 |
-| `sig_p[k]` | 22 | Q2.20 product significand；BF16 product 等价于 Q1.7 × Q1.7 后左移 6 bit |
-| `exp_p[k]` | signed 10 | `exp_a + exp_b`，FP16 理论范围 -28..30，BF16 finite 范围 -252..254 |
+| `sig_p[k]` | 22 | Q2.20 product significand |
+| `exp_p[k]` | signed 10 | `exp_a + exp_b`，理论范围 -252..254 |
 | `is_zero_p[k]` | 1 | zero 或特殊值 lane 不参与普通累加 |
 
 Product 不进行 normalize。例如 `1.5 × 1.5` 保持 `2.25 × 2^(ea+eb)`，不改写成 `1.125 × 2^(ea+eb+1)`。
@@ -298,12 +285,10 @@ Product 不进行 normalize。例如 `1.5 × 1.5` 保持 `2.25 × 2^(ea+eb)`，�
 最大指数：
 
 ```text
-emax = max(exp_c, exp_p[0], exp_p[1], ..., exp_p[15])
+emax = max(exp_c, exp_p[0], exp_p[1], ..., exp_p[7])
 ```
 
-Zero lane 不参与 `emax` 搜索。若 C 和所有 product 都为 zero，则 S2 输出 zero payload。
-
-RTL 中：
+Zero lane 不参与 `emax` 搜索。`emax` 在 S0 与 product 生成同级完成，并随 product/C payload 传到 S1。若 C 和所有 product 都为 zero，则 S0 标记 zero payload。
 
 | 字段 | 位宽 | 说明 |
 | --- | ---: | --- |
@@ -333,7 +318,7 @@ shift_p[k] = emax - exp_p[k]
 aligned_mag = prod_mag >> shift_p[k]
 ```
 
-再按符号转成 signed Q7.25：
+S1 先完成无符号 magnitude 对齐，然后再按符号转成 signed Q7.25 补码：
 
 ```text
 aligned_p_signed[k] = sign_p[k] ? -signed({1'b0, aligned_mag})
@@ -356,7 +341,7 @@ c_mag = sig_c << 2
 
 得到 unsigned Q1.25，有效宽度 26 bit，再零扩展到 `ALIGN_MAG_W=32`。
 
-按 exponent 差值右移并按符号转成 signed Q7.25：
+S1 先按 exponent 差值右移得到无符号 magnitude，再按符号转成 signed Q7.25 补码：
 
 ```text
 shift_c = emax - exp_c
@@ -371,6 +356,7 @@ aligned_c_signed = sign_c ? -signed({1'b0, c_mag >> shift_c})
 RTL localparams：
 
 ```systemverilog
+localparam int DOT_WIDTH          = 8;
 localparam int EXP_W              = 10;
 localparam int PROD_SIG_W         = 22;
 localparam int ALIGN_FRAC_BITS    = 25;
@@ -390,12 +376,12 @@ signed Q7.25
 最大值边界：
 
 ```text
-16 × max(FP16/BF16 product significand) + max(C significand)
-< 16 × 4 + 2
-= 66
+8 × max(TF32 product significand) + max(C significand)
+< 8 × 4 + 2
+= 34
 ```
 
-因此 signed Q7.25 覆盖 `[-128, +127]`，足够表达所有对齐后的有限累加结果。
+因此 signed Q6.25 已足够表达所有对齐后的有限累加结果；本规格仍建议采用 signed Q7.25，与 FP16 F=25 单元保持 datapath 位宽一致，降低共享 align/pack 逻辑的集成成本。
 
 | 字段 | 位宽 | 说明 |
 | --- | ---: | --- |
@@ -403,25 +389,25 @@ signed Q7.25
 | `aligned_c_signed` | 33 | signed Q7.25 C |
 | `sum` / `sum_fixed` | 33 | signed Q7.25 累加结果 |
 
-注意：`aligned_prod_flat` 是 `16 × 33 = 528 bit` 的 packed bus，但每个 lane 仍是 33 bit。
+注意：`aligned_prod_flat` 是 `8 × 33 = 264 bit` 的 packed bus，但每个 lane 仍是 33 bit。
 
 ## 10. Accumulate
 
-S3 计算：
+S2 计算：
 
 ```text
 sum_fixed = aligned_c_signed
           + aligned_p_signed[0]
           + aligned_p_signed[1]
           + ...
-          + aligned_p_signed[15]
+          + aligned_p_signed[7]
 ```
 
-实现中使用一个 combinational loop 累加到 `sum_acc_tmp`。由于所有输入都已经完成 F=25 RZ 对齐，累加过程不再产生额外舍入。数学上加法顺序不影响结果；实现形式可后续替换为 balanced adder tree 以优化时序。
+实现中可先使用 combinational loop 累加到 `sum_acc_tmp`。由于所有输入都已经完成 F=25 RZ 对齐，累加过程不再产生额外舍入。数学上加法顺序不影响结果；实现形式可后续替换为 balanced adder tree 以优化时序。
 
 ## 11. FP32 Normalize + RZ Pack
 
-S4 对 `sum_fixed × 2^base_exp` pack 成 FP32，其中：
+S3 对 `sum_fixed × 2^base_exp` 规约化并 pack 成 FP32，其中：
 
 ```text
 base_exp = emax - 25
@@ -488,32 +474,35 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 
 所有 FP32 fraction 输出为 RZ，不做 RNE，不做 sticky rounding。
 
-## 12. RTL 结构
+## 12. RTL 结构建议
 
-当前实现没有拆成独立子模块，而是将这些功能以内联 function、struct payload 和 5 个 `pipeline_reg` 实例组织在 `fp16_dot_prod` 中。
+当前实现将功能以内联 function、struct payload 和 4 个 `pipeline_reg` 实例组织在 `tf32_dot_prod` 中。相比 FP16 单元，TF32 dot8 lane 数更少，可将 product 生成和 `emax` 搜索合并到 S0，缩短流水级数。
 
 | 规格功能 | RTL 实现 |
 | --- | --- |
-| FP16/BF16 decode | `function automatic fp16_bf16_dec_t decode_fp16_bf16` |
-| FP32 decode | `function automatic fp32_dec_t decode_fp32` |
+| TF32 decode | S0 `function automatic tf32_dec_t decode_tf32_from_fp32` |
+| FP32 C decode | S0 `function automatic fp32_dec_t decode_fp32` |
 | special case handler | S0 `always_comb` |
-| FP16/BF16 product array | S1 `always_comb` loop |
-| max exponent search | S2 `always_comb` |
-| align to F25 | `function automatic align_fixed_rz` |
-| fixed-point accumulate | S3 `always_comb` |
-| FP32 normalize RZ | `function automatic pack_fp32_rz` |
-| pipeline registers | `pipeline_reg` × 5 |
+| TF32 product array | S0 `always_comb` loop |
+| max exponent search | S0 `always_comb` |
+| align to F25 | S1 `function automatic align_mag_rz` |
+| signed two's-complement conversion | S1 对齐后按符号转换 |
+| fixed-point accumulate | S2 `always_comb` |
+| FP32 normalize RZ | S3 `function automatic pack_fp32_rz` |
+| pipeline registers | `pipeline_reg` × 4 |
 
 ## 13. 关键设计点总结
 
-| 设计点 | RTL 对齐后的规格 |
+| 设计点 | 规格 |
 | --- | --- |
-| 主模块 | `fp16_dot_prod` |
-| 兼容模块 | `fp16_dot16_fda_f25` / `bf16_dot16_fda_f25` wrapper |
-| 输入格式 | `fmt_is_bf16_i=0` 为 FP16，`fmt_is_bf16_i=1` 为 BF16；`a_vec_i[k*16 +: 16]` / `b_vec_i[k*16 +: 16]` |
+| 主模块 | `tf32_dot_prod` |
+| 兼容模块 | `tf32_dot8_fda_f25` wrapper |
+| 输入格式 | 外部 FP32 编码，内部 TF32 截断 |
+| 输入布局 | `a_vec_i[k*32 +: 32]` / `b_vec_i[k*32 +: 32]` |
 | valid-ready | 主模块支持 `in_vld_i/in_rdy_o/out_vld_o/out_rdy_i` |
-| FP16/BF16 product 是否 normalize | 不 normalize |
-| product significand | 22 bit Q2.20，BF16 通过低 3 bit padding 复用 11×11 multiplier |
+| TF32 截断 | FP32 fraction 低 13 bit 直接截断 |
+| TF32 product 是否 normalize | 不 normalize |
+| product significand | 22 bit Q2.20 |
 | product exponent RTL 位宽 | signed 10 |
 | 对齐基准 | `emax = max(C exponent, product exponents)` |
 | 内部对齐精度 | F = 25 |
@@ -534,7 +523,7 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 D = Normalize_FP32_RZ {
         2^emax × [
             Trunc_F25(sc × 2^(ec - emax))
-          + Σ Trunc_F25(sa[k] × sb[k] × 2^(ea[k] + eb[k] - emax))
+          + Σ Trunc_F25(TF32_RZ(sa[k]) × TF32_RZ(sb[k]) × 2^(ea[k] + eb[k] - emax))
         ]
     }
 ```
@@ -545,48 +534,63 @@ D = Normalize_FP32_RZ {
 F = 25
 ```
 
-`Trunc_F25` 表示保留 25 个 fractional bits，低位直接截断。
+`TF32_RZ` 表示将 FP32 输入截断到 TF32 significand，即保留 10 个 fraction bit；`Trunc_F25` 表示保留 25 个 fractional bits，低位直接截断。
 
-## 15. 验证状态
+## 15. 验证建议
 
-已执行的 lint：
-
-```text
-verilator --lint-only --sv --top-module fp16_dot_prod \
-  src/main/pipeline_reg.sv src/main/fp16_dot_prod.sv
-```
-
-结果：通过。说明：同文件包含 FP16/BF16 wrapper，裸跑 Verilator 会因多个 top module 报 `MULTITOP` warning；指定 `--top-module fp16_dot_prod` 后通过。
-
-已执行的 FP16/BF16 MMA-Sim 对比仿真：
+已执行的本地 lint：
 
 ```text
-PATH=/opt/homebrew/bin:$PATH make \
-  TOPLEVEL=fp16_dot_prod \
-  COCOTB_TEST_MODULES=test_fp16_dot \
-  VERILOG_SOURCES="/Users/liuyuxuan/work/Allegro/src/main/pipeline_reg.sv /Users/liuyuxuan/work/Allegro/src/main/fp16_dot_prod.sv"
+verilator --lint-only --sv src/main/pipeline_reg.sv src/main/tf32_dot_prod.sv
 ```
 
-结果：`TESTS=1 PASS=1 FAIL=0 SKIP=0`。
+已执行的基本仿真：
 
-覆盖项：
+```text
+iverilog -g2012 -Wall -o /tmp/tf32_dot_prod_mmasim.vvp \
+  src/main/pipeline_reg.sv \
+  src/main/tf32_dot_prod.sv \
+  /tmp/tf32_dot_prod_basic_tb.sv
 
-| 类型 | 场景 |
-| --- | --- |
-| FP16 regression | 旧 directed/random finite case，wrapper 固定 `fmt_is_bf16_i=0` |
-| BF16 directed | zero、normal、subnormal、Inf、NaN、`0*Inf`、正负 Inf 冲突 |
-| BF16 reference | `torch.bfloat16` 输入调用 MMA-Sim `nv_fused_dot_add(..., n_fractional_bits=25, output_type="f32")` |
-| RZ 边界 | 大指数差导致 shifted-out bits 截断，FP32 normal/subnormal/overflow pack |
-| Random | 默认 20000 组 deterministic FP16/BF16 mixed random case |
+vvp /tmp/tf32_dot_prod_basic_tb.vvp
+```
 
-FP16 regression 建议沿用原覆盖内容：
+结果：
+
+```text
+PASS d=41000000
+```
+
+已执行的 MMA-Sim 对比：
+
+```text
+python3 /tmp/tf32_mmasim_verify.py
+```
+
+参考模型来自 `MMA-Sim/mmasim/simulator/arithmetic.py`：
+
+```text
+truncate_to_tf32(A)
+truncate_to_tf32(B)
+nv_fused_dot_add(A_tf32, B_tf32, C, n_fractional_bits=25, output_type="f32")
+```
+
+结果：
+
+```text
+MMA-Sim TF32 compare PASS: 85 cases
+```
+
+最低覆盖内容：
 
 | 类型 | 说明 |
 | --- | --- |
-| Basic | 16 路 `1.0h * 1.0h` 输出 `16.0f` |
+| Basic | 8 路 `1.0f * 1.0f` 输出 `8.0f` |
+| TF32 truncation | FP32 lower 13 fraction bit 改变不影响 product |
 | C-only | A/B 全 zero，输出 C |
 | Cancellation | 正负 product 抵消 |
-| Special | `0 * Inf`、`+Inf`、NaN |
-| Random | deterministic FP16/FP32 case |
+| Subnormal | FP32 subnormal 截断到 TF32 subnormal 或 zero |
+| Special | `0 * Inf`、`+Inf`、`-Inf`、NaN |
+| Random | deterministic FP32 case，经 `truncate_to_tf32()` 后与 MMA-Sim 比较 |
 
-说明：若本机 Python 环境没有 `torch`，可沿用 `/tmp` 下的最小 torch shim 让 `MMA-Sim` 的 `nv_fused_dot_add` 可执行；参考函数仍来自 `MMA-Sim/mmasim/simulator/arithmetic.py`。
+当前状态：`src/main/tf32_dot_prod.sv` 已实现 4-stage TF32 dot8 F=25 datapath，并通过 Verilator lint、basic dot8 仿真和 85 组 MMA-Sim finite case 对比。

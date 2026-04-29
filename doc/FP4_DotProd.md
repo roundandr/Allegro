@@ -1,26 +1,29 @@
-# 64-Element NVFP4 GDFS Dot Product Unit SPEC
+# 64-Element FP4 GDFS Dot Product Unit SPEC
 
 ## 1. 功能定义
 
-该单元实现如下 64 元素 NVFP4 点积加 FP32 累加操作：
+该单元实现 64 元素 E2M1/FP4 点积加 FP32 累加操作，并通过 `fp4_mode_i`
+选择 NVFP4、MXFP4 或不带 micro-scale 的纯 FP4 模式。
+
+通用形式如下：
 
 $$
 d = c + \sum_{i=0}^{63}
 \left(
-a_i \cdot b_i \cdot aSF_{\lfloor i / 16 \rfloor} \cdot bSF_{\lfloor i / 16 \rfloor}
+a_i \cdot b_i \cdot aSF(i) \cdot bSF(i)
 \right)
 $$
 
 其中：
 
-* $a_i$、$b_i$ 为 NVFP4 数据；
-* $aSF_g$、$bSF_g$ 为第 $g$ 组的 UE4M3 scale factor；
-* 每组包含 16 个元素；
-* 总共有 4 个 group dot product；
+* $a_i$、$b_i$ 为 E2M1 FP4 数据；
+* NVFP4 模式下每 16 个元素共用 1 个 UE4M3 scale；
+* MXFP4 模式下每 32 个元素共用 1 个 E8M0 scale；
+* FP4 模式下 scale 固定为 1，`a_sf_i` / `b_sf_i` 被忽略；
 * $c$ 为 FP32 输入累加值；
 * $d$ 为 FP32 输出结果。
 
-将 64 个元素按 16 个一组划分：
+内部仍将 64 个元素按 16 个一组划分为 4 个 group dot product：
 
 $$
 \sigma_g = \sum_{i=16g}^{16g+15} a_i b_i,\quad g=0,1,2,3
@@ -30,7 +33,7 @@ $$
 
 $$
 \gamma_g =
-\sigma_g \cdot a^{SF}_g \cdot b^{SF}_g
+\sigma_g \cdot aSF(g) \cdot bSF(g)
 $$
 
 最终：
@@ -49,10 +52,11 @@ $$
 | `rst_n` | 1 | 低有效异步复位信号 |
 | `in_vld_i` | 1 | 输入有效信号 |
 | `in_rdy_o` | 1 | 单元可接收输入 |
-| `a_fp4_i` | 256 | 64 个 NVFP4 A 操作数，每个 4 bit |
-| `b_fp4_i` | 256 | 64 个 NVFP4 B 操作数，每个 4 bit |
-| `a_sf_i` | 32 | 4 个 A 侧 UE4M3 scale，每个 8 bit |
-| `b_sf_i` | 32 | 4 个 B 侧 UE4M3 scale，每个 8 bit |
+| `a_fp4_i` | 256 | 64 个 E2M1/FP4 A 操作数，每个 4 bit |
+| `b_fp4_i` | 256 | 64 个 E2M1/FP4 B 操作数，每个 4 bit |
+| `fp4_mode_i` | 2 | FP4 模式选择，见下表 |
+| `a_sf_i` | 32 | A 侧 scale，按模式解释 |
+| `b_sf_i` | 32 | B 侧 scale，按模式解释 |
 | `c_fp32_i` | 32 | FP32 累加输入 |
 | `out_vld_o` | 1 | 输出有效信号 |
 | `out_rdy_i` | 1 | 下游可接收输出 |
@@ -71,15 +75,24 @@ out_fire = out_vld_o & out_rdy_i
 * 反压向前传播，`in_rdy_o` 拉低；
 * `rst_n = 0` 时，所有 stage valid 清零，`out_vld_o = 0`。
 
+模式编码：
+
+| `fp4_mode_i` | 模式 | scale 语义 |
+| --- | --- | --- |
+| `2'd0` | NVFP4 | `sf[8*g +: 8]` 对应 16-lane group `g=0..3`，格式 UE4M3 |
+| `2'd1` | MXFP4 | `sf[7:0]` 覆盖 lane 0..31，`sf[15:8]` 覆盖 lane 32..63，格式 E8M0，`sf[31:16]` 忽略 |
+| `2'd2` | FP4 | scale 固定为 1，`a_sf_i` / `b_sf_i` 忽略 |
+| 其他 | NVFP4 | 预留编码按 NVFP4 处理 |
+
 ---
 
 ## 3. 数据格式定义
 
-### 3.1 NVFP4 数据格式
+### 3.1 E2M1 / FP4 数据格式
 
-NVFP4 元素宽度为 4 bit。该单元只负责按照 NVFP4 数值表将 4 bit 编码解码为内部定点值。
+FP4 元素宽度为 4 bit。该单元只负责按照 E2M1/NVFP4 数值表将 4 bit 编码解码为内部定点值。
 
-NVFP4 解码后的典型数值集合为：
+FP4 解码后的典型数值集合为：
 
 $$
 \pm \{0, 0.5, 1, 1.5, 2, 3, 4, 6\}
@@ -101,7 +114,12 @@ $$
 
 ---
 
-### 3.2 UE4M3 scale 格式
+### 3.2 Scale 格式
+
+NVFP4 模式使用 UE4M3 scale。MXFP4 模式使用 E8M0 scale。FP4 模式不解码
+scale，内部注入 unit scale。
+
+#### 3.2.1 UE4M3 scale 格式
 
 每个 scale factor 使用 8 bit 存储，但 Tensor Core 始终将最高位视为 0：
 
@@ -147,6 +165,36 @@ $$
 * UE4M3 无 infinity；
 * 本规格中仅 `7'b111_1111` 视为 NaN，其余编码均视为有限值。
 
+#### 3.2.2 E8M0 scale 格式
+
+MXFP4 模式下每个 scale factor 使用 8 bit E8M0 编码：
+
+```text
+scale_raw == 8'hff : NaN
+scale_raw != 8'hff : SF = 2^(scale_raw - 127)
+```
+
+RTL 内部仍用 `SF = s_SF × 2^e_SF` 表示 scale：
+
+```text
+s_SF = 4'd8
+e_SF = scale_raw - 130
+```
+
+即 `8 × 2^(scale_raw - 130) = 2^(scale_raw - 127)`。
+
+#### 3.2.3 Unit scale
+
+FP4 模式下：
+
+```text
+s_SF = 4'd8
+e_SF = -3
+```
+
+即 `8 × 2^-3 = 1`。该模式忽略输入 scale bit，因此 scale 输入为 NaN
+编码也不会触发特殊值输出。
+
 ---
 
 ### 3.3 FP32 `c` 和 `d`
@@ -163,12 +211,12 @@ fraction : 23 bit
 
 | 条件 | 输出 |
 | --- | --- |
-| 任意 scale factor 为 NaN | `d = NaN`，编码为 `0x7FFFFFFF` |
+| 任意有效 scale factor 为 NaN | `d = NaN`，编码为 `0x7FFFFFFF` |
 | `c` 为 NaN | `d = NaN`，编码为 `0x7FFFFFFF` |
 | `c` 为 `+Inf` 或 `-Inf` | `d = c` |
 | 无特殊值 | 进入正常 GDFS 计算路径 |
 
-由于 NVFP4 数据本身不包含 NaN 和 Inf，因此不需要检查 `a_fp4_i` 和 `b_fp4_i` 的 NaN/Inf。
+由于 FP4 数据本身不包含 NaN 和 Inf，因此不需要检查 `a_fp4_i` 和 `b_fp4_i` 的 NaN/Inf。
 
 `c` 的正常数 / 非正规数解码规则固定为：
 
@@ -203,33 +251,40 @@ $$
 | --- | --: | --- |
 | `FP4_PROD_W` | 9 | 单个 FP4 乘积，signed Q6.2 |
 | `SIGMA_W` | 13 | 16 项局部和，signed Q10.2 |
-| `SF_SIG_W` | 4 | 单个 UE4M3 significand |
-| `SF_EXP_W` | 5 | 单个 UE4M3 指数，signed |
+| `SF_SIG_W` | 4 | 单个 scale significand |
+| `SF_EXP_W` | 9 | 单个 scale 指数，signed，覆盖完整 E8M0 |
 | `SF_SIG_PROD_W` | 8 | 两个 scale significand 乘积 |
-| `SF_EXP_SUM_W` | 6 | 两个 scale 指数和，signed |
+| `SF_EXP_SUM_W` | 10 | 两个 scale 指数和，signed |
 | `GAMMA_SIG_W` | 20 | `sigma_int × sf_sig_prod` 的结果 |
-| `GAMMA_EXP_W` | 6 | `gamma` 的有符号指数 |
+| `GAMMA_EXP_W` | 10 | `gamma` 的有符号指数，和 C exponent 统一比较 |
 | `C_SIG_W` | 24 | FP32 `c` 的 24-bit significand |
-| `C_EXP_W` | 9 | FP32 `c` 的有符号指数 |
-| `EXP_DIFF_W` | 10 | 两个 9-bit signed exponent 相减得到的 shift 位宽 |
-| `ALIGN_W` | 29 | 融合累加对齐时保留的 fractional bits |
-| `ALIGN_MAG_W` | 30 | 归一化后单项 magnitude 位宽，Q1.29 |
-| `ALIGN_TERM_W` | 31 | 对齐后的 signed fixed-point term 位宽，含符号和 Q1.29 magnitude |
-| `ALIGN_SHIFT_W` | 5 | 对 `ALIGN_MAG_W` 宽度数据右移的 shift amount 位宽 |
-| `SUM_W` | 34 | 5 路对齐后求和结果位宽 |
-| `ALIGN_W_EXP` | 29 | `ALIGN_W` 转成 signed exponent 后用于计算 `base_exp` |
+| `C_EXP_W` | 10 | FP32 `c` 和 gamma 的统一有符号指数 |
+| `EXP_DIFF_W` | 11 | 两个 10-bit signed exponent 相减得到的 shift 位宽 |
+| `ALIGN_FRAC_W` | 35 | GDFS Step 5 对齐域保留的 fractional bits |
+| `ALIGN_INT_W` | 11 | 对齐域预留的 integer headroom |
+| `ALIGN_MAG_W` | 46 | Step 5 对齐前单项 magnitude 位宽，`35 + 11` |
+| `ALIGN_TERM_W` | 47 | 对齐后的 signed fixed-point term 位宽，含符号和 magnitude |
+| `ALIGN_SHIFT_W` | 6 | 对 `ALIGN_MAG_W` 宽度数据移位的 shift amount 位宽 |
+| `SUM_W` | 50 | 5 路对齐后求和结果位宽 |
+| `FP4_DOT_EXP` | -2 | 当前 S0 FP4 乘积使用 `Q*.2` 编码，对应 group dot exponent |
+| `GAMMA_NORM_EXP` | 8 | 从 gamma raw exponent 转 normalized exponent 的偏移 |
+| `C_NORM_EXP` | 23 | 从 C raw exponent 转 normalized exponent 的偏移 |
+| `GAMMA_ALIGN_LSHIFT_W` | 27 | gamma raw magnitude 预左移到 35 fractional domain 的固定移位 |
+| `C_ALIGN_LSHIFT_W` | 12 | C raw magnitude 预左移到 35 fractional domain 的固定移位 |
 
 位宽来源说明：
 
 * `SIGMA_W = 13`，因为 `16 × 36 = 576`，并保留 2 个 fractional bits；
 * `SF_SIG_PROD_W = 8`，因为 `max(15 × 15) = 225`；
 * `GAMMA_SIG_W = 20`，因为内部整数编码最大值为 `2304 × 225 = 518400`；
-* `ALIGN_W = 29`，是当前 RTL 与本地 MMA-Sim 测试对齐后采用的 fractional bits；
-* `ALIGN_MAG_W = ALIGN_W + 1 = 30`，表示归一化后的 Q1.29 magnitude；
-* `ALIGN_TERM_W = ALIGN_MAG_W + 1 = 31`，表示带符号的对齐结果；
-* `ALIGN_SHIFT_W = ceil(log2(ALIGN_MAG_W + 1)) = 5`，用于表达 `0..30` 的右移量；
-* `SUM_W = ALIGN_TERM_W + ceil(log2(5)) = 31 + 3 = 34`，可覆盖 5 路同宽 signed 加法；
-* `ALIGN_W_EXP = 29`，用于在 S3 中计算 `base_exp = emax - 29`。
+* `ALIGN_MAG_W = ALIGN_FRAC_W + ALIGN_INT_W = 35 + 11 = 46`，用于 S2 对齐时容纳 raw magnitude 左移后的结果；
+* `ALIGN_TERM_W = ALIGN_MAG_W + 1 = 47`，表示带符号的对齐结果；
+* `ALIGN_SHIFT_W = ceil(log2(ALIGN_MAG_W + 1)) = 6`，用于表达 `0..46` 的移位量；
+* `SUM_W = ALIGN_TERM_W + ceil(log2(5)) = 47 + 3 = 50`，可覆盖 5 路同宽 signed 加法；
+* `FP4_DOT_EXP = -2`，因为 `fp4_product` 中 `1.5 -> 3` 带 `exp=-1`，两个 FP4 相乘后 group dot 统一带 `exp=-2`。
+* `GAMMA_NORM_EXP = 8`，因为 `gamma_raw = sigma_int × sf_sig_prod` 相对 normalized significand 带 8 个 fractional bits；
+* `C_NORM_EXP = 23`，因为 FP32 C raw significand 带 23 个 fractional bits。
+* `GAMMA_ALIGN_LSHIFT_W = 35 - 8 = 27`，`C_ALIGN_LSHIFT_W = 35 - 23 = 12`，这两个固定左移用连线补零实现，不进入动态对齐移位器。
 
 ---
 
@@ -418,27 +473,43 @@ $$
 \text{sfExpSum}_g = e_{a,g} + e_{b,g}
 $$
 
-硬件统一输出：
+硬件先得到未左移的内部整数：
 
 $$
-\gamma^{sig}_g = \sigma^{int}_g \times \text{sfSigProd}_g
+\gamma^{raw}_g = \sigma^{int}_g \times \text{sfSigProd}_g
 $$
+
+其中 `sigma_int` 是 FP4 group dot 的定点 significand，当前 S0 乘积编码使其统一带 `exp=-2`。RTL 在 S1 只寄存窄的 `gamma_raw` magnitude 和对应 raw exponent：
+
+$$
+\gamma^{mag}_g = |\gamma^{raw}_g|
+$$
+
+$$
+\gamma^{normExp}_g = \gamma^{exp}_g + 8
+$$
+
+对应指数为 scale 乘积 exponent 与 FP4 group dot exponent 之和：
 
 $$
 \gamma^{exp}_g = \text{sfExpSum}_g - 2
 $$
 
+$$
+\gamma^{normExp}_g = \text{sfExpSum}_g + 6
+$$
+
 因此：
 
 $$
-\gamma_g = \gamma^{sig}_g \times 2^{\gamma^{exp}_g}
+\gamma_g = \operatorname{sign}(\gamma^{raw}_g) \times \gamma^{mag}_g \times 2^{\gamma^{exp}_g}
 $$
 
 说明：
 
-* `-2` 来自 `sigma_int_g` 的 2 个 fractional bits；
-* `gamma_sig_g` 为有符号整数；
-* `gamma_exp_g` 为有符号指数；
+* `gamma_mag_g` 是 S1 寄存的窄无符号 magnitude；
+* `gamma_exp_g` 是与 raw integer magnitude 配套的 exponent；
+* `gamma_normExp_g` 是 GDFS Step 5 参与 `emax` 比较的 normalized significand exponent；
 * 该步骤不发生精度损失。
 
 ---
@@ -451,36 +522,60 @@ $$
 c,\gamma_0,\gamma_1,\gamma_2,\gamma_3
 $$
 
-首先提取它们的原始指数：
+首先在 S2 生成参与 `emax` 比较的 normalized exponent：
 
 $$
 e_c,e_0,e_1,e_2,e_3
 $$
 
-然后计算最大原始 exponent：
+然后计算最大 normalized exponent：
 
 $$
 e_{\max} = \max(e_c,e_0,e_1,e_2,e_3)
 $$
 
-S1 先将每一项规约为 compact significand + exponent 形式，其中 significand 固定为 `Q1.29`：
+S1 先将每一项规约为 raw integer magnitude + raw exponent：
 
 $$
-sig^{norm} \in [1,2), \quad width = Q1.29
+value = sign \times sig^{raw} \times 2^{e^{raw}}
 $$
 
-然后只根据 exponent 差右移：
+S2 将 MMA-Sim 公式拆成固定预左移和动态右移。原始公式为：
+
+$$
+shift = 35 + e^{raw} - e_{\max}
+$$
+
+其中 normalized exponent 为：
+
+$$
+e^{norm} = e^{raw} + fracBits
+$$
+
+因此：
+
+$$
+sig^{raw} \times 2^{35 + e^{raw} - e_{\max}}
+=
+\left(sig^{raw} \ll (35 - fracBits)\right)
+\gg
+\left(e_{\max} - e^{norm}\right)
+$$
+
+硬件先用连线固定左移到 35 fractional domain，再按 `emax - e_norm` 只做 RZ 右移：
 
 $$
 \hat{s} =
-\operatorname{RZ}\left(sig^{norm} \gg (e_{\max} - e)\right)
+\operatorname{RZ}\left(sig^{pre} \gg (e_{\max} - e^{norm})\right)
 $$
 
 规则：
 
-* 因为 $e_{\max}$ 是最大原始 exponent，对齐阶段只需要根据 `emax - e` 右移；
+* gamma 的 `fracBits = 8`，固定左移 `35 - 8 = 27`；
+* C 的 `fracBits = 23`，固定左移 `35 - 23 = 12`；
+* 动态对齐阶段只执行右移；
 * 舍入模式固定为 RZ；
-* 对齐后所有数共享同一个基准指数 $e_{\max} - 29$；
+* 对齐后所有数共享同一个基准指数 $e_{\max} - 35$；
 * 若右移量大于等于操作数位宽，则对齐结果为 0；
 * 不能直接使用 signed arithmetic shift 代替 RZ，因为负数算术右移会向负无穷取整。
 
@@ -504,7 +599,7 @@ $$
 此时结果可以表示为：
 
 $$
-S \times 2^{e_{\max}-29}
+S \times 2^{e_{\max}-35}
 $$
 
 该步骤使用定点加法树完成。为了更低延迟可使用 5:2 compressor / carry-save tree：
@@ -519,7 +614,7 @@ $$
    final CPA
 ```
 
-`SUM_W = 34`，能够无损覆盖 5 路 `ALIGN_TERM_W = 31` 的 signed 求和。
+`SUM_W = 50`，能够无损覆盖 5 路 `ALIGN_TERM_W = 47` 的 signed 求和。
 
 ---
 
@@ -752,10 +847,10 @@ $$
 
 ### 功能
 
-将 group sum 与 scale significand 乘积相乘，生成：
+将 group sum 与 scale significand 乘积相乘，并把窄结果传给下一级：
 
 $$
-\gamma_g = \gamma^{sig}_g \times 2^{\gamma^{exp}_g}
+\gamma_g = \operatorname{sign}(\gamma^{raw}_g) \times \gamma^{mag}_g \times 2^{\gamma^{exp}_g}
 $$
 
 ### 接口定义
@@ -765,17 +860,18 @@ $$
 | `sigma_i` | 4 × 13 | 4 个 signed Q10.2 group sum |
 | `sf_sig_prod_i` | 4 × 8 | scale significand 乘积 |
 | `sf_exp_sum_i` | 4 × 6 | scale exponent 和 |
-| `gamma_sig_o` | 4 × 20 | 4 个 gamma significand |
-| `gamma_exp_o` | 4 × 6 | 4 个 gamma exponent |
+| `gamma_mag_o` | 4 × 20 | 4 个 S1 窄 gamma magnitude |
+| `gamma_exp_o` | 4 × 9 | 4 个 gamma exponent |
 
 ### 行为
 
 ```text
-gamma_sig_o = sigma_i × sf_sig_prod_i
-gamma_exp_o = sf_exp_sum_i - 2
+gamma_raw  = sigma_i × sf_sig_prod_i
+gamma_mag  = abs(gamma_raw)
+gamma_exp  = sf_exp_sum_i - 2
 ```
 
-其中 `-2` 对应 `sigma_i` 的 2 个 fractional bits。
+其中 `-2` 对应当前 FP4 乘积固定点编码的 2 个 fractional bits。S2 直接使用 raw magnitude 和 raw exponent 执行 MMA-Sim 对齐公式。
 
 ---
 
@@ -832,12 +928,12 @@ $$
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
 | `c_exp_i` | 9 | FP32 c 的 exponent |
-| `gamma_exp_i` | 4 × 6 | 4 个 gamma exponent |
+| `gamma_exp_i` | 4 × 9 | 4 个 gamma exponent |
 | `emax_o` | 9 | 最大 exponent |
 
 ### 微架构
 
-比较前需先将 `gamma_exp_i` 符号扩展到 9 bit，再与 `c_exp_i` 比较。
+`gamma_exp_i` 和 `c_exp_i` 均使用 9-bit signed exponent，直接进行 signed compare。
 
 ---
 
@@ -845,44 +941,46 @@ $$
 
 ### 功能
 
-将 4 个 gamma significand 和 c significand 对齐到同一个最大原始 exponent：
+将 4 个 gamma significand 和 c significand 对齐到同一个最大 normalized exponent：
 
 $$
-base\_exp = e_{\max} - 29
+base\_exp = e_{\max}
 $$
 
 ### 接口定义
 
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
-| `gamma_mag_i` | 4 × 30 | 4 个 gamma magnitude，Q1.29 |
-| `gamma_exp_i` | 4 × 6 | 4 个 gamma exponent |
-| `c_mag_i` | 30 | c magnitude，Q1.29 |
+| `gamma_mag_i` | 4 × 20 | 4 个 S1 窄 gamma magnitude |
+| `gamma_exp_i` | 4 × 9 | 4 个 gamma exponent |
+| `c_mag_i` | 24 | S1 窄 c magnitude |
 | `c_sign_i` | 1 | c 的符号 |
 | `c_exp_i` | 9 | c exponent |
-| `emax_i` | 9 | 最大原始 exponent |
-| `gamma_aligned_o` | 4 × 31 | 对齐后的 gamma fixed-point 值 |
-| `c_aligned_o` | 31 | 对齐后的 c fixed-point 值 |
+| `emax_i` | 9 | 最大 normalized exponent |
+| `gamma_aligned_o` | 4 × 47 | 对齐后的 gamma fixed-point 值 |
+| `c_aligned_o` | 47 | 对齐后的 c fixed-point 值 |
 
 ### 行为
 
 RTL 中对齐统一调用 `align_fixed_rz(term_mag, term_exp, emax)`：
 
-* `term_mag` 在进入对齐级之前已经在 S1 规约为 `Q1.29`；
-* 再计算 `align_shift = emax - term_exp`；
-* 因为 `emax` 是最大原始 exponent，`align_shift >= 0`，对齐阶段只右移；
-* 右移始终执行 `RZ`，即直接截断 shifted-out 低位。
+* `term_mag` 已经预左移到 35 fractional domain，gamma 为 `gamma_mag << 27`，C 为 `c_mag << 12`；
+* `term_exp` 使用 normalized exponent，C 为 `c_exp + 23`，gamma 为 `gamma_exp + 8`；
+* `emax` 搜索使用 normalized exponent；
+* `emax` 搜索包含 4 个 gamma block 的 exponent，即使对应 `gamma_mag` 为 0，也要保留 scale exponent 对 C 截断的影响；
+* 对齐位移为 `align_shift = emax - term_exp`；
+* 因为 `emax >= term_exp`，动态对齐阶段只右移并 RZ 截断。
 
 对于 gamma：
 
 ```text
-gamma_aligned_g = align_fixed_rz(gamma_mag_i[g], gamma_exp_i[g], emax_i)
+gamma_aligned_g = align_fixed_rz(gamma_mag_i[g] << 27, gamma_exp_i[g] + 8, emax_i)
 ```
 
 对于 c：
 
 ```text
-c_aligned = align_fixed_rz(c_mag_i, c_exp_i, emax_i)
+c_aligned = align_fixed_rz(c_mag_i << 12, c_exp_i + 23, emax_i)
 ```
 
 ---
@@ -906,9 +1004,9 @@ $$
 
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
-| `gamma_aligned_i` | 4 × 31 | 4 个对齐后的 gamma fixed-point 值 |
-| `c_aligned_i` | 31 | 对齐后的 c fixed-point 值 |
-| `sum_o` | 34 | 定点求和结果 |
+| `gamma_aligned_i` | 4 × 47 | 4 个对齐后的 gamma fixed-point 值 |
+| `c_aligned_i` | 47 | 对齐后的 c fixed-point 值 |
+| `sum_o` | 50 | 定点求和结果 |
 | `sum_zero_o` | 1 | 求和结果是否为 0 |
 | `sum_sign_o` | 1 | 求和结果符号 |
 
@@ -947,7 +1045,7 @@ $$
 
 | 接口名称 | 位宽 | 说明 |
 | --- | -: | --- |
-| `sum_i` | 34 | 定点求和结果 |
+| `sum_i` | 50 | 定点求和结果 |
 | `base_exp_i` | 9 | 融合累加域的基准指数 |
 | `d_fp32_o` | 32 | FP32 输出 |
 
@@ -978,8 +1076,8 @@ RZ 舍入规则：
 | Stage | 名称 | 主要功能 | 关键输出 | 时序压力 |
 | ----: | --- | --- | --- | ---- |
 | S0 | Input Register & Decode & Special Check & FP4 Product | 输入寄存；FP4 decode/product；UE4M3 scale decode；FP32 C decode；scale/C 特殊值检查 | `prod[63:0]`, scale sig/exp, `c_sign/c_sig/c_exp`, special flags | 中 |
-| S1 | Group Sum & Scale Product | 4 组 16-element product sum；scale significand product；scale exponent sum | `sigma[3:0]`, `sfSig[3:0]`, `sfExp[3:0]` | 中 |
-| S2 | Gamma Form & Emax Search & Alignment | `sigma × sfSig` 生成 gamma；搜索最大原始 exponent；5 路 significand 按 RZ 对齐 | aligned gamma/c, `emax` | 高 |
+| S1 | Group Sum & Gamma Form | 4 组 16-element product sum；scale significand product；scale exponent sum；生成窄 gamma/C magnitude | `gamma_mag/exp[3:0]`, `c_mag/exp` | 中 |
+| S2 | Emax Search & Alignment | 固定左移到 35 fractional domain；搜索最大 normalized exponent；5 路 significand 只按 RZ 右移对齐 | aligned gamma/c, `emax` | 中-高 |
 | S3 | Accumulate | 5-input fixed-point accumulation | `sum`, `base_exp` | 中 |
 | S4 | FP32 Normalize | zero/sign 处理；LOD；指数修正；RZ 截断；FP32 pack；special mux | `d_fp32_o` | 中-高 |
 
@@ -1091,7 +1189,7 @@ S0 同时完成特殊值检查：
 
 ---
 
-# S1：Group Sum & Scale Significand Product & Scale Exponent Sum
+# S1：Group Sum & Gamma Form
 
 ## 功能
 
@@ -1101,7 +1199,8 @@ S1 完成：
 1. 64 个 FP4 product 按 16 个一组求和
 2. scale significand product
 3. scale exponent sum
-4. C path 延迟一拍
+4. gamma raw significand 生成并以窄位宽打一拍
+5. C significand 以窄位宽打一拍
 ```
 
 ## Group sum
@@ -1135,81 +1234,91 @@ $$
 sfExp_g = e_{a,g} + e_{b,g}
 $$
 
-## C path 延迟
+## C path significand form
 
 ```text
-c_sign_s1 <= c_sign_s0
-c_sig_s1  <= c_sig_s0
-c_exp_s1  <= c_exp_s0
+c_exp_s1 = c_exp_s0
+c_mag_s1 = c_sig_s0
 ```
 
 ## S1 输出
 
 | 信号 | 位宽 / 格式 | 说明 |
 | --- | --: | --- |
-| `sigma_s1[3:0]` | 4 × 13 | 4 个 group sum，signed Q10.2 |
-| `sfSig_s1[3:0]` | 4 × 8 | scale significand product |
-| `sfExp_s1[3:0]` | 4 × 6 | scale exponent sum |
-| `c_sign_s1` | 1 | 延迟后的 C 符号 |
-| `c_sig_s1` | 24 | 延迟后的 C significand |
-| `c_exp_s1` | 9 | 延迟后的 C exponent |
+| `gamma_sign_s1[3:0]` | 4 × 1 | 4 个 gamma 符号 |
+| `gamma_mag_s1[3:0]` | 4 × 20 | 4 个 gamma magnitude |
+| `gamma_exp_s1[3:0]` | 4 × 9 | 4 个 gamma exponent |
+| `c_sign_s1` | 1 | C 符号 |
+| `c_mag_s1` | 24 | C magnitude |
+| `c_exp_s1` | 9 | C exponent |
 | `special_valid_s1` | 1 | 特殊值旁路有效 |
 | `special_result_s1` | 32 | 特殊值旁路结果 |
 
 ---
 
-# S2：Gamma Form & Emax Search & Alignment
+# S2：Emax Search & Alignment
 
 ## 功能
 
 S2 完成：
 
 ```text
-1. 4 路 gamma 的 compact magnitude 生成，固定为 `Q1.29`
-2. 4 路 gamma exponent 生成
-3. 5-input maximum exponent search
-4. 生成原始 exponent 的 `emax`
-5. 相对 `emax` 只执行 RZ 右移对齐
+1. 5-input maximum exponent search
+2. 生成对齐 exponent 的 `emax`
+3. 相对 `emax` 只执行 RZ 右移对齐
 ```
 
-## Gamma form / Pre-normalize
+## 输入 fixed-point form
 
-每个 group 生成：
+S1 已为每个 group 生成：
 
 $$
-\gamma_g = \gamma^{sig}_g \times 2^{\gamma^{exp}_g}
+\gamma_g = \operatorname{sign}(\gamma^{raw}_g) \times \gamma^{mag}_g \times 2^{\gamma^{exp}_g}
 $$
 
 其中：
 
 $$
-\gamma^{sig}_g = \sigma^{int}_g \times sfSig_g
+\gamma^{raw}_g = \sigma^{int}_g \times sfSig_g
+$$
+
+$$
+\gamma^{mag}_g = |\gamma^{raw}_g|
 $$
 
 $$
 \gamma^{exp}_g = sfExp_g - 2
 $$
 
-输出：
+S2 输入：
 
 ```text
-gamma_mag_s1[g] : unsigned Q1.29, width = 30
-gamma_exp_s2[g] : signed integer, width = 6
+gamma_mag_s1[g] : unsigned significand, width = 20
+gamma_exp_s1[g] : signed integer, width = 9
+c_mag_s1        : unsigned significand, width = 24
+c_exp_s1        : signed integer, width = 9
 ```
 
 ## Emax search
 
-S2 搜索原始 exponent：
+S2 搜索 normalized exponent：
 
 $$
-e_{\max} = \max(e_c,e_0,e_1,e_2,e_3)
+e_{\max} = \max(c\_exp+23,\gamma\_exp_0+8,\gamma\_exp_1+8,\gamma\_exp_2+8,\gamma\_exp_3+8)
 $$
 
 ## Alignment
 
-进入 S2 前，`c` 和 4 个 `gamma` 已在 S1 规约为 compact `Q1.29` magnitude。
+进入 S2 后、对齐前，组合逻辑把窄 significand 固定左移到 35 fractional domain：
 
-对齐按最大原始 exponent 执行：
+```text
+gamma_align_mag = gamma_mag_s1 << 27
+gamma_term_exp  = gamma_exp_s1 + 8
+c_align_mag     = c_mag_s1 << 12
+c_term_exp      = c_exp_s1 + 23
+```
+
+对齐阶段只执行 RZ 右移：
 
 ```text
 shift = emax - term_exp
@@ -1220,9 +1329,9 @@ aligned = rz_right_shift(term_mag, shift)
 
 | 信号 | 位宽 / 格式 | 说明 |
 | --- | --: | --- |
-| `gamma_aligned_s2[3:0]` | 4 × 31 | 对齐后的 gamma fixed-point 值 |
-| `c_aligned_s2` | 31 | 对齐后的 C fixed-point 值 |
-| `emax_s2` | 9 | 最大原始 exponent |
+| `gamma_aligned_s2[3:0]` | 4 × 47 | 对齐后的 gamma fixed-point 值 |
+| `c_aligned_s2` | 47 | 对齐后的 C fixed-point 值 |
+| `emax_s2` | 9 | 最大 normalized exponent |
 | `special_valid_s2` | 1 | 特殊值旁路有效 |
 | `special_result_s2` | 32 | 特殊值旁路结果 |
 
@@ -1252,15 +1361,15 @@ $$
 输出：
 
 ```text
-sum_s3  : signed integer, width = 34
-base_exp_s3 = emax_s2 - 29
+sum_s3  : signed integer, width = 50
+base_exp_s3 = emax_s2 - 35
 ```
 
 ## S3 输出
 
 | 信号 | 位宽 / 格式 | 说明 |
 | --- | --: | --- |
-| `sum_s3` | 34 | 对齐后的 5 输入定点求和结果 |
+| `sum_s3` | 50 | 对齐后的 5 输入定点求和结果 |
 | `base_exp_s3` | 9 | 公共基准指数 |
 | `special_valid_s3` | 1 | 特殊值旁路有效 |
 | `special_result_s3` | 32 | 特殊值旁路结果 |
@@ -1319,8 +1428,8 @@ else:
 本单元为 5 级流水：
 
 * S0：输入寄存、特殊值检查、FP4 乘积、scale 解码、C 解码；
-* S1：group sum、scale significand product、scale exponent sum；
-* S2：gamma form、`emax` 搜索、RZ 对齐；
+* S1：group sum、scale significand product、scale exponent sum、gamma/C 的窄 significand form；
+* S2：raw magnitude 零扩展到 `ALIGN_MAG_W`、`emax` 搜索、RZ 对齐；
 * S3：5 路定点求和；
 * S4：FP32 规格化、特殊值 mux、输出寄存。
 

@@ -2,14 +2,15 @@
 // File Name   : fp4_dot_prod.sv
 // Author      : Codex
 // Date        : 2026-04-22
-// Description : 64-element NVFP4 dot-product with UE4M3 block scaling and
-//               FP32 accumulate. The datapath follows the 5-stage pipeline
+// Description : 64-element FP4 dot-product with NVFP4, MXFP4, or unscaled FP4
+//               mode and FP32 accumulate. The datapath follows the 5-stage pipeline
 //               defined in doc/FP4_DotProd.md.
 //
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
 //   2026-04-22  v0.1      Codex       Initial version
+//   2026-04-28  v0.2      Codex       Add MXFP4 and unscaled FP4 modes
 // ============================================================================
 
 module fp4_dot_prod (
@@ -19,6 +20,7 @@ module fp4_dot_prod (
     output logic         in_rdy_o,
     input  logic [255:0] a_fp4_i,
     input  logic [255:0] b_fp4_i,
+    input  logic [1:0]   fp4_mode_i,
     input  logic [31:0]  a_sf_i,
     input  logic [31:0]  b_sf_i,
     input  logic [31:0]  c_fp32_i,
@@ -31,26 +33,34 @@ module fp4_dot_prod (
     localparam int NUM_ELEMS      = 64;
     localparam int BLOCK_SIZE     = 16;
     localparam int NUM_BLOCKS     = 4;
+    localparam logic [1:0] FP4_MODE_NVFP4 = 2'd0;
+    localparam logic [1:0] FP4_MODE_MXFP4 = 2'd1;
+    localparam logic [1:0] FP4_MODE_FP4   = 2'd2;
     localparam int SCALE_W        = 8;
     localparam int FP4_PROD_W     = 9;
     localparam int SIGMA_W        = 13;
     localparam int SF_SIG_W       = 4;
-    localparam int SF_EXP_W       = 5;
+    localparam int SF_EXP_W       = 9;
     localparam int SF_SIG_PROD_W  = 8;
-    localparam int SF_EXP_SUM_W   = 6;
+    localparam int SF_EXP_SUM_W   = 10;
     localparam int GAMMA_SIG_W    = 20;
-    localparam int GAMMA_EXP_W    = 6;
     localparam int C_SIG_W        = 24;
-    localparam int C_EXP_W        = 9;
+    localparam int C_EXP_W        = 10;
     localparam int EXP_DIFF_W     = C_EXP_W + 1;
-    // ALIGN_W is the retained fractional precision in the fused accumulator domain.
-    localparam int ALIGN_W        = 29;
-    // Each aligned term is represented as sign + Q1.35 normalized significand.
-    localparam int ALIGN_MAG_W    = ALIGN_W + 1;
+    // GDFS aligns raw significands into a 35-fractional-bit accumulator domain.
+    localparam int ALIGN_FRAC_W   = 35;
+    localparam int ALIGN_INT_W    = 11;
+    localparam int ALIGN_MAG_W    = ALIGN_FRAC_W + ALIGN_INT_W;
     localparam int ALIGN_TERM_W   = ALIGN_MAG_W + 1;
     localparam int ALIGN_SHIFT_W  = $clog2(ALIGN_MAG_W + 1);
     localparam int SUM_W          = ALIGN_TERM_W + 3;
-    localparam logic signed [C_EXP_W-1:0] ALIGN_W_EXP = ALIGN_W;
+    localparam logic signed [C_EXP_W-1:0] FP4_DOT_EXP = -10'sd2;
+    localparam logic signed [C_EXP_W-1:0] ALIGN_FRAC_EXP = ALIGN_FRAC_W;
+    localparam logic signed [C_EXP_W-1:0] GAMMA_NORM_EXP = 10'sd8;
+    localparam logic signed [C_EXP_W-1:0] C_NORM_EXP     = 10'sd23;
+    localparam int GAMMA_ALIGN_LSHIFT_W = ALIGN_FRAC_W - GAMMA_NORM_EXP;
+    localparam int C_ALIGN_LSHIFT_W     = ALIGN_FRAC_W - C_NORM_EXP;
+    localparam int C_ALIGN_PAD_W        = ALIGN_MAG_W - C_SIG_W - C_ALIGN_LSHIFT_W;
 
     typedef struct packed {
         logic                    special_valid;
@@ -69,10 +79,10 @@ module fp4_dot_prod (
         logic                    special_valid;
         logic [31:0]             special_result;
         logic [NUM_BLOCKS-1:0]              gamma_sign_flat;
-        logic [NUM_BLOCKS*ALIGN_MAG_W-1:0]  gamma_mag_flat;
+        logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  gamma_mag_flat;
         logic [NUM_BLOCKS*C_EXP_W-1:0]      gamma_exp_flat;
         logic                    c_sign;
-        logic [ALIGN_MAG_W-1:0]  c_mag;
+        logic [C_SIG_W-1:0]      c_mag;
         logic signed [C_EXP_W-1:0] c_exp;
     } stage1_data_t;
 
@@ -113,7 +123,6 @@ module fp4_dot_prod (
     logic s3_vld_q;
     logic s4_vld_q;
 
-    logic s0_rdy;
     logic s1_rdy;
     logic s2_rdy;
     logic s3_rdy;
@@ -132,11 +141,11 @@ module fp4_dot_prod (
     logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_b_sf_exp_flat_hold;
 
     logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_tmp;
-    logic [NUM_BLOCKS*ALIGN_MAG_W-1:0]  s1_gamma_mag_flat_tmp;
+    logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  s1_gamma_mag_flat_tmp;
     logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_exp_flat_tmp;
 
     logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_hold;
-    logic [NUM_BLOCKS*ALIGN_MAG_W-1:0]  s1_gamma_mag_flat_hold;
+    logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  s1_gamma_mag_flat_hold;
     logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_exp_flat_hold;
 
     logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_tmp;
@@ -186,7 +195,7 @@ module fp4_dot_prod (
         end
     endfunction
 
-    function automatic logic [10:0] decode_scale(input logic [SCALE_W-1:0] scale_i);
+    function automatic logic [SF_EXP_W+4:0] decode_ue4m3_scale(input logic [SCALE_W-1:0] scale_i);
         logic [7:0] scale_eff;
         logic [3:0] exp_raw;
         logic [2:0] mant_raw;
@@ -207,17 +216,41 @@ module fp4_dot_prod (
                 exp = '0;
             end else if (exp_raw == 4'b0000) begin
                 sig = {1'b0, mant_raw};
-                exp = -5'sd9;
+                exp = -9'sd9;
             end else begin
                 sig = {1'b1, mant_raw};
-                exp = $signed({1'b0, exp_raw}) - 5'sd10;
+                exp = $signed({{(SF_EXP_W-4){1'b0}}, exp_raw}) - 9'sd10;
             end
 
-            decode_scale = {is_nan, is_zero, sig, exp};
+            decode_ue4m3_scale = {is_nan, sig, exp};
         end
     endfunction
 
-    function automatic logic [36:0] decode_c(input logic [31:0] c_i);
+    function automatic logic [SF_EXP_W+4:0] decode_e8m0_scale(input logic [SCALE_W-1:0] scale_i);
+        logic       is_nan;
+        logic [3:0] sig;
+        logic signed [SF_EXP_W-1:0] exp;
+        begin
+            is_nan  = (scale_i == 8'hff);
+            sig     = 4'd8;
+            exp     = $signed({1'b0, scale_i}) - 9'sd130;
+            decode_e8m0_scale = {is_nan, sig, exp};
+        end
+    endfunction
+
+    function automatic logic [SF_EXP_W+4:0] make_unit_scale();
+        logic       is_nan;
+        logic [3:0] sig;
+        logic signed [SF_EXP_W-1:0] exp;
+        begin
+            is_nan = 1'b0;
+            sig = 4'd8;
+            exp = -9'sd3;
+            make_unit_scale = {is_nan, sig, exp};
+        end
+    endfunction
+
+    function automatic logic [37:0] decode_c(input logic [31:0] c_i);
         logic       sign;
         logic [7:0] exp_raw;
         logic [22:0] frac_raw;
@@ -239,39 +272,13 @@ module fp4_dot_prod (
                 exp = '0;
             end else if (exp_raw == 8'h00) begin
                 sig = {1'b0, frac_raw};
-                exp = -9'sd149;
+                exp = -10'sd149;
             end else begin
                 sig = {1'b1, frac_raw};
-                exp = $signed({1'b0, exp_raw}) - 9'sd150;
+                exp = $signed({1'b0, exp_raw}) - 10'sd150;
             end
 
             decode_c = {sign, is_zero, is_nan, is_inf, sig, exp};
-        end
-    endfunction
-
-    function automatic logic [4:0] msb_index24(input logic [23:0] val_i);
-        integer idx;
-        begin
-            msb_index24 = '0;
-            for (idx = 23; idx >= 0; idx = idx - 1) begin
-                if (val_i[idx]) begin
-                    msb_index24 = idx[4:0];
-                    idx = -1;
-                end
-            end
-        end
-    endfunction
-
-    function automatic logic [4:0] msb_index20(input logic [19:0] val_i);
-        integer idx;
-        begin
-            msb_index20 = '0;
-            for (idx = 19; idx >= 0; idx = idx - 1) begin
-                if (val_i[idx]) begin
-                    msb_index20 = idx[4:0];
-                    idx = -1;
-                end
-            end
         end
     endfunction
 
@@ -289,11 +296,16 @@ module fp4_dot_prod (
             if (term_mag_i == '0) begin
                 align_fixed_rz = '0;
             end else begin
-                // After raw-exponent emax search, alignment itself is only an
-                // RZ right shift to emax.
-                align_shift = $signed({emax_i[C_EXP_W-1], emax_i})
-                            - $signed({term_exp_i[C_EXP_W-1], term_exp_i});
-                if (align_shift >= ALIGN_MAG_W) begin
+                // term_mag_i is already wired into the 35-fractional-bit
+                // accumulator domain. Alignment after emax search is RZ
+                // right shift by emax - normalized_exp.
+                align_shift = $signed({{(EXP_DIFF_W-C_EXP_W){emax_i[C_EXP_W-1]}}, emax_i})
+                            - $signed({{(EXP_DIFF_W-C_EXP_W){term_exp_i[C_EXP_W-1]}},
+                                      term_exp_i});
+
+                if (align_shift <= $signed({EXP_DIFF_W{1'b0}})) begin
+                    aligned_mag = term_mag_i;
+                end else if (align_shift >= $signed(EXP_DIFF_W'(ALIGN_MAG_W))) begin
                     aligned_mag = '0;
                 end else begin
                     shift_amt = align_shift[ALIGN_SHIFT_W-1:0];
@@ -362,7 +374,11 @@ module fp4_dot_prod (
                     frac_field  = sig24[22:0];
                 end
 
-                pack_fp32_rz = {sign_bit, exp_field, frac_field};
+                if ((exp_field == 8'h00) && (frac_field == 23'h0)) begin
+                    pack_fp32_rz = 32'h0000_0000;
+                end else begin
+                    pack_fp32_rz = {sign_bit, exp_field, frac_field};
+                end
             end
         end
     endfunction
@@ -374,9 +390,9 @@ module fp4_dot_prod (
     integer g3;
     integer g4;
     integer k1;
-    logic [10:0] scale_dec_a;
-    logic [10:0] scale_dec_b;
-    logic [36:0] c_dec;
+    logic [SF_EXP_W+4:0] scale_dec_a;
+    logic [SF_EXP_W+4:0] scale_dec_b;
+    logic [37:0]         c_dec;
     logic        any_scale_nan;
 
     always_comb begin
@@ -394,13 +410,25 @@ module fp4_dot_prod (
         end
 
         for (g0 = 0; g0 < NUM_BLOCKS; g0 = g0 + 1) begin
-            scale_dec_a = decode_scale(a_sf_i[g0*SCALE_W +: SCALE_W]);
-            scale_dec_b = decode_scale(b_sf_i[g0*SCALE_W +: SCALE_W]);
-            s0_a_sf_sig_flat_tmp[g0*SF_SIG_W +: SF_SIG_W] = scale_dec_a[8:5];
-            s0_b_sf_sig_flat_tmp[g0*SF_SIG_W +: SF_SIG_W] = scale_dec_b[8:5];
-            s0_a_sf_exp_flat_tmp[g0*SF_EXP_W +: SF_EXP_W] = scale_dec_a[4:0];
-            s0_b_sf_exp_flat_tmp[g0*SF_EXP_W +: SF_EXP_W] = scale_dec_b[4:0];
-            any_scale_nan = any_scale_nan | scale_dec_a[10] | scale_dec_b[10];
+            case (fp4_mode_i)
+                FP4_MODE_MXFP4: begin
+                    scale_dec_a = decode_e8m0_scale(a_sf_i[(g0 >> 1)*SCALE_W +: SCALE_W]);
+                    scale_dec_b = decode_e8m0_scale(b_sf_i[(g0 >> 1)*SCALE_W +: SCALE_W]);
+                end
+                FP4_MODE_FP4: begin
+                    scale_dec_a = make_unit_scale();
+                    scale_dec_b = make_unit_scale();
+                end
+                default: begin
+                    scale_dec_a = decode_ue4m3_scale(a_sf_i[g0*SCALE_W +: SCALE_W]);
+                    scale_dec_b = decode_ue4m3_scale(b_sf_i[g0*SCALE_W +: SCALE_W]);
+                end
+            endcase
+            s0_a_sf_sig_flat_tmp[g0*SF_SIG_W +: SF_SIG_W] = scale_dec_a[SF_EXP_W+3:SF_EXP_W];
+            s0_b_sf_sig_flat_tmp[g0*SF_SIG_W +: SF_SIG_W] = scale_dec_b[SF_EXP_W+3:SF_EXP_W];
+            s0_a_sf_exp_flat_tmp[g0*SF_EXP_W +: SF_EXP_W] = scale_dec_a[SF_EXP_W-1:0];
+            s0_b_sf_exp_flat_tmp[g0*SF_EXP_W +: SF_EXP_W] = scale_dec_b[SF_EXP_W-1:0];
+            any_scale_nan = any_scale_nan | scale_dec_a[SF_EXP_W+4] | scale_dec_b[SF_EXP_W+4];
         end
 
         s0_d.prod_flat     = s0_prod_flat_tmp;
@@ -410,14 +438,14 @@ module fp4_dot_prod (
         s0_d.b_sf_exp_flat = s0_b_sf_exp_flat_tmp;
 
         c_dec         = decode_c(c_fp32_i);
-        s0_d.c_sign   = c_dec[36];
-        s0_d.c_sig    = c_dec[32:9];
-        s0_d.c_exp    = $signed(c_dec[8:0]);
+        s0_d.c_sign   = c_dec[37];
+        s0_d.c_sig    = c_dec[33:10];
+        s0_d.c_exp    = $signed(c_dec[9:0]);
 
-        if (any_scale_nan || c_dec[34]) begin
+        if (any_scale_nan || c_dec[35]) begin
             s0_d.special_valid  = 1'b1;
             s0_d.special_result = 32'h7fff_ffff;
-        end else if (c_dec[33]) begin
+        end else if (c_dec[34]) begin
             s0_d.special_valid  = 1'b1;
             s0_d.special_result = c_fp32_i;
         end else begin
@@ -437,10 +465,7 @@ module fp4_dot_prod (
     logic signed [C_EXP_W-1:0]      gamma_exp_tmp_s1;
     logic                           gamma_sign_tmp_s1;
     logic [GAMMA_SIG_W-1:0]         gamma_abs_tmp_s1;
-    logic [4:0]                     gamma_msb_idx_tmp_s1;
-    logic [4:0]                     c_msb_idx_tmp_s1;
-    logic [ALIGN_MAG_W-1:0]         gamma_mag_tmp_s1;
-    logic [ALIGN_MAG_W-1:0]         c_mag_tmp_s1;
+    logic [GAMMA_SIG_W-1:0]         gamma_mag_tmp_s1;
 
     always_comb begin
         s1_d = '0;
@@ -450,14 +475,24 @@ module fp4_dot_prod (
         s1_d.special_valid  = s0_q.special_valid;
         s1_d.special_result = s0_q.special_result;
         s1_d.c_sign         = s0_q.c_sign;
+        sigma_tmp           = '0;
+        sigma_acc           = '0;
+        a_sf_exp_tmp        = '0;
+        b_sf_exp_tmp        = '0;
+        prod_s0_tmp         = '0;
+        sf_sig_prod_tmp     = '0;
+        sf_exp_sum_tmp_s1   = '0;
+        gamma_sig_tmp_s1    = '0;
+        gamma_exp_tmp_s1    = '0;
+        gamma_sign_tmp_s1   = 1'b0;
+        gamma_abs_tmp_s1    = '0;
+        gamma_mag_tmp_s1    = '0;
         if (s0_q.c_sig == '0) begin
             s1_d.c_exp = '0;
             s1_d.c_mag = '0;
         end else begin
-            c_msb_idx_tmp_s1 = msb_index24(s0_q.c_sig);
-            s1_d.c_exp       = s0_q.c_exp + $signed({4'd0, c_msb_idx_tmp_s1});
-            c_mag_tmp_s1     = s0_q.c_sig << (ALIGN_W - c_msb_idx_tmp_s1);
-            s1_d.c_mag       = c_mag_tmp_s1;
+            s1_d.c_exp       = s0_q.c_exp;
+            s1_d.c_mag       = s0_q.c_sig;
         end
 
         for (g1 = 0; g1 < NUM_BLOCKS; g1 = g1 + 1) begin
@@ -476,26 +511,21 @@ module fp4_dot_prod (
             sf_exp_sum_tmp_s1 = a_sf_exp_tmp + b_sf_exp_tmp;
 
             gamma_sig_tmp_s1 = sigma_tmp * $signed({1'b0, sf_sig_prod_tmp});
-            gamma_exp_tmp_s1 = $signed({{(C_EXP_W-SF_EXP_SUM_W){sf_exp_sum_tmp_s1[SF_EXP_SUM_W-1]}},
-                                        sf_exp_sum_tmp_s1})
-                             - 9'sd2;
+            gamma_exp_tmp_s1 = $signed(sf_exp_sum_tmp_s1) + FP4_DOT_EXP;
             gamma_sign_tmp_s1 = gamma_sig_tmp_s1[GAMMA_SIG_W-1];
             if (gamma_sig_tmp_s1 == '0) begin
                 gamma_mag_tmp_s1 = '0;
-                gamma_exp_tmp_s1 = '0;
             end else begin
                 if (gamma_sign_tmp_s1) begin
                     gamma_abs_tmp_s1 = -gamma_sig_tmp_s1;
                 end else begin
                     gamma_abs_tmp_s1 = gamma_sig_tmp_s1;
                 end
-                gamma_msb_idx_tmp_s1 = msb_index20(gamma_abs_tmp_s1);
-                gamma_exp_tmp_s1 = gamma_exp_tmp_s1 + $signed({4'd0, gamma_msb_idx_tmp_s1});
-                gamma_mag_tmp_s1 = gamma_abs_tmp_s1 << (ALIGN_W - gamma_msb_idx_tmp_s1);
+                gamma_mag_tmp_s1 = gamma_abs_tmp_s1;
             end
 
             s1_gamma_sign_flat_tmp[g1] = gamma_sign_tmp_s1;
-            s1_gamma_mag_flat_tmp[g1*ALIGN_MAG_W +: ALIGN_MAG_W] = gamma_mag_tmp_s1;
+            s1_gamma_mag_flat_tmp[g1*GAMMA_SIG_W +: GAMMA_SIG_W] = gamma_mag_tmp_s1;
             s1_gamma_exp_flat_tmp[g1*C_EXP_W +: C_EXP_W] = gamma_exp_tmp_s1;
         end
 
@@ -505,6 +535,10 @@ module fp4_dot_prod (
     end
 
     logic signed [C_EXP_W-1:0] gamma_exp_ext;
+    logic signed [C_EXP_W-1:0] gamma_norm_exp_tmp;
+    logic signed [C_EXP_W-1:0] c_norm_exp_tmp;
+    logic [ALIGN_MAG_W-1:0]    gamma_align_mag_tmp;
+    logic [ALIGN_MAG_W-1:0]    c_align_mag_tmp;
     logic signed [C_EXP_W-1:0] emax_tmp;
     logic                      emax_vld_tmp_s2;
 
@@ -513,37 +547,46 @@ module fp4_dot_prod (
         s2_gamma_aligned_flat_tmp = '0;
         s2_d.special_valid  = s1_q.special_valid;
         s2_d.special_result = s1_q.special_result;
+        gamma_exp_ext       = '0;
+        gamma_norm_exp_tmp  = '0;
+        c_norm_exp_tmp      = '0;
+        gamma_align_mag_tmp = '0;
+        c_align_mag_tmp     = '0;
 
-        // S1 already normalized each term into a compact Q1.35 significand.
-        // S2 only searches exponents and right-shifts magnitudes to emax.
+        // GDFS Step 5: search emax using normalized significand exponents,
+        // then align raw integer significands with 35 fractional bits.
         emax_tmp = '0;
         emax_vld_tmp_s2 = 1'b0;
         if (s1_q.c_mag != '0) begin
-            emax_tmp = s1_q.c_exp;
+            c_norm_exp_tmp = s1_q.c_exp + C_NORM_EXP;
+            emax_tmp = c_norm_exp_tmp;
             emax_vld_tmp_s2 = 1'b1;
         end
         for (g2 = 0; g2 < NUM_BLOCKS; g2 = g2 + 1) begin
-            if (s1_gamma_mag_flat_hold[g2*ALIGN_MAG_W +: ALIGN_MAG_W] != '0) begin
-                gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g2*C_EXP_W +: C_EXP_W]);
-                if (!emax_vld_tmp_s2 || (gamma_exp_ext > emax_tmp)) begin
-                    emax_tmp = gamma_exp_ext;
-                    emax_vld_tmp_s2 = 1'b1;
-                end
+            gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g2*C_EXP_W +: C_EXP_W]);
+            gamma_norm_exp_tmp = gamma_exp_ext + GAMMA_NORM_EXP;
+            if (!emax_vld_tmp_s2 || (gamma_norm_exp_tmp > emax_tmp)) begin
+                emax_tmp = gamma_norm_exp_tmp;
+                emax_vld_tmp_s2 = 1'b1;
             end
         end
         s2_d.emax = emax_tmp;
 
         for (g3 = 0; g3 < NUM_BLOCKS; g3 = g3 + 1) begin
             gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g3*C_EXP_W +: C_EXP_W]);
+            gamma_align_mag_tmp =
+                {s1_gamma_mag_flat_hold[g3*GAMMA_SIG_W +: (GAMMA_SIG_W-1)],
+                 {GAMMA_ALIGN_LSHIFT_W{1'b0}}};
             s2_gamma_aligned_flat_tmp[g3*ALIGN_TERM_W +: ALIGN_TERM_W] =
                 align_fixed_rz(s1_gamma_sign_flat_hold[g3],
-                               s1_gamma_mag_flat_hold[g3*ALIGN_MAG_W +: ALIGN_MAG_W],
-                               gamma_exp_ext,
+                               gamma_align_mag_tmp,
+                               gamma_exp_ext + GAMMA_NORM_EXP,
                                emax_tmp);
         end
         s2_d.gamma_aligned_flat = s2_gamma_aligned_flat_tmp;
 
-        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, s1_q.c_mag, s1_q.c_exp, emax_tmp);
+        c_align_mag_tmp = {{C_ALIGN_PAD_W{1'b0}}, s1_q.c_mag, {C_ALIGN_LSHIFT_W{1'b0}}};
+        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_align_mag_tmp, s1_q.c_exp + C_NORM_EXP, emax_tmp);
     end
 
     logic signed [SUM_W-1:0] sum_acc;
@@ -552,8 +595,7 @@ module fp4_dot_prod (
         s3_d = '0;
         s3_d.special_valid  = s2_q.special_valid;
         s3_d.special_result = s2_q.special_result;
-        // Q*.35 alignment moves 35 bits into the significand, so compensate in exponent.
-        s3_d.base_exp       = s2_q.emax - ALIGN_W_EXP;
+        s3_d.base_exp       = s2_q.emax - ALIGN_FRAC_EXP;
 
         sum_acc = $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}}, s2_q.c_aligned});
         for (g4 = 0; g4 < NUM_BLOCKS; g4 = g4 + 1) begin

@@ -2,8 +2,9 @@
 // File Name   : fp8_dot_prod.sv
 // Author      : Codex
 // Date        : 2026-04-22
-// Description : 32-element FP8 dot-product with FP32 accumulate. The datapath
-//               follows the 5-stage FDA pipeline defined in doc/FP8_DotProd.md.
+// Description : 32-element FP8/MXFP8 dot-product with FP32 accumulate. The
+//               datapath follows the 5-stage FDA pipeline defined in
+//               doc/FP8_DotProd.md.
 //
 // Revision History:
 //   Date        Version   Author      Description
@@ -20,6 +21,9 @@ module fp8_dot_prod (
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
     input  logic         fp8_format_i,
+    input  logic         mxfp8_en_i,
+    input  logic [7:0]   a_mx_scale_i,
+    input  logic [7:0]   b_mx_scale_i,
     output logic         out_vld_o,
     input  logic         out_rdy_i,
     output logic [31:0]  d_o
@@ -30,7 +34,8 @@ module fp8_dot_prod (
     localparam int FP8_SIG_W        = 4;
     localparam int PROD_SIG_W       = 8;
     localparam int C_SIG_W          = 24;
-    localparam int EXP_W            = 9;
+    localparam int MX_SCALE_W       = 8;
+    localparam int EXP_W            = 10;
     localparam int ALIGN_FRAC_BITS  = 25;
     localparam int ALIGN_TERM_W     = 28;
     localparam int SUM_W            = 35;
@@ -39,7 +44,8 @@ module fp8_dot_prod (
     localparam int C_SIG_FRAC_BITS    = 23;
     localparam int PROD_ALIGN_PAD_W   = ALIGN_FRAC_BITS - PROD_SIG_FRAC_BITS;
     localparam int C_ALIGN_PAD_W      = ALIGN_FRAC_BITS - C_SIG_FRAC_BITS;
-    localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = ALIGN_FRAC_BITS;
+    localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = 10'sd25;
+    localparam logic signed [EXP_W-1:0] MX_SCALE_BIAS_EXP = 10'sd127;
 
     typedef struct packed {
         logic                      sign;
@@ -134,42 +140,40 @@ module fp8_dot_prod (
     logic [NUM_ELEMS*EXP_W-1:0]              s0_prod_exp_flat_tmp;
     logic [NUM_ELEMS-1:0]                    s0_prod_zero_flat_tmp;
 
-    logic [NUM_ELEMS-1:0]                    s0_prod_sign_flat_hold;
-    logic [NUM_ELEMS*(ALIGN_TERM_W-1)-1:0]   s0_prod_mag_flat_hold;
-    logic [NUM_ELEMS*EXP_W-1:0]              s0_prod_exp_flat_hold;
-    logic [NUM_ELEMS-1:0]                    s0_prod_zero_flat_hold;
+    logic [NUM_ELEMS-1:0]                    s0_prod_sign_q_flat;
+    logic [NUM_ELEMS*(ALIGN_TERM_W-1)-1:0]   s0_prod_mag_q_flat;
+    logic [NUM_ELEMS*EXP_W-1:0]              s0_prod_exp_q_flat;
+    logic [NUM_ELEMS-1:0]                    s0_prod_zero_q_flat;
 
-    logic [NUM_ELEMS-1:0]                    s1_prod_sign_flat_hold;
-    logic [NUM_ELEMS*(ALIGN_TERM_W-1)-1:0]   s1_prod_mag_flat_hold;
-    logic [NUM_ELEMS*EXP_W-1:0]              s1_prod_exp_flat_hold;
-    logic [NUM_ELEMS-1:0]                    s1_prod_zero_flat_hold;
+    logic [NUM_ELEMS-1:0]                    s1_prod_sign_q_flat;
+    logic [NUM_ELEMS*(ALIGN_TERM_W-1)-1:0]   s1_prod_mag_q_flat;
+    logic [NUM_ELEMS*EXP_W-1:0]              s1_prod_exp_q_flat;
+    logic [NUM_ELEMS-1:0]                    s1_prod_zero_q_flat;
 
     logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_flat_tmp;
-    logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_flat_hold;
+    logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_q_flat;
 
-    assign s0_prod_sign_flat_hold = s0_q.prod_sign_flat;
-    assign s0_prod_mag_flat_hold  = s0_q.prod_mag_flat;
-    assign s0_prod_exp_flat_hold  = s0_q.prod_exp_flat;
-    assign s0_prod_zero_flat_hold = s0_q.prod_zero_flat;
-    assign s1_prod_sign_flat_hold = s1_q.prod_sign_flat;
-    assign s1_prod_mag_flat_hold  = s1_q.prod_mag_flat;
-    assign s1_prod_exp_flat_hold  = s1_q.prod_exp_flat;
-    assign s1_prod_zero_flat_hold = s1_q.prod_zero_flat;
-    assign s2_aligned_prod_flat_hold = s2_q.aligned_prod_flat;
+    assign s0_prod_sign_q_flat = s0_q.prod_sign_flat;
+    assign s0_prod_mag_q_flat  = s0_q.prod_mag_flat;
+    assign s0_prod_exp_q_flat  = s0_q.prod_exp_flat;
+    assign s0_prod_zero_q_flat = s0_q.prod_zero_flat;
+    assign s1_prod_sign_q_flat = s1_q.prod_sign_flat;
+    assign s1_prod_mag_q_flat  = s1_q.prod_mag_flat;
+    assign s1_prod_exp_q_flat  = s1_q.prod_exp_flat;
+    assign s1_prod_zero_q_flat = s1_q.prod_zero_flat;
+    assign s2_aligned_prod_q_flat = s2_q.aligned_prod_flat;
 
     function automatic fp8_dec_t decode_fp8(
         input logic [FP8_W-1:0] fp8_i,
         input logic             fp8_format_i
     );
         fp8_dec_t dec;
-        logic [4:0] exp_raw;
         logic [2:0] mant_raw;
         begin
             dec      = '0;
             dec.sign = fp8_i[7];
 
             if (!fp8_format_i) begin
-                exp_raw  = {1'b0, fp8_i[6:3]};
                 mant_raw = fp8_i[2:0];
 
                 dec.is_zero = (fp8_i[6:3] == 4'b0000) && (mant_raw == 3'b000);
@@ -181,13 +185,12 @@ module fp8_dot_prod (
                     dec.exp = '0;
                 end else if (fp8_i[6:3] == 4'b0000) begin
                     dec.sig = {1'b0, mant_raw};
-                    dec.exp = -9'sd6;
+                    dec.exp = -10'sd6;
                 end else begin
                     dec.sig = {1'b1, mant_raw};
-                    dec.exp = $signed({5'd0, fp8_i[6:3]}) - 9'sd7;
+                    dec.exp = $signed({6'd0, fp8_i[6:3]}) - 10'sd7;
                 end
             end else begin
-                exp_raw  = fp8_i[6:2];
                 mant_raw = {1'b0, fp8_i[1:0]};
 
                 dec.is_zero = (fp8_i[6:2] == 5'b00000) && (fp8_i[1:0] == 2'b00);
@@ -199,10 +202,10 @@ module fp8_dot_prod (
                     dec.exp = '0;
                 end else if (fp8_i[6:2] == 5'b00000) begin
                     dec.sig = {1'b0, fp8_i[1:0], 1'b0};
-                    dec.exp = -9'sd14;
+                    dec.exp = -10'sd14;
                 end else begin
                     dec.sig = {1'b1, fp8_i[1:0], 1'b0};
-                    dec.exp = $signed({4'd0, fp8_i[6:2]}) - 9'sd15;
+                    dec.exp = $signed({5'd0, fp8_i[6:2]}) - 10'sd15;
                 end
             end
 
@@ -231,13 +234,21 @@ module fp8_dot_prod (
                 dec.exp = '0;
             end else if (exp_raw == 8'h00) begin
                 dec.sig = {1'b0, frac_raw};
-                dec.exp = -9'sd126;
+                dec.exp = -10'sd126;
             end else begin
                 dec.sig = {1'b1, frac_raw};
-                dec.exp = $signed({1'b0, exp_raw}) - 9'sd127;
+                dec.exp = $signed({2'b00, exp_raw}) - 10'sd127;
             end
 
             return dec;
+        end
+    endfunction
+
+    function automatic logic signed [EXP_W-1:0] decode_e8m0_exp(
+        input logic [MX_SCALE_W-1:0] scale_i
+    );
+        begin
+            decode_e8m0_exp = $signed({2'b00, scale_i}) - MX_SCALE_BIAS_EXP;
         end
     endfunction
 
@@ -346,6 +357,8 @@ module fp8_dot_prod (
     logic [PROD_SIG_W-1:0] lane_prod_sig_tmp;
     logic [ALIGN_TERM_W-2:0] lane_prod_mag_tmp;
     logic [ALIGN_TERM_W-2:0] c_mag_tmp_s0;
+    logic mx_scale_nan_tmp;
+    logic signed [EXP_W-1:0] mx_scale_exp_sum_tmp;
 
     always @(*) begin
         s0_d = '0;
@@ -355,7 +368,11 @@ module fp8_dot_prod (
         s0_prod_zero_flat_tmp = '0;
 
         c_dec_tmp            = decode_fp32(c_i);
-        any_nan_tmp          = c_dec_tmp.is_nan;
+        mx_scale_nan_tmp     = mxfp8_en_i && ((a_mx_scale_i == 8'hff) || (b_mx_scale_i == 8'hff));
+        mx_scale_exp_sum_tmp = mxfp8_en_i
+                             ? (decode_e8m0_exp(a_mx_scale_i) + decode_e8m0_exp(b_mx_scale_i))
+                             : '0;
+        any_nan_tmp          = c_dec_tmp.is_nan | mx_scale_nan_tmp;
         has_pos_inf_tmp      = c_dec_tmp.is_inf && !c_dec_tmp.sign;
         has_neg_inf_tmp      = c_dec_tmp.is_inf && c_dec_tmp.sign;
         has_zero_mul_inf_tmp = 1'b0;
@@ -406,7 +423,8 @@ module fp8_dot_prod (
                 if (a_dec_tmp.is_zero || b_dec_tmp.is_zero) begin
                     s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = '0;
                 end else begin
-                    s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = a_dec_tmp.exp + b_dec_tmp.exp;
+                    s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] =
+                        a_dec_tmp.exp + b_dec_tmp.exp + mx_scale_exp_sum_tmp;
                 end
             end
         end
@@ -458,8 +476,8 @@ module fp8_dot_prod (
         end
 
         for (idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
-            if (!s0_prod_zero_flat_hold[idx1]) begin
-                prod_exp_s1_tmp = $signed(s0_prod_exp_flat_hold[idx1*EXP_W +: EXP_W]);
+            if (!s0_prod_zero_q_flat[idx1]) begin
+                prod_exp_s1_tmp = $signed(s0_prod_exp_q_flat[idx1*EXP_W +: EXP_W]);
                 if (!emax_vld_tmp || (prod_exp_s1_tmp > emax_tmp)) begin
                     emax_tmp     = prod_exp_s1_tmp;
                     emax_vld_tmp = 1'b1;
@@ -484,11 +502,11 @@ module fp8_dot_prod (
             s2_d.base_exp = s1_q.emax - ALIGN_FRAC_BITS_EXP;
 
             for (idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
-                if (!s1_prod_zero_flat_hold[idx2]) begin
-                    prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
+                if (!s1_prod_zero_q_flat[idx2]) begin
+                    prod_exp_s2_tmp = $signed(s1_prod_exp_q_flat[idx2*EXP_W +: EXP_W]);
                     s2_aligned_prod_flat_tmp[idx2*ALIGN_TERM_W +: ALIGN_TERM_W] =
-                        align_fixed_rz(s1_prod_sign_flat_hold[idx2],
-                                       s1_prod_mag_flat_hold[idx2*(ALIGN_TERM_W-1) +: (ALIGN_TERM_W-1)],
+                        align_fixed_rz(s1_prod_sign_q_flat[idx2],
+                                       s1_prod_mag_q_flat[idx2*(ALIGN_TERM_W-1) +: (ALIGN_TERM_W-1)],
                                        prod_exp_s2_tmp, s1_q.emax);
                 end
             end
@@ -519,8 +537,8 @@ module fp8_dot_prod (
         sum_acc_tmp = $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}}, s2_q.c_aligned});
         for (idx3 = 0; idx3 < NUM_ELEMS; idx3 = idx3 + 1) begin
             sum_acc_tmp = sum_acc_tmp
-                        + $signed({{(SUM_W-ALIGN_TERM_W){s2_aligned_prod_flat_hold[idx3*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
-                                   s2_aligned_prod_flat_hold[idx3*ALIGN_TERM_W +: ALIGN_TERM_W]});
+                        + $signed({{(SUM_W-ALIGN_TERM_W){s2_aligned_prod_q_flat[idx3*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
+                                   s2_aligned_prod_q_flat[idx3*ALIGN_TERM_W +: ALIGN_TERM_W]});
         end
         s3_d.sum = sum_acc_tmp;
     end
