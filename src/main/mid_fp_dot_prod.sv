@@ -1,26 +1,25 @@
 // ============================================================================
-// File Name   : fp16_dot_prod.sv
+// File Name   : mid_fp_dot_prod.sv
 // Author      : Codex
-// Date        : 2026-04-26
-// Description : 16-element FP16/BF16 dot-product with FP32 accumulate. The
+// Date        : 2026-04-29
+// Description : Shared TF32/BF16/FP16 dot-product with FP32 accumulate. The
 //               datapath follows the F=25 FDA pipeline defined in
-//               doc/FP16_DotProd.md.
+//               doc/MID_FP_DotProd.md.
 //
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-26  v0.1      Codex       Initial version
-//   2026-04-28  v0.2      Codex       Add BF16 input mode
+//   2026-04-29  v0.1      Codex       Initial version
 // ============================================================================
 
 `default_nettype none
 
-module fp16_dot_prod (
+module mid_fp_dot_prod (
     input  logic         clk,
     input  logic         rst_n,
     input  logic         in_vld_i,
     output logic         in_rdy_o,
-    input  logic         fmt_is_bf16_i,
+    input  logic [1:0]   mode_i,
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
@@ -29,13 +28,20 @@ module fp16_dot_prod (
     output logic [31:0]  d_o
 );
 
+    localparam logic [1:0] MID_FP_MODE_TF32 = 2'd0;
+    localparam logic [1:0] MID_FP_MODE_BF16 = 2'd1;
+    localparam logic [1:0] MID_FP_MODE_FP16 = 2'd2;
+
     localparam int FP16_W               = 16;
+    localparam int FP32_W               = 32;
     localparam int NUM_ELEMS            = 16;
-    localparam int FP16_SIG_W           = 11;
+    localparam int TF32_NUM_ELEMS       = 8;
+    localparam int SIG_W                = 11;
     localparam int FP16_EXP_W           = 5;
     localparam int FP16_FRAC_W          = 10;
     localparam int BF16_EXP_W           = 8;
     localparam int BF16_FRAC_W          = 7;
+    localparam int TF32_FRAC_W          = 10;
     localparam int BF16_SIG_PAD_W       = FP16_FRAC_W - BF16_FRAC_W;
     localparam int FP32_SIG_W           = 24;
     localparam int FP32_EXP_W           = 8;
@@ -54,13 +60,14 @@ module fp16_dot_prod (
     localparam logic signed [EXP_W:0]   ALIGN_MAG_W_EXP     = 11'sd32;
 
     typedef struct packed {
+        logic                    valid;
         logic                    sign;
-        logic [FP16_SIG_W-1:0]   sig;
+        logic [SIG_W-1:0]        sig;
         logic signed [EXP_W-1:0] exp;
         logic                    is_zero;
         logic                    is_inf;
         logic                    is_nan;
-    } fp16_bf16_dec_t;
+    } mid_fp_dec_t;
 
     typedef struct packed {
         logic                    sign;
@@ -72,46 +79,46 @@ module fp16_dot_prod (
     } fp32_dec_t;
 
     typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
-        logic [NUM_ELEMS-1:0]           prod_sign_flat;
-        logic [NUM_ELEMS*FP16_SIG_W-1:0] a_sig_flat;
-        logic [NUM_ELEMS*FP16_SIG_W-1:0] b_sig_flat;
-        logic [NUM_ELEMS*EXP_W-1:0]     a_exp_flat;
-        logic [NUM_ELEMS*EXP_W-1:0]     b_exp_flat;
-        logic [NUM_ELEMS-1:0]           prod_zero_flat;
-        logic                           c_sign;
-        logic [FP32_SIG_W-1:0]          c_sig;
-        logic signed [EXP_W-1:0]        c_exp;
-        logic                           c_zero;
+        logic                            special_vld;
+        logic [31:0]                     special_result;
+        logic [NUM_ELEMS-1:0]            prod_sign_flat;
+        logic [NUM_ELEMS*SIG_W-1:0]      a_sig_flat;
+        logic [NUM_ELEMS*SIG_W-1:0]      b_sig_flat;
+        logic [NUM_ELEMS*EXP_W-1:0]      a_exp_flat;
+        logic [NUM_ELEMS*EXP_W-1:0]      b_exp_flat;
+        logic [NUM_ELEMS-1:0]            prod_zero_flat;
+        logic                            c_sign;
+        logic [FP32_SIG_W-1:0]           c_sig;
+        logic signed [EXP_W-1:0]         c_exp;
+        logic                            c_zero;
     } stage0_data_t;
 
     typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
-        logic [NUM_ELEMS-1:0]           prod_sign_flat;
-        logic [NUM_ELEMS*PROD_SIG_W-1:0] prod_sig_flat;
-        logic [NUM_ELEMS*EXP_W-1:0]     prod_exp_flat;
-        logic [NUM_ELEMS-1:0]           prod_zero_flat;
-        logic                           c_sign;
-        logic [FP32_SIG_W-1:0]          c_sig;
-        logic signed [EXP_W-1:0]        c_exp;
-        logic                           c_zero;
+        logic                             special_vld;
+        logic [31:0]                      special_result;
+        logic [NUM_ELEMS-1:0]             prod_sign_flat;
+        logic [NUM_ELEMS*PROD_SIG_W-1:0]  prod_sig_flat;
+        logic [NUM_ELEMS*EXP_W-1:0]       prod_exp_flat;
+        logic [NUM_ELEMS-1:0]             prod_zero_flat;
+        logic                             c_sign;
+        logic [FP32_SIG_W-1:0]            c_sig;
+        logic signed [EXP_W-1:0]          c_exp;
+        logic                             c_zero;
     } stage1_data_t;
 
     typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
+        logic                              special_vld;
+        logic [31:0]                       special_result;
         logic [NUM_ELEMS*ALIGN_TERM_W-1:0] aligned_prod_flat;
-        logic signed [ALIGN_TERM_W-1:0] c_aligned;
-        logic signed [EXP_W-1:0]        base_exp;
+        logic signed [ALIGN_TERM_W-1:0]    c_aligned;
+        logic signed [EXP_W-1:0]           base_exp;
     } stage2_data_t;
 
     typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
-        logic signed [SUM_W-1:0]        sum;
-        logic signed [EXP_W-1:0]        base_exp;
+        logic                         special_vld;
+        logic [31:0]                  special_result;
+        logic signed [SUM_W-1:0]      sum;
+        logic signed [EXP_W-1:0]      base_exp;
     } stage3_data_t;
 
     typedef struct packed {
@@ -142,15 +149,15 @@ module fp16_dot_prod (
     logic s4_rdy;
 
     logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_tmp;
-    logic [NUM_ELEMS*FP16_SIG_W-1:0]  s0_a_sig_flat_tmp;
-    logic [NUM_ELEMS*FP16_SIG_W-1:0]  s0_b_sig_flat_tmp;
+    logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_tmp;
+    logic [NUM_ELEMS*SIG_W-1:0]       s0_b_sig_flat_tmp;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_a_exp_flat_tmp;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_b_exp_flat_tmp;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_tmp;
 
     logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_hold;
-    logic [NUM_ELEMS*FP16_SIG_W-1:0]  s0_a_sig_flat_hold;
-    logic [NUM_ELEMS*FP16_SIG_W-1:0]  s0_b_sig_flat_hold;
+    logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_hold;
+    logic [NUM_ELEMS*SIG_W-1:0]       s0_b_sig_flat_hold;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_a_exp_flat_hold;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_b_exp_flat_hold;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_hold;
@@ -167,36 +174,86 @@ module fp16_dot_prod (
     logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_flat_tmp;
     logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_flat_hold;
 
-    assign s0_prod_sign_flat_hold  = s0_q.prod_sign_flat;
-    assign s0_a_sig_flat_hold      = s0_q.a_sig_flat;
-    assign s0_b_sig_flat_hold      = s0_q.b_sig_flat;
-    assign s0_a_exp_flat_hold      = s0_q.a_exp_flat;
-    assign s0_b_exp_flat_hold      = s0_q.b_exp_flat;
-    assign s0_prod_zero_flat_hold  = s0_q.prod_zero_flat;
-    assign s1_prod_sign_flat_hold  = s1_q.prod_sign_flat;
-    assign s1_prod_sig_flat_hold   = s1_q.prod_sig_flat;
-    assign s1_prod_exp_flat_hold   = s1_q.prod_exp_flat;
-    assign s1_prod_zero_flat_hold  = s1_q.prod_zero_flat;
+    assign s0_prod_sign_flat_hold    = s0_q.prod_sign_flat;
+    assign s0_a_sig_flat_hold        = s0_q.a_sig_flat;
+    assign s0_b_sig_flat_hold        = s0_q.b_sig_flat;
+    assign s0_a_exp_flat_hold        = s0_q.a_exp_flat;
+    assign s0_b_exp_flat_hold        = s0_q.b_exp_flat;
+    assign s0_prod_zero_flat_hold    = s0_q.prod_zero_flat;
+    assign s1_prod_sign_flat_hold    = s1_q.prod_sign_flat;
+    assign s1_prod_sig_flat_hold     = s1_q.prod_sig_flat;
+    assign s1_prod_exp_flat_hold     = s1_q.prod_exp_flat;
+    assign s1_prod_zero_flat_hold    = s1_q.prod_zero_flat;
     assign s2_aligned_prod_flat_hold = s2_q.aligned_prod_flat;
 
-    function automatic fp16_bf16_dec_t decode_fp16_bf16(
-        input logic               fmt_is_bf16,
-        input logic [FP16_W-1:0]  fp16_bf16_i
+    function automatic mid_fp_dec_t decode_disabled_lane;
+        mid_fp_dec_t dec;
+        begin
+            dec         = '0;
+            dec.valid   = 1'b0;
+            dec.is_zero = 1'b1;
+            return dec;
+        end
+    endfunction
+
+    function automatic mid_fp_dec_t decode_tf32_from_fp32(
+        input logic lane_valid_i,
+        input logic [FP32_W-1:0] fp32_i
     );
-        fp16_bf16_dec_t dec;
+        mid_fp_dec_t dec;
+        logic [FP32_EXP_W-1:0]   exp_raw;
+        logic [FP32_FRAC_W-1:0]  frac_raw;
+        logic [TF32_FRAC_W-1:0]  tf32_frac;
+        begin
+            dec = decode_disabled_lane();
+
+            if (lane_valid_i) begin
+                dec       = '0;
+                dec.valid = 1'b1;
+                dec.sign  = fp32_i[31];
+                exp_raw   = fp32_i[30:23];
+                frac_raw  = fp32_i[22:0];
+                tf32_frac = fp32_i[22:13];
+
+                dec.is_zero = (exp_raw == 8'h00) && (tf32_frac == 10'h000);
+                dec.is_inf  = (exp_raw == 8'hff) && (frac_raw == 23'h0);
+                dec.is_nan  = (exp_raw == 8'hff) && (frac_raw != 23'h0);
+
+                if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                    dec.sig = '0;
+                    dec.exp = '0;
+                end else if (exp_raw == 8'h00) begin
+                    dec.sig = {1'b0, tf32_frac};
+                    dec.exp = -10'sd126;
+                end else begin
+                    dec.sig = {1'b1, tf32_frac};
+                    dec.exp = $signed({2'd0, exp_raw}) - 10'sd127;
+                end
+            end
+
+            return dec;
+        end
+    endfunction
+
+    function automatic mid_fp_dec_t decode_fp16_bf16(
+        input logic              is_bf16_i,
+        input logic [FP16_W-1:0] fp16_bf16_i
+    );
+        mid_fp_dec_t dec;
         logic [FP16_EXP_W-1:0]  exp_raw;
         logic [FP16_FRAC_W-1:0] frac_raw;
         logic [BF16_EXP_W-1:0]  bf16_exp_raw;
         logic [BF16_FRAC_W-1:0] bf16_frac_raw;
         begin
-            dec      = '0;
-            dec.sign = fp16_bf16_i[15];
-            exp_raw  = fp16_bf16_i[14:10];
-            frac_raw = fp16_bf16_i[9:0];
+            dec       = '0;
+            dec.valid = 1'b1;
+            dec.sign  = fp16_bf16_i[15];
+            exp_raw   = fp16_bf16_i[14:10];
+            frac_raw  = fp16_bf16_i[9:0];
             bf16_exp_raw  = fp16_bf16_i[14:7];
             bf16_frac_raw = fp16_bf16_i[6:0];
 
-            if (fmt_is_bf16) begin
+            if (is_bf16_i) begin
                 dec.is_zero = (bf16_exp_raw == 8'h00) && (bf16_frac_raw == 7'h00);
                 dec.is_inf  = (bf16_exp_raw == 8'hff) && (bf16_frac_raw == 7'h00);
                 dec.is_nan  = (bf16_exp_raw == 8'hff) && (bf16_frac_raw != 7'h00);
@@ -232,7 +289,7 @@ module fp16_dot_prod (
         end
     endfunction
 
-    function automatic fp32_dec_t decode_fp32(input logic [31:0] fp32_i);
+    function automatic fp32_dec_t decode_fp32(input logic [FP32_W-1:0] fp32_i);
         fp32_dec_t dec;
         logic [FP32_EXP_W-1:0]  exp_raw;
         logic [FP32_FRAC_W-1:0] frac_raw;
@@ -267,10 +324,10 @@ module fp16_dot_prod (
         input logic signed [EXP_W-1:0]      term_exp_i,
         input logic signed [EXP_W-1:0]      emax_i
     );
-        logic [ALIGN_MAG_W-1:0]       term_mag_shift;
+        logic [ALIGN_MAG_W-1:0]         term_mag_shift;
         logic signed [ALIGN_TERM_W-1:0] aligned_val;
-        logic signed [EXP_W:0]        align_shift;
-        integer                       shift_i;
+        logic signed [EXP_W:0]          align_shift;
+        integer                         shift_i;
         begin
             align_fixed_rz = '0;
             term_mag_shift = '0;
@@ -302,6 +359,7 @@ module fp16_dot_prod (
     );
         logic             sign_bit;
         logic [SUM_W-1:0] abs_sum;
+        logic [SUM_W-1:0] norm_sum;
         logic [23:0]      sig24;
         logic [22:0]      frac_field;
         logic [7:0]       exp_field;
@@ -314,6 +372,7 @@ module fp16_dot_prod (
             pack_fp32_rz = 32'h0000_0000;
             sign_bit     = sum_i[SUM_W-1];
             abs_sum      = '0;
+            norm_sum     = '0;
             sig24        = '0;
             frac_field   = '0;
             exp_field    = '0;
@@ -338,7 +397,8 @@ module fp16_dot_prod (
 
                 unbiased_exp = $signed({{(32-EXP_W){base_exp_i[EXP_W-1]}}, base_exp_i}) + msb_idx;
                 norm_lshift  = (SUM_W - 1) - msb_idx;
-                sig24        = 24'((abs_sum << norm_lshift) >> (SUM_W - 24));
+                norm_sum     = abs_sum << norm_lshift;
+                sig24        = norm_sum[SUM_W-1 -: 24];
 
                 if (unbiased_exp > 127) begin
                     exp_field  = 8'hff;
@@ -362,17 +422,19 @@ module fp16_dot_prod (
     endfunction
 
     integer idx0;
-    fp16_bf16_dec_t a_dec_tmp;
-    fp16_bf16_dec_t b_dec_tmp;
+    mid_fp_dec_t a_dec_tmp;
+    mid_fp_dec_t b_dec_tmp;
     fp32_dec_t c_dec_tmp;
     logic any_nan_tmp;
     logic has_pos_inf_tmp;
     logic has_neg_inf_tmp;
     logic has_zero_mul_inf_tmp;
-    logic lane_has_inf_tmp;
     logic lane_prod_sign_tmp;
-
+    logic reserved_mode_tmp;
     always_comb begin
+        logic lane_has_inf_tmp;
+        logic lane_valid_tmp;
+
         s0_d = '0;
         s0_prod_sign_flat_tmp = '0;
         s0_a_sig_flat_tmp     = '0;
@@ -382,7 +444,8 @@ module fp16_dot_prod (
         s0_prod_zero_flat_tmp = '0;
 
         c_dec_tmp            = decode_fp32(c_i);
-        any_nan_tmp          = c_dec_tmp.is_nan;
+        reserved_mode_tmp    = (mode_i == 2'd3);
+        any_nan_tmp          = c_dec_tmp.is_nan || reserved_mode_tmp;
         has_pos_inf_tmp      = c_dec_tmp.is_inf && !c_dec_tmp.sign;
         has_neg_inf_tmp      = c_dec_tmp.is_inf && c_dec_tmp.sign;
         has_zero_mul_inf_tmp = 1'b0;
@@ -393,32 +456,53 @@ module fp16_dot_prod (
         s0_d.c_zero = c_dec_tmp.is_zero;
 
         for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
-            a_dec_tmp = decode_fp16_bf16(fmt_is_bf16_i, a_vec_i[idx0*FP16_W +: FP16_W]);
-            b_dec_tmp = decode_fp16_bf16(fmt_is_bf16_i, b_vec_i[idx0*FP16_W +: FP16_W]);
+            a_dec_tmp = decode_disabled_lane();
+            b_dec_tmp = decode_disabled_lane();
+
+            case (mode_i)
+                MID_FP_MODE_TF32: begin
+                    lane_valid_tmp = (idx0 < TF32_NUM_ELEMS);
+                    if (lane_valid_tmp) begin
+                        a_dec_tmp = decode_tf32_from_fp32(1'b1, a_vec_i[idx0*FP32_W +: FP32_W]);
+                        b_dec_tmp = decode_tf32_from_fp32(1'b1, b_vec_i[idx0*FP32_W +: FP32_W]);
+                    end
+                end
+                MID_FP_MODE_BF16: begin
+                    a_dec_tmp = decode_fp16_bf16(1'b1, a_vec_i[idx0*FP16_W +: FP16_W]);
+                    b_dec_tmp = decode_fp16_bf16(1'b1, b_vec_i[idx0*FP16_W +: FP16_W]);
+                end
+                MID_FP_MODE_FP16: begin
+                    a_dec_tmp = decode_fp16_bf16(1'b0, a_vec_i[idx0*FP16_W +: FP16_W]);
+                    b_dec_tmp = decode_fp16_bf16(1'b0, b_vec_i[idx0*FP16_W +: FP16_W]);
+                end
+                default: begin
+                    a_dec_tmp = decode_disabled_lane();
+                    b_dec_tmp = decode_disabled_lane();
+                end
+            endcase
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
-            lane_has_inf_tmp   = ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
-                                  (b_dec_tmp.is_inf && !a_dec_tmp.is_zero && !a_dec_tmp.is_nan));
+            lane_has_inf_tmp   = a_dec_tmp.valid && b_dec_tmp.valid &&
+                                  ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
+                                   (b_dec_tmp.is_inf && !a_dec_tmp.is_zero && !a_dec_tmp.is_nan));
 
-            any_nan_tmp = any_nan_tmp | a_dec_tmp.is_nan | b_dec_tmp.is_nan;
-            has_zero_mul_inf_tmp = has_zero_mul_inf_tmp |
-                                   ((a_dec_tmp.is_zero && b_dec_tmp.is_inf) ||
-                                    (a_dec_tmp.is_inf && b_dec_tmp.is_zero));
-
-            if (lane_has_inf_tmp) begin
-                if (lane_prod_sign_tmp) begin
-                    has_neg_inf_tmp = 1'b1;
-                end else begin
-                    has_pos_inf_tmp = 1'b1;
-                end
-            end
+            any_nan_tmp = any_nan_tmp ||
+                          (a_dec_tmp.valid && a_dec_tmp.is_nan) ||
+                          (b_dec_tmp.valid && b_dec_tmp.is_nan);
+            has_zero_mul_inf_tmp = has_zero_mul_inf_tmp ||
+                                   (a_dec_tmp.valid && b_dec_tmp.valid &&
+                                    ((a_dec_tmp.is_zero && b_dec_tmp.is_inf) ||
+                                     (a_dec_tmp.is_inf && b_dec_tmp.is_zero)));
+            has_neg_inf_tmp = has_neg_inf_tmp || (lane_has_inf_tmp && lane_prod_sign_tmp);
+            has_pos_inf_tmp = has_pos_inf_tmp || (lane_has_inf_tmp && !lane_prod_sign_tmp);
 
             s0_prod_sign_flat_tmp[idx0] = lane_prod_sign_tmp;
-            s0_a_sig_flat_tmp[idx0*FP16_SIG_W +: FP16_SIG_W] = a_dec_tmp.sig;
-            s0_b_sig_flat_tmp[idx0*FP16_SIG_W +: FP16_SIG_W] = b_dec_tmp.sig;
+            s0_a_sig_flat_tmp[idx0*SIG_W +: SIG_W] = a_dec_tmp.sig;
+            s0_b_sig_flat_tmp[idx0*SIG_W +: SIG_W] = b_dec_tmp.sig;
             s0_a_exp_flat_tmp[idx0*EXP_W +: EXP_W] = a_dec_tmp.exp;
             s0_b_exp_flat_tmp[idx0*EXP_W +: EXP_W] = b_dec_tmp.exp;
-            s0_prod_zero_flat_tmp[idx0] = a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
+            s0_prod_zero_flat_tmp[idx0] = (!a_dec_tmp.valid) || (!b_dec_tmp.valid) ||
+                                          a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
                                           a_dec_tmp.is_inf  || b_dec_tmp.is_inf  ||
                                           a_dec_tmp.is_nan  || b_dec_tmp.is_nan;
         end
@@ -445,15 +529,13 @@ module fp16_dot_prod (
         end
     end
 
-    integer idx1;
-    logic [FP16_SIG_W-1:0]       a_sig_s1_tmp;
-    logic [FP16_SIG_W-1:0]       b_sig_s1_tmp;
-    logic signed [EXP_W-1:0]     a_exp_s1_tmp;
-    logic signed [EXP_W-1:0]     b_exp_s1_tmp;
-    logic [PROD_SIG_W-1:0]       prod_sig_s1_tmp;
-    logic signed [EXP_W-1:0]     prod_exp_s1_tmp;
-
+    logic [SIG_W-1:0]             a_sig_s1_tmp;
+    logic [SIG_W-1:0]             b_sig_s1_tmp;
+    logic [PROD_SIG_W-1:0]        prod_sig_s1_tmp;
     always_comb begin
+        logic signed [EXP_W-1:0] a_exp_s1_tmp;
+        logic signed [EXP_W-1:0] b_exp_s1_tmp;
+        logic signed [EXP_W-1:0] prod_exp_s1_tmp;
         s1_d = '0;
         s1_prod_sign_flat_tmp = '0;
         s1_prod_sig_flat_tmp  = '0;
@@ -467,9 +549,9 @@ module fp16_dot_prod (
         s1_d.c_exp          = s0_q.c_exp;
         s1_d.c_zero         = s0_q.c_zero;
 
-        for (idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
-            a_sig_s1_tmp = s0_a_sig_flat_hold[idx1*FP16_SIG_W +: FP16_SIG_W];
-            b_sig_s1_tmp = s0_b_sig_flat_hold[idx1*FP16_SIG_W +: FP16_SIG_W];
+        for (int idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
+            a_sig_s1_tmp = s0_a_sig_flat_hold[idx1*SIG_W +: SIG_W];
+            b_sig_s1_tmp = s0_b_sig_flat_hold[idx1*SIG_W +: SIG_W];
             a_exp_s1_tmp = $signed(s0_a_exp_flat_hold[idx1*EXP_W +: EXP_W]);
             b_exp_s1_tmp = $signed(s0_b_exp_flat_hold[idx1*EXP_W +: EXP_W]);
 
@@ -478,27 +560,25 @@ module fp16_dot_prod (
 
             s1_prod_sign_flat_tmp[idx1] = s0_prod_sign_flat_hold[idx1];
             s1_prod_sig_flat_tmp[idx1*PROD_SIG_W +: PROD_SIG_W] = prod_sig_s1_tmp;
-            s1_prod_exp_flat_tmp[idx1*EXP_W +: EXP_W] = s0_prod_zero_flat_hold[idx1] ? '0 : prod_exp_s1_tmp;
+            s1_prod_exp_flat_tmp[idx1*EXP_W +: EXP_W] =
+                s0_prod_zero_flat_hold[idx1] ? '0 : prod_exp_s1_tmp;
         end
 
         s1_d.prod_sign_flat = s1_prod_sign_flat_tmp;
         s1_d.prod_sig_flat  = s1_prod_sig_flat_tmp;
         s1_d.prod_exp_flat  = s1_prod_exp_flat_tmp;
     end
-
-    integer idx2;
     logic signed [EXP_W-1:0] emax_tmp;
     logic                    emax_vld_tmp;
     logic signed [EXP_W-1:0] prod_exp_s2_tmp;
     logic [PROD_SIG_W-1:0]   prod_sig_s2_tmp;
     logic [ALIGN_MAG_W-1:0]  prod_mag_s2_tmp;
     logic [ALIGN_MAG_W-1:0]  c_mag_s2_tmp;
-
     always_comb begin
         s2_d = '0;
         s2_aligned_prod_flat_tmp = '0;
-        emax_tmp     = '0;
-        emax_vld_tmp = 1'b0;
+        emax_tmp        = '0;
+        emax_vld_tmp    = 1'b0;
         prod_exp_s2_tmp = '0;
         prod_sig_s2_tmp = '0;
         prod_mag_s2_tmp = '0;
@@ -512,7 +592,7 @@ module fp16_dot_prod (
             emax_vld_tmp = 1'b1;
         end
 
-        for (idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
+        for (int idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
             if (!s1_prod_zero_flat_hold[idx2]) begin
                 prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
                 if (!emax_vld_tmp || (prod_exp_s2_tmp > emax_tmp)) begin
@@ -525,7 +605,7 @@ module fp16_dot_prod (
         if (emax_vld_tmp) begin
             s2_d.base_exp = emax_tmp - ALIGN_FRAC_BITS_EXP;
 
-            for (idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
+            for (int idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
                 if (!s1_prod_zero_flat_hold[idx2]) begin
                     prod_sig_s2_tmp = s1_prod_sig_flat_hold[idx2*PROD_SIG_W +: PROD_SIG_W];
                     prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
@@ -570,11 +650,8 @@ module fp16_dot_prod (
 
     always_comb begin
         s4_d = '0;
-        if (s3_q.special_vld) begin
-            s4_d.result = s3_q.special_result;
-        end else begin
-            s4_d.result = pack_fp32_rz(s3_q.sum, s3_q.base_exp);
-        end
+        s4_d.result = s3_q.special_vld ? s3_q.special_result
+                                       : pack_fp32_rz(s3_q.sum, s3_q.base_exp);
     end
 
     pipeline_reg #(
@@ -644,90 +721,6 @@ module fp16_dot_prod (
 
     assign out_vld_o = s4_vld_q;
     assign d_o       = s4_q.result;
-
-endmodule
-
-module fp16_dot16_fda_f25 (
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        in_valid,
-    input  logic [15:0] a_in [16],
-    input  logic [15:0] b_in [16],
-    input  logic [31:0] c_in,
-    output logic        out_valid,
-    output logic [31:0] d_out
-);
-
-    logic [255:0] a_vec;
-    logic [255:0] b_vec;
-    logic         in_ready_unused;
-
-    integer idx_pack;
-
-    always_comb begin
-        a_vec = '0;
-        b_vec = '0;
-        for (idx_pack = 0; idx_pack < 16; idx_pack = idx_pack + 1) begin
-            a_vec[idx_pack*16 +: 16] = a_in[idx_pack];
-            b_vec[idx_pack*16 +: 16] = b_in[idx_pack];
-        end
-    end
-
-    fp16_dot_prod u_fp16_dot_prod (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .in_vld_i     (in_valid),
-        .in_rdy_o     (in_ready_unused),
-        .fmt_is_bf16_i(1'b0),
-        .a_vec_i      (a_vec),
-        .b_vec_i      (b_vec),
-        .c_i          (c_in),
-        .out_vld_o    (out_valid),
-        .out_rdy_i    (1'b1),
-        .d_o          (d_out)
-    );
-
-endmodule
-
-module bf16_dot16_fda_f25 (
-    input  logic        clk,
-    input  logic        rst_n,
-    input  logic        in_valid,
-    input  logic [15:0] a_in [16],
-    input  logic [15:0] b_in [16],
-    input  logic [31:0] c_in,
-    output logic        out_valid,
-    output logic [31:0] d_out
-);
-
-    logic [255:0] a_vec;
-    logic [255:0] b_vec;
-    logic         in_ready_unused;
-
-    integer idx_pack;
-
-    always_comb begin
-        a_vec = '0;
-        b_vec = '0;
-        for (idx_pack = 0; idx_pack < 16; idx_pack = idx_pack + 1) begin
-            a_vec[idx_pack*16 +: 16] = a_in[idx_pack];
-            b_vec[idx_pack*16 +: 16] = b_in[idx_pack];
-        end
-    end
-
-    fp16_dot_prod u_bf16_dot_prod (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .in_vld_i     (in_valid),
-        .in_rdy_o     (in_ready_unused),
-        .fmt_is_bf16_i(1'b1),
-        .a_vec_i      (a_vec),
-        .b_vec_i      (b_vec),
-        .c_i          (c_in),
-        .out_vld_o    (out_valid),
-        .out_rdy_i    (1'b1),
-        .d_o          (d_out)
-    );
 
 endmodule
 
