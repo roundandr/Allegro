@@ -600,7 +600,7 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 | TF32/BF16/FP16 multiplier | 是 | 三者统一 11-bit significand |
 | TF32/BF16/FP16 exponent add | 是 | decode 后统一 signed unbiased exponent |
 | TF32/BF16/FP16 align/pack | 是 | 均输出 FP32，F=25 |
-| FP8 core | 否 | K32、FP8 decode/MX scale 语义不同 |
+| F6/F8 core | 否 | K32、FP8/FP6 decode/MX scale 语义不同 |
 | FP4 core | 否 | K64、FP4 scale block 语义不同 |
 | INT8 core | 否 | 整数乘加、overflow/saturation 语义不同 |
 

@@ -11,8 +11,6 @@
 //   2026-04-29  v0.1      Codex       Initial version
 // ============================================================================
 
-`default_nettype none
-
 module dot_cluster_top #(
     parameter int TAG_W = 8
 ) (
@@ -53,12 +51,14 @@ module dot_cluster_top #(
     localparam logic [3:0] DTYPE_FP8_E5M2 = 4'd4;
     localparam logic [3:0] DTYPE_INT8    = 4'd5;
     localparam logic [3:0] DTYPE_FP4     = 4'd6;
+    localparam logic [3:0] DTYPE_FP6_E3M2 = 4'd7;
+    localparam logic [3:0] DTYPE_FP6_E2M3 = 4'd8;
 
     // Share groups represent physical arithmetic datapath ownership.
     // TF32/BF16/FP16 share the MID-FP 16-lane 11x11 datapath.
     localparam logic [2:0] SHARE_GROUP_NONE  = 3'd0;
     localparam logic [2:0] SHARE_GROUP_MIDFP = 3'd1;
-    localparam logic [2:0] SHARE_GROUP_FP8   = 3'd2;
+    localparam logic [2:0] SHARE_GROUP_F6F8  = 3'd2;
     localparam logic [2:0] SHARE_GROUP_INT8  = 3'd3;
     localparam logic [2:0] SHARE_GROUP_FP4   = 3'd4;
 
@@ -128,6 +128,8 @@ module dot_cluster_top #(
                 DTYPE_FP16,
                 DTYPE_FP8_E4M3,
                 DTYPE_FP8_E5M2,
+                DTYPE_FP6_E3M2,
+                DTYPE_FP6_E2M3,
                 DTYPE_INT8,
                 DTYPE_FP4: supported_dtype = 1'b1;
                 default:   supported_dtype = 1'b0;
@@ -142,7 +144,9 @@ module dot_cluster_top #(
                 DTYPE_BF16,
                 DTYPE_FP16: dtype_share_group = SHARE_GROUP_MIDFP;
                 DTYPE_FP8_E4M3,
-                DTYPE_FP8_E5M2: dtype_share_group = SHARE_GROUP_FP8;
+                DTYPE_FP8_E5M2,
+                DTYPE_FP6_E3M2,
+                DTYPE_FP6_E2M3: dtype_share_group = SHARE_GROUP_F6F8;
                 DTYPE_INT8:     dtype_share_group = SHARE_GROUP_INT8;
                 DTYPE_FP4:      dtype_share_group = SHARE_GROUP_FP4;
                 default:        dtype_share_group = SHARE_GROUP_NONE;
@@ -161,6 +165,8 @@ module dot_cluster_top #(
                 DTYPE_FP16: meta_valid_by_dtype = meta_2to4_valid(meta_i, 8);
                 DTYPE_FP8_E4M3,
                 DTYPE_FP8_E5M2,
+                DTYPE_FP6_E3M2,
+                DTYPE_FP6_E2M3,
                 DTYPE_INT8: meta_valid_by_dtype = meta_2to4_valid(meta_i, 16);
                 DTYPE_FP4:  meta_valid_by_dtype = meta_4to8_valid(meta_i);
                 default:    meta_valid_by_dtype = 1'b0;
@@ -240,6 +246,30 @@ module dot_cluster_top #(
         end
     endfunction
 
+    function automatic logic [255:0] select_b_2to4_6(
+        input logic [511:0] b_i,
+        input logic [127:0] meta_i
+    );
+        integer group_idx;
+        integer lane_idx;
+        integer sel_idx;
+        begin
+            select_b_2to4_6 = '0;
+            for (group_idx = 0; group_idx < 16; group_idx = group_idx + 1) begin
+                sel_idx = 0;
+                for (lane_idx = 0; lane_idx < 4; lane_idx = lane_idx + 1) begin
+                    if (meta_i[group_idx*4 + lane_idx]) begin
+                        if (sel_idx < 2) begin
+                            select_b_2to4_6[(group_idx*2+sel_idx)*6 +: 6] =
+                                b_i[(group_idx*4+lane_idx)*6 +: 6];
+                        end
+                        sel_idx = sel_idx + 1;
+                    end
+                end
+            end
+        end
+    endfunction
+
     function automatic logic [255:0] select_b_4to8_4(
         input logic [511:0] b_i,
         input logic [127:0] meta_i
@@ -278,23 +308,25 @@ module dot_cluster_top #(
     logic [255:0] b_fp16_core;
     logic [255:0] b_mid_fp_core;
     logic [255:0] b_8b_lane_core;
+    logic [255:0] b_fp6_core;
     logic [255:0] b_fp4_core;
 
     logic tf32_sel;
     logic fp16_sel;
     logic mid_fp_sel;
-    logic fp8_sel;
+    logic f6f8_sel;
+    logic fp6_sel;
     logic int8_sel;
     logic fp4_sel;
     logic [1:0] mid_fp_mode;
 
     logic mid_fp_in_rdy;
-    logic fp8_in_rdy;
+    logic f6f8_in_rdy;
     logic int8_in_rdy;
     logic fp4_in_rdy;
 
     logic mid_fp_meta_in_rdy;
-    logic fp8_meta_in_rdy;
+    logic f6f8_meta_in_rdy;
     logic int8_meta_in_rdy;
     logic fp4_meta_in_rdy;
 
@@ -305,32 +337,32 @@ module dot_cluster_top #(
     logic err_out_fire;
 
     logic mid_fp_in_vld;
-    logic fp8_in_vld;
+    logic f6f8_in_vld;
     logic int8_in_vld;
     logic fp4_in_vld;
 
     logic mid_fp_out_vld;
-    logic fp8_out_vld;
+    logic f6f8_out_vld;
     logic int8_out_vld;
     logic fp4_out_vld;
 
     logic mid_fp_out_rdy;
-    logic fp8_out_rdy;
+    logic f6f8_out_rdy;
     logic int8_out_rdy;
     logic fp4_out_rdy;
 
     logic [31:0] mid_fp_d;
-    logic [31:0] fp8_d;
+    logic [31:0] f6f8_d;
     logic [31:0] int8_d;
     logic [31:0] fp4_d;
     logic        int8_overflow;
 
     logic mid_fp_meta_vld;
-    logic fp8_meta_vld;
+    logic f6f8_meta_vld;
     logic int8_meta_vld;
     logic fp4_meta_vld;
     logic [RSP_META_W-1:0] mid_fp_meta;
-    logic [RSP_META_W-1:0] fp8_meta;
+    logic [RSP_META_W-1:0] f6f8_meta;
     logic [RSP_META_W-1:0] int8_meta;
     logic [RSP_META_W-1:0] fp4_meta;
     logic [RSP_META_W-1:0] req_rsp_meta;
@@ -342,7 +374,7 @@ module dot_cluster_top #(
 
     logic arb_err_sel;
     logic arb_mid_fp_sel;
-    logic arb_fp8_sel;
+    logic arb_f6f8_sel;
     logic arb_int8_sel;
     logic arb_fp4_sel;
 
@@ -360,12 +392,15 @@ module dot_cluster_top #(
     assign b_fp16_core     = req_sparse_en_i ? select_b_2to4_16(req_b_packed_i, req_meta_i) : req_b_packed_i[255:0];
     assign b_mid_fp_core   = tf32_sel ? b_tf32_core : b_fp16_core;
     assign b_8b_lane_core  = req_sparse_en_i ? select_b_2to4_8(req_b_packed_i, req_meta_i)  : req_b_packed_i[255:0];
+    assign b_fp6_core      = req_sparse_en_i ? select_b_2to4_6(req_b_packed_i, req_meta_i)  : req_b_packed_i[255:0];
     assign b_fp4_core      = req_sparse_en_i ? select_b_4to8_4(req_b_packed_i, req_meta_i)  : req_b_packed_i[255:0];
 
     assign tf32_sel = (req_dtype_i == DTYPE_TF32);
     assign fp16_sel = (req_dtype_i == DTYPE_FP16) || (req_dtype_i == DTYPE_BF16);
     assign mid_fp_sel = tf32_sel || fp16_sel;
-    assign fp8_sel  = (req_dtype_i == DTYPE_FP8_E4M3) || (req_dtype_i == DTYPE_FP8_E5M2);
+    assign fp6_sel   = (req_dtype_i == DTYPE_FP6_E3M2) || (req_dtype_i == DTYPE_FP6_E2M3);
+    assign f6f8_sel  = (req_dtype_i == DTYPE_FP8_E4M3) || (req_dtype_i == DTYPE_FP8_E5M2) ||
+                       fp6_sel;
     assign int8_sel = (req_dtype_i == DTYPE_INT8);
     assign fp4_sel  = (req_dtype_i == DTYPE_FP4);
     assign mid_fp_mode = tf32_sel ? MID_FP_MODE_TF32 :
@@ -379,8 +414,8 @@ module dot_cluster_top #(
         selected_core_rdy = 1'b0;
         if (mid_fp_sel) begin
             selected_core_rdy = mid_fp_in_rdy && mid_fp_meta_in_rdy;
-        end else if (fp8_sel) begin
-            selected_core_rdy = fp8_in_rdy && fp8_meta_in_rdy;
+        end else if (f6f8_sel) begin
+            selected_core_rdy = f6f8_in_rdy && f6f8_meta_in_rdy;
         end else if (int8_sel) begin
             selected_core_rdy = int8_in_rdy && int8_meta_in_rdy;
         end else if (fp4_sel) begin
@@ -393,7 +428,7 @@ module dot_cluster_top #(
     assign core_req_fire = in_vld_i && in_rdy_o && !err_path;
 
     assign mid_fp_in_vld = core_req_fire && mid_fp_sel;
-    assign fp8_in_vld  = core_req_fire && fp8_sel;
+    assign f6f8_in_vld  = core_req_fire && f6f8_sel;
     assign int8_in_vld = core_req_fire && int8_sel;
     assign fp4_in_vld  = core_req_fire && fp4_sel;
 
@@ -413,21 +448,23 @@ module dot_cluster_top #(
         .d_o      (mid_fp_d)
     );
 
-    fp8_dot_prod u_fp8_dot_prod (
+    f6f8_dot_prod u_f6f8_dot_prod (
         .clk         (clk),
         .rst_n       (rst_n),
-        .in_vld_i    (fp8_in_vld),
-        .in_rdy_o    (fp8_in_rdy),
+        .in_vld_i    (f6f8_in_vld),
+        .in_rdy_o    (f6f8_in_rdy),
         .a_vec_i     (req_a_packed_i),
-        .b_vec_i     (b_8b_lane_core),
+        .b_vec_i     (fp6_sel ? b_fp6_core : b_8b_lane_core),
         .c_i         (req_c_i),
         .fp8_format_i(req_dtype_i == DTYPE_FP8_E5M2),
+        .fp6_en_i    (fp6_sel),
+        .fp6_format_i(req_dtype_i == DTYPE_FP6_E3M2),
         .mxfp8_en_i  (req_mxfp8_en_i),
         .a_mx_scale_i(req_a_mx_scale_i),
         .b_mx_scale_i(req_b_mx_scale_i),
-        .out_vld_o   (fp8_out_vld),
-        .out_rdy_i   (fp8_out_rdy),
-        .d_o         (fp8_d)
+        .out_vld_o   (f6f8_out_vld),
+        .out_rdy_i   (f6f8_out_rdy),
+        .d_o         (f6f8_d)
     );
 
     int8_dot_prod u_int8_dot_prod (
@@ -480,15 +517,15 @@ module dot_cluster_top #(
     dot_rsp_meta_pipe #(
         .W      (RSP_META_W),
         .STAGES (5)
-    ) u_fp8_meta_pipe (
+    ) u_f6f8_meta_pipe (
         .clk          (clk),
         .rst_n        (rst_n),
-        .in_vld_i     (fp8_in_vld),
-        .in_rdy_o     (fp8_meta_in_rdy),
+        .in_vld_i     (f6f8_in_vld),
+        .in_rdy_o     (f6f8_meta_in_rdy),
         .in_data_i    (req_rsp_meta),
-        .out_vld_o    (fp8_meta_vld),
-        .out_rdy_i    (fp8_out_rdy),
-        .out_data_o   (fp8_meta)
+        .out_vld_o    (f6f8_meta_vld),
+        .out_rdy_i    (f6f8_out_rdy),
+        .out_data_o   (f6f8_meta)
     );
 
     dot_rsp_meta_pipe #(
@@ -540,20 +577,20 @@ module dot_cluster_top #(
 
     assign arb_err_sel    = err_vld_q;
     assign arb_mid_fp_sel = !arb_err_sel && mid_fp_out_vld;
-    assign arb_fp8_sel    = !arb_err_sel && !arb_mid_fp_sel && fp8_out_vld;
+    assign arb_f6f8_sel  = !arb_err_sel && !arb_mid_fp_sel && f6f8_out_vld;
     assign arb_int8_sel   = !arb_err_sel && !arb_mid_fp_sel &&
-                            !arb_fp8_sel && int8_out_vld;
+                            !arb_f6f8_sel && int8_out_vld;
     assign arb_fp4_sel    = !arb_err_sel && !arb_mid_fp_sel &&
-                            !arb_fp8_sel && !arb_int8_sel && fp4_out_vld;
+                            !arb_f6f8_sel && !arb_int8_sel && fp4_out_vld;
 
     assign err_out_rdy    = out_rdy_i && arb_err_sel;
     assign mid_fp_out_rdy = out_rdy_i && arb_mid_fp_sel;
-    assign fp8_out_rdy    = out_rdy_i && arb_fp8_sel;
+    assign f6f8_out_rdy  = out_rdy_i && arb_f6f8_sel;
     assign int8_out_rdy   = out_rdy_i && arb_int8_sel;
     assign fp4_out_rdy    = out_rdy_i && arb_fp4_sel;
     assign err_out_fire = err_vld_q && err_out_rdy;
 
-    assign out_vld_o = err_vld_q || mid_fp_out_vld || fp8_out_vld ||
+    assign out_vld_o = err_vld_q || mid_fp_out_vld || f6f8_out_vld ||
                        int8_out_vld || fp4_out_vld;
 
     always_comb begin
@@ -569,10 +606,10 @@ module dot_cluster_top #(
             out_d_o      = mid_fp_d;
             out_status_o = mid_fp_meta[7:0];
             out_tag_o    = mid_fp_meta[RSP_META_W-1:8];
-        end else if (arb_fp8_sel) begin
-            out_d_o      = fp8_d;
-            out_status_o = fp8_meta[7:0];
-            out_tag_o    = fp8_meta[RSP_META_W-1:8];
+        end else if (arb_f6f8_sel) begin
+            out_d_o      = f6f8_d;
+            out_status_o = f6f8_meta[7:0];
+            out_tag_o    = f6f8_meta[RSP_META_W-1:8];
         end else if (arb_int8_sel) begin
             out_d_o      = int8_d;
             out_status_o = int8_meta[7:0] | (int8_overflow ? STATUS_INT_OVERFLOW : STATUS_OK);
@@ -585,7 +622,7 @@ module dot_cluster_top #(
     end
 
     assign core_rsp_fire = (mid_fp_out_vld && mid_fp_out_rdy) ||
-                           (fp8_out_vld  && fp8_out_rdy)  ||
+                           (f6f8_out_vld  && f6f8_out_rdy)  ||
                            (int8_out_vld && int8_out_rdy) ||
                            (fp4_out_vld  && fp4_out_rdy);
 
@@ -659,5 +696,3 @@ module dot_rsp_meta_pipe #(
     endgenerate
 
 endmodule
-
-`default_nettype wire

@@ -1,8 +1,8 @@
-# 32-Element FP8 Dot Product Unit Spec Based on FDA Algorithm
+# 32-Element F6/F8 Dot Product Unit Spec Based on FDA Algorithm
 
 ## 1. 设计目标
 
-该单元用于实现 32 个 FP8 / MXFP8 元素的点积累加。普通 FP8 模式：
+该单元用于实现 32 个 FP8 / FP6 / MXFP8 / MXFP6 元素的点积累加。普通 FP8 / FP6 模式：
 
 $$
 D = C + \sum_{k=0}^{31} A_k \times B_k
@@ -11,10 +11,11 @@ $$
 其中：
 
 * 输入向量长度：32
-* 输入数据格式：FP8
+* 输入数据格式：FP8 或 FP6
 
   * 支持 E4M3 / E5M2，可通过参数选择
-  * 可选 MXFP8 模式，使用 32-lane block 的 A/B E8M0 scale
+  * 支持 E2M3 / E3M2 FP6，低 192-bit payload 被前端 exact widening 后复用 F6/F8 core
+  * 可选 MXFP8 / MXFP6 模式，使用 32-lane block 的 A/B E8M0 scale
 * 累加输入：FP32 `C`
 * 输出格式：FP32 `D`
 * 内部对齐累加精度：
@@ -38,13 +39,15 @@ $$
 | `rst_n`        |      1 | 低有效复位                         |
 | `in_vld_i`     |      1 | 输入有效信号                        |
 | `in_rdy_o`     |      1 | 输入就绪信号                        |
-| `a_vec_i`      | 32 × 8 | FP8 输入向量 A，共 32 个元素           |
-| `b_vec_i`      | 32 × 8 | FP8 输入向量 B，共 32 个元素           |
+| `a_vec_i`      | 32 × 8 | FP8 输入向量 A；FP6 模式下低 32 × 6 bit 有效 |
+| `b_vec_i`      | 32 × 8 | FP8 输入向量 B；FP6 模式下低 32 × 6 bit 有效 |
 | `c_i`          |     32 | FP32 累加输入 C                   |
 | `fp8_format_i` |      1 | FP8 格式选择，0 表示 E4M3，1 表示 E5M2  |
-| `mxfp8_en_i`   |      1 | MXFP8 使能，0 表示普通 FP8，1 表示 MXFP8 |
-| `a_mx_scale_i` |      8 | A 向量 E8M0 block scale，仅 MXFP8 模式有效 |
-| `b_mx_scale_i` |      8 | B 向量 E8M0 block scale，仅 MXFP8 模式有效 |
+| `fp6_en_i`     |      1 | FP6 输入使能，1 表示按 FP6 payload 解码 |
+| `fp6_format_i` |      1 | FP6 格式选择，0 表示 E2M3，1 表示 E3M2 |
+| `mxfp8_en_i`   |      1 | MX scale 使能，FP8/FP6 下分别表示 MXFP8/MXFP6 |
+| `a_mx_scale_i` |      8 | A 向量 E8M0 block scale，仅 MX 模式有效 |
+| `b_mx_scale_i` |      8 | B 向量 E8M0 block scale，仅 MX 模式有效 |
 | `out_vld_o`    |      1 | 输出有效信号                        |
 | `out_rdy_i`    |      1 | 下游就绪信号                        |
 | `d_o`          |     32 | FP32 输出结果 D                   |
@@ -87,9 +90,44 @@ E5M2 通常支持 Inf / NaN 编码，因此 Special Check 阶段需要完整处�
 
 ---
 
-### 3.3 MXFP8 E8M0 Scale
+### 3.3 FP6 E2M3 / E3M2
 
-MXFP8 模式沿用 32 个 FP8 element 的 E4M3 / E5M2 decode，仅额外引入 A/B 两个 8-bit E8M0 block scale。当前点积宽度为 32，因此一个 dot 正好对应一个 MX block：
+FP6 payload 使用 32 路 6-bit little-endian lane packing：
+
+```text
+lane k = vec_i[k*6 +: 6]
+```
+
+E2M3 字段：
+
+```text
+sign = x[5]
+exp  = x[4:3]
+frac = x[2:0]
+bias = 1
+```
+
+E3M2 字段：
+
+```text
+sign = x[5]
+exp  = x[4:2]
+frac = x[1:0]
+bias = 3
+```
+
+FP6 遵循 MX/OCP finite-only 语义，无 Inf / NaN 保留编码，支持 subnormal。前端不做舍入，只生成 F6/F8 core 的 decoded operand：
+
+```text
+E2M3 mant_core = {hidden, frac[2:0]}
+E3M2 mant_core = {hidden, frac[1:0], 1'b0}
+```
+
+其中 normal exponent 为 `exp - bias`，subnormal exponent 为 `1 - bias`。
+
+### 3.4 MXFP8 / MXFP6 E8M0 Scale
+
+MX 模式沿用 32 个 FP8 或 FP6 element decode，仅额外引入 A/B 两个 8-bit E8M0 block scale。当前点积宽度为 32，因此一个 dot 正好对应一个 MX block：
 
 $$
 D = C + 2^{e_{sa} + e_{sb}} \times \sum_{k=0}^{31} A_k B_k
@@ -129,7 +167,7 @@ $$
 D = C + \sum_{k=0}^{31} A_k B_k \times 2^{e_{sa} + e_{sb}}
 $$
 
-`C` 不参与 MX scale。
+`C` 不参与 MX scale。若 `fp6_en_i = 1`，同一开关表示 MXFP6。
 
 FDA 内部将每个输入拆成：
 
@@ -466,10 +504,10 @@ $$
 * 32 个 product exponent
 * 1 个 C exponent
 
-推荐使用比较树实现：
+当前 RTL 使用同级平衡比较树实现，避免 32 路串行比较链：
 
 ```text
-Level 0: 33 exponents
+Level 0: 32 个 product exponent + 1 个 C exponent
 Level 1: pairwise max
 Level 2: pairwise max
 Level 3: pairwise max
@@ -790,7 +828,7 @@ $$
 | Stage | 名称                                      | 主要功能                                     |
 | --- | --- | --- |
 | S0    | Input Register / Decode / Product Generation | 输入寄存、FP8 解码、E8M0 scale decode、FP32 C 解码、特殊值检查、32 路 FP8 significand 精确乘法并生成非归一化 product |
-| S1    | Max Exponent Search                     | 搜索 32 个 product 与 C 的 exponent 最大值；MXFP8 product exponent 已包含 scale exponent |
+| S1    | Max Exponent Search                     | 用平衡比较树搜索 32 个 product 与 C 的 exponent 最大值；MXFP8 product exponent 已包含 scale exponent |
 | S2    | Alignment                               | 计算 shift amount，对齐到 `S2.25`，并输出 `base_exp = emax - 25` |
 | S3    | Fixed-Point Accumulation                | 33 输入 fixed-point 加法树，得到 `S7.25` 累加结果 |
 | S4    | FP32 Normalize / RZ Round               | 归一化、溢出处理、subnormal 处理、RZ 输出 FP32         |
@@ -799,7 +837,7 @@ $$
 
 # 7. 子模块划分
 
-## 7.1 `fp8_decode_unit`
+## 7.1 `f6f8_decode_unit`
 
 ### 功能
 
@@ -831,7 +869,7 @@ $$
 
 ---
 
-## 7.2 `fp8_product_unit`
+## 7.2 `f6f8_product_unit`
 
 ### 功能
 
@@ -960,7 +998,7 @@ $$
 
 ### 功能
 
-搜索 33 个有效项中的最大原始 exponent。
+搜索 33 个有效项中的最大原始 exponent。当前实现保持 5 级流水，在 S1 内使用平衡比较树完成 `emax` 搜索。
 
 ### 接口定义
 
@@ -1051,7 +1089,7 @@ $$
 
 ---
 
-# 8. MXFP8 验证要求
+# 8. MXFP8/MXFP6 验证要求
 
 普通 FP8 回归：
 

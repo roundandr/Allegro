@@ -1,10 +1,10 @@
 // ============================================================================
-// File Name   : fp8_dot_prod.sv
+// File Name   : f6f8_dot_prod.sv
 // Author      : Codex
 // Date        : 2026-04-22
-// Description : 32-element FP8/MXFP8 dot-product with FP32 accumulate. The
-//               datapath follows the 5-stage FDA pipeline defined in
-//               doc/FP8_DotProd.md.
+// Description : 32-element FP8/FP6/MXFP8/MXFP6 dot-product with FP32
+//               accumulate. The datapath follows the 5-stage FDA pipeline
+//               defined in doc/F6F8_DotProd.md.
 //
 // Revision History:
 //   Date        Version   Author      Description
@@ -12,7 +12,7 @@
 //   2026-04-22  v0.1      Codex       Initial version
 // ============================================================================
 
-module fp8_dot_prod (
+module f6f8_dot_prod (
     input  logic         clk,
     input  logic         rst_n,
     input  logic         in_vld_i,
@@ -21,6 +21,8 @@ module fp8_dot_prod (
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
     input  logic         fp8_format_i,
+    input  logic         fp6_en_i,
+    input  logic         fp6_format_i,
     input  logic         mxfp8_en_i,
     input  logic [7:0]   a_mx_scale_i,
     input  logic [7:0]   b_mx_scale_i,
@@ -30,6 +32,7 @@ module fp8_dot_prod (
 );
 
     localparam int FP8_W            = 8;
+    localparam int FP6_W            = 6;
     localparam int NUM_ELEMS        = 32;
     localparam int FP8_SIG_W        = 4;
     localparam int PROD_SIG_W       = 8;
@@ -46,6 +49,12 @@ module fp8_dot_prod (
     localparam int C_ALIGN_PAD_W      = ALIGN_FRAC_BITS - C_SIG_FRAC_BITS;
     localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = 10'sd25;
     localparam logic signed [EXP_W-1:0] MX_SCALE_BIAS_EXP = 10'sd127;
+    localparam logic signed [EXP_W-1:0] FP6_E2M3_BIAS_EXP = 10'sd1;
+    localparam logic signed [EXP_W-1:0] FP6_E3M2_BIAS_EXP = 10'sd3;
+    localparam logic signed [EXP_W:0]   ALIGN_TERM_M1_EXP = 11'sd27;
+
+    localparam logic FP6_FORMAT_E2M3 = 1'b0;
+    localparam logic FP6_FORMAT_E3M2 = 1'b1;
 
     typedef struct packed {
         logic                      sign;
@@ -213,6 +222,57 @@ module fp8_dot_prod (
         end
     endfunction
 
+    function automatic fp8_dec_t decode_fp6(
+        input logic [FP6_W-1:0] fp6_i,
+        input logic             fp6_format_i
+    );
+        fp8_dec_t dec;
+        logic [1:0] exp_e2m3;
+        logic [2:0] frac_e2m3;
+        logic [2:0] exp_e3m2;
+        logic [1:0] frac_e3m2;
+        begin
+            dec        = '0;
+            dec.sign   = fp6_i[5];
+            dec.is_inf = 1'b0;
+            dec.is_nan = 1'b0;
+
+            if (fp6_format_i == FP6_FORMAT_E3M2) begin
+                exp_e3m2  = fp6_i[4:2];
+                frac_e3m2 = fp6_i[1:0];
+
+                dec.is_zero = (exp_e3m2 == 3'b000) && (frac_e3m2 == 2'b00);
+                if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = '0;
+                end else if (exp_e3m2 == 3'b000) begin
+                    dec.sig = {1'b0, frac_e3m2, 1'b0};
+                    dec.exp = 10'sd1 - FP6_E3M2_BIAS_EXP;
+                end else begin
+                    dec.sig = {1'b1, frac_e3m2, 1'b0};
+                    dec.exp = $signed({7'd0, exp_e3m2}) - FP6_E3M2_BIAS_EXP;
+                end
+            end else begin
+                exp_e2m3  = fp6_i[4:3];
+                frac_e2m3 = fp6_i[2:0];
+
+                dec.is_zero = (exp_e2m3 == 2'b00) && (frac_e2m3 == 3'b000);
+                if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = '0;
+                end else if (exp_e2m3 == 2'b00) begin
+                    dec.sig = {1'b0, frac_e2m3};
+                    dec.exp = 10'sd1 - FP6_E2M3_BIAS_EXP;
+                end else begin
+                    dec.sig = {1'b1, frac_e2m3};
+                    dec.exp = $signed({8'd0, exp_e2m3}) - FP6_E2M3_BIAS_EXP;
+                end
+            end
+
+            return dec;
+        end
+    endfunction
+
     function automatic fp32_dec_t decode_fp32(
         input logic [31:0] fp32_i
     );
@@ -270,10 +330,10 @@ module fp8_dot_prod (
                             - $signed({term_exp_i[EXP_W-1], term_exp_i});
                 if (align_shift <= 0) begin
                     term_mag_shift = term_mag_i;
-                end else if (align_shift >= (ALIGN_TERM_W-1)) begin
+                end else if (align_shift >= ALIGN_TERM_M1_EXP) begin
                     term_mag_shift = '0;
                 end else begin
-                    shift_i = align_shift;
+                    shift_i = int'(align_shift);
                     term_mag_shift = term_mag_i >> shift_i;
                 end
 
@@ -311,10 +371,9 @@ module fp8_dot_prod (
                 end
 
                 msb_idx = 0;
-                for (idx = SUM_W-1; idx >= 0; idx = idx - 1) begin
+                for (idx = 0; idx < SUM_W; idx = idx + 1) begin
                     if (abs_sum[idx]) begin
                         msb_idx = idx;
-                        idx = -1;
                     end
                 end
 
@@ -327,7 +386,7 @@ module fp8_dot_prod (
                     exp_field  = 8'hff;
                     frac_field = 23'h0;
                 end else if (unbiased_exp >= -126) begin
-                    exp_field  = unbiased_exp + 127;
+                    exp_field  = 8'(unbiased_exp + 127);
                     frac_field = sig24[22:0];
                 end else if (unbiased_exp < -149) begin
                     exp_field  = 8'h00;
@@ -376,6 +435,8 @@ module fp8_dot_prod (
         has_pos_inf_tmp      = c_dec_tmp.is_inf && !c_dec_tmp.sign;
         has_neg_inf_tmp      = c_dec_tmp.is_inf && c_dec_tmp.sign;
         has_zero_mul_inf_tmp = 1'b0;
+        lane_prod_sig_tmp    = '0;
+        lane_prod_mag_tmp    = '0;
 
         s0_d.c_sign = c_dec_tmp.sign;
         s0_d.c_exp  = c_dec_tmp.exp;
@@ -386,8 +447,13 @@ module fp8_dot_prod (
         s0_d.c_mag = c_mag_tmp_s0;
 
         for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
-            a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
-            b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
+            if (fp6_en_i) begin
+                a_dec_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], fp6_format_i);
+                b_dec_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], fp6_format_i);
+            end else begin
+                a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
+                b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
+            end
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
             lane_has_inf_tmp   = ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
@@ -449,13 +515,55 @@ module fp8_dot_prod (
         end
     end
 
+    function automatic logic emax_pick_vld(
+        input logic a_vld_i,
+        input logic b_vld_i
+    );
+        begin
+            emax_pick_vld = a_vld_i | b_vld_i;
+        end
+    endfunction
+
+    function automatic logic signed [EXP_W-1:0] emax_pick_exp(
+        input logic                  a_vld_i,
+        input logic signed [EXP_W-1:0] a_exp_i,
+        input logic                  b_vld_i,
+        input logic signed [EXP_W-1:0] b_exp_i
+    );
+        begin
+            if (!a_vld_i) begin
+                emax_pick_exp = b_exp_i;
+            end else if (!b_vld_i) begin
+                emax_pick_exp = a_exp_i;
+            end else if (b_exp_i > a_exp_i) begin
+                emax_pick_exp = b_exp_i;
+            end else begin
+                emax_pick_exp = a_exp_i;
+            end
+        end
+    endfunction
+
     integer idx1;
-    logic signed [EXP_W-1:0] prod_exp_s1_tmp;
-    logic signed [EXP_W-1:0] emax_tmp;
-    logic                    emax_vld_tmp;
+    logic                                  emax_l0_vld_tmp [0:32];
+    logic signed [EXP_W-1:0]               emax_l0_exp_tmp [0:32];
+    logic                                  emax_l1_vld_tmp [0:16];
+    logic signed [EXP_W-1:0]               emax_l1_exp_tmp [0:16];
+    logic                                  emax_l2_vld_tmp [0:8];
+    logic signed [EXP_W-1:0]               emax_l2_exp_tmp [0:8];
+    logic                                  emax_l3_vld_tmp [0:4];
+    logic signed [EXP_W-1:0]               emax_l3_exp_tmp [0:4];
+    logic                                  emax_l4_vld_tmp [0:2];
+    logic signed [EXP_W-1:0]               emax_l4_exp_tmp [0:2];
+    logic                                  emax_l5_vld_tmp [0:1];
+    logic signed [EXP_W-1:0]               emax_l5_exp_tmp [0:1];
+    logic                                  emax_result_vld_tmp;
+    logic signed [EXP_W-1:0]               emax_result_exp_tmp;
 
     always @(*) begin
         s1_d = '0;
+        emax_result_vld_tmp  = 1'b0;
+        emax_result_exp_tmp  = '0;
+
         s1_d.special_vld    = s0_q.special_vld;
         s1_d.special_result = s0_q.special_result;
         s1_d.prod_sign_flat = s0_q.prod_sign_flat;
@@ -467,26 +575,68 @@ module fp8_dot_prod (
         s1_d.c_exp          = s0_q.c_exp;
         s1_d.c_zero         = s0_q.c_zero;
 
-        emax_tmp     = '0;
-        emax_vld_tmp = 1'b0;
-
-        if (!s0_q.c_zero) begin
-            emax_tmp     = s0_q.c_exp;
-            emax_vld_tmp = 1'b1;
-        end
-
         for (idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
-            if (!s0_prod_zero_q_flat[idx1]) begin
-                prod_exp_s1_tmp = $signed(s0_prod_exp_q_flat[idx1*EXP_W +: EXP_W]);
-                if (!emax_vld_tmp || (prod_exp_s1_tmp > emax_tmp)) begin
-                    emax_tmp     = prod_exp_s1_tmp;
-                    emax_vld_tmp = 1'b1;
-                end
-            end
+            emax_l0_vld_tmp[idx1] = !s0_prod_zero_q_flat[idx1];
+            emax_l0_exp_tmp[idx1] = $signed(s0_prod_exp_q_flat[idx1*EXP_W +: EXP_W]);
         end
+        emax_l0_vld_tmp[32] = !s0_q.c_zero;
+        emax_l0_exp_tmp[32] = s0_q.c_exp;
 
-        s1_d.emax     = emax_tmp;
-        s1_d.emax_vld = emax_vld_tmp;
+        for (idx1 = 0; idx1 < 16; idx1 = idx1 + 1) begin
+            emax_l1_vld_tmp[idx1] = emax_pick_vld(emax_l0_vld_tmp[idx1*2],
+                                                   emax_l0_vld_tmp[idx1*2+1]);
+            emax_l1_exp_tmp[idx1] = emax_pick_exp(emax_l0_vld_tmp[idx1*2],
+                                                   emax_l0_exp_tmp[idx1*2],
+                                                   emax_l0_vld_tmp[idx1*2+1],
+                                                   emax_l0_exp_tmp[idx1*2+1]);
+        end
+        emax_l1_vld_tmp[16] = emax_l0_vld_tmp[32];
+        emax_l1_exp_tmp[16] = emax_l0_exp_tmp[32];
+
+        for (idx1 = 0; idx1 < 8; idx1 = idx1 + 1) begin
+            emax_l2_vld_tmp[idx1] = emax_pick_vld(emax_l1_vld_tmp[idx1*2],
+                                                   emax_l1_vld_tmp[idx1*2+1]);
+            emax_l2_exp_tmp[idx1] = emax_pick_exp(emax_l1_vld_tmp[idx1*2],
+                                                   emax_l1_exp_tmp[idx1*2],
+                                                   emax_l1_vld_tmp[idx1*2+1],
+                                                   emax_l1_exp_tmp[idx1*2+1]);
+        end
+        emax_l2_vld_tmp[8] = emax_l1_vld_tmp[16];
+        emax_l2_exp_tmp[8] = emax_l1_exp_tmp[16];
+
+        for (idx1 = 0; idx1 < 4; idx1 = idx1 + 1) begin
+            emax_l3_vld_tmp[idx1] = emax_pick_vld(emax_l2_vld_tmp[idx1*2],
+                                                   emax_l2_vld_tmp[idx1*2+1]);
+            emax_l3_exp_tmp[idx1] = emax_pick_exp(emax_l2_vld_tmp[idx1*2],
+                                                   emax_l2_exp_tmp[idx1*2],
+                                                   emax_l2_vld_tmp[idx1*2+1],
+                                                   emax_l2_exp_tmp[idx1*2+1]);
+        end
+        emax_l3_vld_tmp[4] = emax_l2_vld_tmp[8];
+        emax_l3_exp_tmp[4] = emax_l2_exp_tmp[8];
+
+        for (idx1 = 0; idx1 < 2; idx1 = idx1 + 1) begin
+            emax_l4_vld_tmp[idx1] = emax_pick_vld(emax_l3_vld_tmp[idx1*2],
+                                                   emax_l3_vld_tmp[idx1*2+1]);
+            emax_l4_exp_tmp[idx1] = emax_pick_exp(emax_l3_vld_tmp[idx1*2],
+                                                   emax_l3_exp_tmp[idx1*2],
+                                                   emax_l3_vld_tmp[idx1*2+1],
+                                                   emax_l3_exp_tmp[idx1*2+1]);
+        end
+        emax_l4_vld_tmp[2] = emax_l3_vld_tmp[4];
+        emax_l4_exp_tmp[2] = emax_l3_exp_tmp[4];
+
+        emax_l5_vld_tmp[0] = emax_pick_vld(emax_l4_vld_tmp[0], emax_l4_vld_tmp[1]);
+        emax_l5_exp_tmp[0] = emax_pick_exp(emax_l4_vld_tmp[0], emax_l4_exp_tmp[0],
+                                           emax_l4_vld_tmp[1], emax_l4_exp_tmp[1]);
+        emax_l5_vld_tmp[1] = emax_l4_vld_tmp[2];
+        emax_l5_exp_tmp[1] = emax_l4_exp_tmp[2];
+        emax_result_vld_tmp = emax_pick_vld(emax_l5_vld_tmp[0], emax_l5_vld_tmp[1]);
+        emax_result_exp_tmp = emax_pick_exp(emax_l5_vld_tmp[0], emax_l5_exp_tmp[0],
+                                            emax_l5_vld_tmp[1], emax_l5_exp_tmp[1]);
+
+        s1_d.emax          = emax_result_exp_tmp;
+        s1_d.emax_vld      = emax_result_vld_tmp;
     end
 
     integer idx2;
@@ -495,6 +645,7 @@ module fp8_dot_prod (
     always @(*) begin
         s2_d = '0;
         s2_aligned_prod_flat_tmp = '0;
+        prod_exp_s2_tmp = '0;
         s2_d.special_vld    = s1_q.special_vld;
         s2_d.special_result = s1_q.special_result;
 
