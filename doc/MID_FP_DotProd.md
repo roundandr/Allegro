@@ -115,8 +115,8 @@ RTL 只提供一个综合/集成入口：`mid_fp_dot_prod`。TF32、BF16、FP16 
 | Stage | RTL payload | 功能 |
 | --- | --- | --- |
 | S0 | `stage0_data_t` | 输入寄存；按 `mode_i` 解码 TF32/BF16/FP16 A/B；生成 lane valid mask；FP32 C 解码；NaN/Inf/`0*Inf` 特殊值检测 |
-| S1 | `stage1_data_t` | 16 路 11-bit significand 乘法；product sign/exponent/zero 生成 |
-| S2 | `stage2_data_t` | `emax` 搜索；product/C 转换到 F=25；对齐到 signed Q7.25 |
+| S1 | `stage1_data_t` | 16 路 11-bit significand 乘法；product sign/exponent/zero 生成；平衡比较树搜索并寄存 `emax` |
+| S2 | `stage2_data_t` | product/C 转换到 F=25；使用寄存后的 `emax` 对齐到 signed Q7.25 |
 | S3 | `stage3_data_t` | 16 products + C 的 33-bit signed Q7.25 累加；无效 lane 累加项为 0 |
 | S4 | `stage4_data_t` | 特殊值选择或 FP32 normalize + RZ pack |
 
@@ -587,7 +587,7 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 | special case handler | S0 `always_comb`，所有 A/B special 统计受 `lane_valid` gating |
 | shared product array | S1 `always_comb` loop，16 路 `11 × 11` |
 | product exponent adder | S1 `a_exp + b_exp`，16 路 signed 10-bit |
-| max exponent search | S2 `always_comb`，只搜索 valid nonzero product 和 nonzero C |
+| max exponent search | S1 `always_comb` 平衡比较树，只搜索 valid nonzero product 和 nonzero C，并随 `stage1_data_t` 寄存 |
 | align to F25 | `function automatic align_fixed_rz` |
 | fixed-point accumulate | S3 `always_comb` |
 | FP32 normalize RZ | `function automatic pack_fp32_rz` |

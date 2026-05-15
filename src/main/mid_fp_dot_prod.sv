@@ -102,6 +102,8 @@ module mid_fp_dot_prod (
         logic [FP32_SIG_W-1:0]            c_sig;
         logic signed [EXP_W-1:0]          c_exp;
         logic                             c_zero;
+        logic signed [EXP_W-1:0]          emax;
+        logic                             emax_vld;
     } stage1_data_t;
 
     typedef struct packed {
@@ -351,6 +353,34 @@ module mid_fp_dot_prod (
         end
     endfunction
 
+    function automatic logic emax_pick_vld(
+        input logic a_vld_i,
+        input logic b_vld_i
+    );
+        begin
+            emax_pick_vld = a_vld_i | b_vld_i;
+        end
+    endfunction
+
+    function automatic logic signed [EXP_W-1:0] emax_pick_exp(
+        input logic                    a_vld_i,
+        input logic signed [EXP_W-1:0] a_exp_i,
+        input logic                    b_vld_i,
+        input logic signed [EXP_W-1:0] b_exp_i
+    );
+        begin
+            if (!a_vld_i) begin
+                emax_pick_exp = b_exp_i;
+            end else if (!b_vld_i) begin
+                emax_pick_exp = a_exp_i;
+            end else if (b_exp_i > a_exp_i) begin
+                emax_pick_exp = b_exp_i;
+            end else begin
+                emax_pick_exp = a_exp_i;
+            end
+        end
+    endfunction
+
     function automatic logic [31:0] pack_fp32_rz(
         input logic signed [SUM_W-1:0] sum_i,
         input logic signed [EXP_W-1:0] base_exp_i
@@ -529,6 +559,16 @@ module mid_fp_dot_prod (
     logic [SIG_W-1:0]             a_sig_s1_tmp;
     logic [SIG_W-1:0]             b_sig_s1_tmp;
     logic [PROD_SIG_W-1:0]        prod_sig_s1_tmp;
+    logic                         emax_l0_vld_tmp [0:16];
+    logic signed [EXP_W-1:0]      emax_l0_exp_tmp [0:16];
+    logic                         emax_l1_vld_tmp [0:8];
+    logic signed [EXP_W-1:0]      emax_l1_exp_tmp [0:8];
+    logic                         emax_l2_vld_tmp [0:4];
+    logic signed [EXP_W-1:0]      emax_l2_exp_tmp [0:4];
+    logic                         emax_l3_vld_tmp [0:2];
+    logic signed [EXP_W-1:0]      emax_l3_exp_tmp [0:2];
+    logic                         emax_l4_vld_tmp [0:1];
+    logic signed [EXP_W-1:0]      emax_l4_exp_tmp [0:1];
     always_comb begin
         logic signed [EXP_W-1:0] a_exp_s1_tmp;
         logic signed [EXP_W-1:0] b_exp_s1_tmp;
@@ -559,14 +599,59 @@ module mid_fp_dot_prod (
             s1_prod_sig_flat_tmp[idx1*PROD_SIG_W +: PROD_SIG_W] = prod_sig_s1_tmp;
             s1_prod_exp_flat_tmp[idx1*EXP_W +: EXP_W] =
                 s0_prod_zero_flat_hold[idx1] ? '0 : prod_exp_s1_tmp;
+
+            emax_l0_vld_tmp[idx1] = !s0_prod_zero_flat_hold[idx1];
+            emax_l0_exp_tmp[idx1] = prod_exp_s1_tmp;
         end
+        emax_l0_vld_tmp[16] = !s0_q.c_zero;
+        emax_l0_exp_tmp[16] = s0_q.c_exp;
+
+        for (int idx1 = 0; idx1 < 8; idx1 = idx1 + 1) begin
+            emax_l1_vld_tmp[idx1] = emax_pick_vld(emax_l0_vld_tmp[idx1*2],
+                                                  emax_l0_vld_tmp[idx1*2+1]);
+            emax_l1_exp_tmp[idx1] = emax_pick_exp(emax_l0_vld_tmp[idx1*2],
+                                                  emax_l0_exp_tmp[idx1*2],
+                                                  emax_l0_vld_tmp[idx1*2+1],
+                                                  emax_l0_exp_tmp[idx1*2+1]);
+        end
+        emax_l1_vld_tmp[8] = emax_l0_vld_tmp[16];
+        emax_l1_exp_tmp[8] = emax_l0_exp_tmp[16];
+
+        for (int idx1 = 0; idx1 < 4; idx1 = idx1 + 1) begin
+            emax_l2_vld_tmp[idx1] = emax_pick_vld(emax_l1_vld_tmp[idx1*2],
+                                                  emax_l1_vld_tmp[idx1*2+1]);
+            emax_l2_exp_tmp[idx1] = emax_pick_exp(emax_l1_vld_tmp[idx1*2],
+                                                  emax_l1_exp_tmp[idx1*2],
+                                                  emax_l1_vld_tmp[idx1*2+1],
+                                                  emax_l1_exp_tmp[idx1*2+1]);
+        end
+        emax_l2_vld_tmp[4] = emax_l1_vld_tmp[8];
+        emax_l2_exp_tmp[4] = emax_l1_exp_tmp[8];
+
+        for (int idx1 = 0; idx1 < 2; idx1 = idx1 + 1) begin
+            emax_l3_vld_tmp[idx1] = emax_pick_vld(emax_l2_vld_tmp[idx1*2],
+                                                  emax_l2_vld_tmp[idx1*2+1]);
+            emax_l3_exp_tmp[idx1] = emax_pick_exp(emax_l2_vld_tmp[idx1*2],
+                                                  emax_l2_exp_tmp[idx1*2],
+                                                  emax_l2_vld_tmp[idx1*2+1],
+                                                  emax_l2_exp_tmp[idx1*2+1]);
+        end
+        emax_l3_vld_tmp[2] = emax_l2_vld_tmp[4];
+        emax_l3_exp_tmp[2] = emax_l2_exp_tmp[4];
+
+        emax_l4_vld_tmp[0] = emax_pick_vld(emax_l3_vld_tmp[0], emax_l3_vld_tmp[1]);
+        emax_l4_exp_tmp[0] = emax_pick_exp(emax_l3_vld_tmp[0], emax_l3_exp_tmp[0],
+                                           emax_l3_vld_tmp[1], emax_l3_exp_tmp[1]);
+        emax_l4_vld_tmp[1] = emax_l3_vld_tmp[2];
+        emax_l4_exp_tmp[1] = emax_l3_exp_tmp[2];
 
         s1_d.prod_sign_flat = s1_prod_sign_flat_tmp;
         s1_d.prod_sig_flat  = s1_prod_sig_flat_tmp;
         s1_d.prod_exp_flat  = s1_prod_exp_flat_tmp;
+        s1_d.emax_vld       = emax_pick_vld(emax_l4_vld_tmp[0], emax_l4_vld_tmp[1]);
+        s1_d.emax           = emax_pick_exp(emax_l4_vld_tmp[0], emax_l4_exp_tmp[0],
+                                           emax_l4_vld_tmp[1], emax_l4_exp_tmp[1]);
     end
-    logic signed [EXP_W-1:0] emax_tmp;
-    logic                    emax_vld_tmp;
     logic signed [EXP_W-1:0] prod_exp_s2_tmp;
     logic [PROD_SIG_W-1:0]   prod_sig_s2_tmp;
     logic [ALIGN_MAG_W-1:0]  prod_mag_s2_tmp;
@@ -574,8 +659,6 @@ module mid_fp_dot_prod (
     always_comb begin
         s2_d = '0;
         s2_aligned_prod_flat_tmp = '0;
-        emax_tmp        = '0;
-        emax_vld_tmp    = 1'b0;
         prod_exp_s2_tmp = '0;
         prod_sig_s2_tmp = '0;
         prod_mag_s2_tmp = '0;
@@ -584,23 +667,8 @@ module mid_fp_dot_prod (
         s2_d.special_vld    = s1_q.special_vld;
         s2_d.special_result = s1_q.special_result;
 
-        if (!s1_q.c_zero) begin
-            emax_tmp     = s1_q.c_exp;
-            emax_vld_tmp = 1'b1;
-        end
-
-        for (int idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
-            if (!s1_prod_zero_flat_hold[idx2]) begin
-                prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
-                if (!emax_vld_tmp || (prod_exp_s2_tmp > emax_tmp)) begin
-                    emax_tmp     = prod_exp_s2_tmp;
-                    emax_vld_tmp = 1'b1;
-                end
-            end
-        end
-
-        if (emax_vld_tmp) begin
-            s2_d.base_exp = emax_tmp - ALIGN_FRAC_BITS_EXP;
+        if (s1_q.emax_vld) begin
+            s2_d.base_exp = s1_q.emax - ALIGN_FRAC_BITS_EXP;
 
             for (int idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
                 if (!s1_prod_zero_flat_hold[idx2]) begin
@@ -613,7 +681,7 @@ module mid_fp_dot_prod (
                         align_fixed_rz(s1_prod_sign_flat_hold[idx2],
                                        prod_mag_s2_tmp,
                                        prod_exp_s2_tmp,
-                                       emax_tmp);
+                                       s1_q.emax);
                 end
             end
 
@@ -621,7 +689,7 @@ module mid_fp_dot_prod (
                 c_mag_s2_tmp = {{(ALIGN_MAG_W-FP32_SIG_W-C_ALIGN_PAD_W){1'b0}},
                                 s1_q.c_sig,
                                 {C_ALIGN_PAD_W{1'b0}}};
-                s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_mag_s2_tmp, s1_q.c_exp, emax_tmp);
+                s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_mag_s2_tmp, s1_q.c_exp, s1_q.emax);
             end
         end
 
