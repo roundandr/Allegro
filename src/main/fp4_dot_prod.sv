@@ -346,10 +346,9 @@ module fp4_dot_prod (
                 end
 
                 msb_idx = 0;
-                for (i = SUM_W-1; i >= 0; i = i - 1) begin
+                for (i = 0; i < SUM_W; i = i + 1) begin
                     if (abs_sum[i]) begin
                         msb_idx = i;
-                        i = -1;
                     end
                 end
 
