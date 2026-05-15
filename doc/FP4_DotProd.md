@@ -933,7 +933,7 @@ $$
 
 ### 微架构
 
-`gamma_exp_i` 和 `c_exp_i` 均使用 9-bit signed exponent，直接进行 signed compare。
+`gamma_exp_i` 和 `c_exp_i` 均使用 signed exponent。RTL 当前在 S1 使用小型平衡比较树完成搜索，并将 `emax` 随 `stage1_data_t` 寄存，避免 S2 同时承担 max 搜索和对齐移位。
 
 ---
 
@@ -1076,8 +1076,8 @@ RZ 舍入规则：
 | Stage | 名称 | 主要功能 | 关键输出 | 时序压力 |
 | ----: | --- | --- | --- | ---- |
 | S0 | Input Register & Decode & Special Check & FP4 Product | 输入寄存；FP4 decode/product；UE4M3 scale decode；FP32 C decode；scale/C 特殊值检查 | `prod[63:0]`, scale sig/exp, `c_sign/c_sig/c_exp`, special flags | 中 |
-| S1 | Group Sum & Gamma Form | 4 组 16-element product sum；scale significand product；scale exponent sum；生成窄 gamma/C magnitude | `gamma_mag/exp[3:0]`, `c_mag/exp` | 中 |
-| S2 | Emax Search & Alignment | 固定左移到 35 fractional domain；搜索最大 normalized exponent；5 路 significand 只按 RZ 右移对齐 | aligned gamma/c, `emax` | 中-高 |
+| S1 | Group Sum & Gamma Form | 4 组 16-element product sum；scale significand product；scale exponent sum；生成窄 gamma/C magnitude；搜索并寄存最大 normalized exponent | `gamma_mag/exp[3:0]`, `c_mag/exp`, `emax` | 中 |
+| S2 | Registered Emax Alignment | 固定左移到 35 fractional domain；使用 S1 寄存的 `emax` 对 5 路 significand 只按 RZ 右移对齐 | aligned gamma/c, `emax` | 中 |
 | S3 | Accumulate | 5-input fixed-point accumulation | `sum`, `base_exp` | 中 |
 | S4 | FP32 Normalize | zero/sign 处理；LOD；指数修正；RZ 截断；FP32 pack；special mux | `d_fp32_o` | 中-高 |
 
@@ -1256,15 +1256,15 @@ c_mag_s1 = c_sig_s0
 
 ---
 
-# S2：Emax Search & Alignment
+# S2：Registered Emax Alignment
 
 ## 功能
 
 S2 完成：
 
 ```text
-1. 5-input maximum exponent search
-2. 生成对齐 exponent 的 `emax`
+1. 接收 S1 寄存的 `emax`
+2. 固定左移到 35 fractional domain
 3. 相对 `emax` 只执行 RZ 右移对齐
 ```
 
@@ -1299,9 +1299,9 @@ c_mag_s1        : unsigned significand, width = 24
 c_exp_s1        : signed integer, width = 9
 ```
 
-## Emax search
+## Emax source
 
-S2 搜索 normalized exponent：
+S1 搜索并寄存 normalized exponent：
 
 $$
 e_{\max} = \max(c\_exp+23,\gamma\_exp_0+8,\gamma\_exp_1+8,\gamma\_exp_2+8,\gamma\_exp_3+8)
@@ -1428,8 +1428,8 @@ else:
 本单元为 5 级流水：
 
 * S0：输入寄存、特殊值检查、FP4 乘积、scale 解码、C 解码；
-* S1：group sum、scale significand product、scale exponent sum、gamma/C 的窄 significand form；
-* S2：raw magnitude 零扩展到 `ALIGN_MAG_W`、`emax` 搜索、RZ 对齐；
+* S1：group sum、scale significand product、scale exponent sum、gamma/C 的窄 significand form、`emax` 搜索；
+* S2：raw magnitude 零扩展到 `ALIGN_MAG_W`，使用 S1 寄存的 `emax` 做 RZ 对齐；
 * S3：5 路定点求和；
 * S4：FP32 规格化、特殊值 mux、输出寄存。
 

@@ -84,6 +84,7 @@ module fp4_dot_prod (
         logic                    c_sign;
         logic [C_SIG_W-1:0]      c_mag;
         logic signed [C_EXP_W-1:0] c_exp;
+        logic signed [C_EXP_W-1:0] emax;
     } stage1_data_t;
 
     typedef struct packed {
@@ -318,6 +319,34 @@ module fp4_dot_prod (
         end
     endfunction
 
+    function automatic logic emax_pick_vld(
+        input logic a_vld_i,
+        input logic b_vld_i
+    );
+        begin
+            emax_pick_vld = a_vld_i | b_vld_i;
+        end
+    endfunction
+
+    function automatic logic signed [C_EXP_W-1:0] emax_pick_exp(
+        input logic                      a_vld_i,
+        input logic signed [C_EXP_W-1:0] a_exp_i,
+        input logic                      b_vld_i,
+        input logic signed [C_EXP_W-1:0] b_exp_i
+    );
+        begin
+            if (!a_vld_i) begin
+                emax_pick_exp = b_exp_i;
+            end else if (!b_vld_i) begin
+                emax_pick_exp = a_exp_i;
+            end else if (b_exp_i > a_exp_i) begin
+                emax_pick_exp = b_exp_i;
+            end else begin
+                emax_pick_exp = a_exp_i;
+            end
+        end
+    endfunction
+
     function automatic logic [31:0] pack_fp32_rz(
         input logic signed [SUM_W-1:0] sum_i,
         input logic signed [C_EXP_W-1:0] base_exp_i
@@ -385,7 +414,6 @@ module fp4_dot_prod (
     integer idx0;
     integer g0;
     integer g1;
-    integer g2;
     integer g3;
     integer g4;
     integer k1;
@@ -462,9 +490,17 @@ module fp4_dot_prod (
     logic signed [SF_EXP_SUM_W-1:0] sf_exp_sum_tmp_s1;
     logic signed [GAMMA_SIG_W-1:0]  gamma_sig_tmp_s1;
     logic signed [C_EXP_W-1:0]      gamma_exp_tmp_s1;
+    logic signed [C_EXP_W-1:0]      gamma_norm_exp_s1_tmp;
+    logic signed [C_EXP_W-1:0]      c_norm_exp_s1_tmp;
     logic                           gamma_sign_tmp_s1;
     logic [GAMMA_SIG_W-1:0]         gamma_abs_tmp_s1;
     logic [GAMMA_SIG_W-1:0]         gamma_mag_tmp_s1;
+    logic                           emax_l0_vld_tmp [0:4];
+    logic signed [C_EXP_W-1:0]      emax_l0_exp_tmp [0:4];
+    logic                           emax_l1_vld_tmp [0:2];
+    logic signed [C_EXP_W-1:0]      emax_l1_exp_tmp [0:2];
+    logic                           emax_l2_vld_tmp [0:1];
+    logic signed [C_EXP_W-1:0]      emax_l2_exp_tmp [0:1];
 
     always_comb begin
         s1_d = '0;
@@ -483,6 +519,8 @@ module fp4_dot_prod (
         sf_exp_sum_tmp_s1   = '0;
         gamma_sig_tmp_s1    = '0;
         gamma_exp_tmp_s1    = '0;
+        gamma_norm_exp_s1_tmp = '0;
+        c_norm_exp_s1_tmp   = '0;
         gamma_sign_tmp_s1   = 1'b0;
         gamma_abs_tmp_s1    = '0;
         gamma_mag_tmp_s1    = '0;
@@ -511,6 +549,7 @@ module fp4_dot_prod (
 
             gamma_sig_tmp_s1 = sigma_tmp * $signed({1'b0, sf_sig_prod_tmp});
             gamma_exp_tmp_s1 = $signed(sf_exp_sum_tmp_s1) + FP4_DOT_EXP;
+            gamma_norm_exp_s1_tmp = gamma_exp_tmp_s1 + GAMMA_NORM_EXP;
             gamma_sign_tmp_s1 = gamma_sig_tmp_s1[GAMMA_SIG_W-1];
             if (gamma_sig_tmp_s1 == '0) begin
                 gamma_mag_tmp_s1 = '0;
@@ -526,20 +565,46 @@ module fp4_dot_prod (
             s1_gamma_sign_flat_tmp[g1] = gamma_sign_tmp_s1;
             s1_gamma_mag_flat_tmp[g1*GAMMA_SIG_W +: GAMMA_SIG_W] = gamma_mag_tmp_s1;
             s1_gamma_exp_flat_tmp[g1*C_EXP_W +: C_EXP_W] = gamma_exp_tmp_s1;
+            emax_l0_vld_tmp[g1] = 1'b1;
+            emax_l0_exp_tmp[g1] = gamma_norm_exp_s1_tmp;
         end
+
+        if (s0_q.c_sig == '0) begin
+            emax_l0_vld_tmp[4] = 1'b0;
+            emax_l0_exp_tmp[4] = '0;
+        end else begin
+            c_norm_exp_s1_tmp = s0_q.c_exp + C_NORM_EXP;
+            emax_l0_vld_tmp[4] = 1'b1;
+            emax_l0_exp_tmp[4] = c_norm_exp_s1_tmp;
+        end
+
+        for (g1 = 0; g1 < 2; g1 = g1 + 1) begin
+            emax_l1_vld_tmp[g1] = emax_pick_vld(emax_l0_vld_tmp[g1*2],
+                                                emax_l0_vld_tmp[g1*2+1]);
+            emax_l1_exp_tmp[g1] = emax_pick_exp(emax_l0_vld_tmp[g1*2],
+                                                emax_l0_exp_tmp[g1*2],
+                                                emax_l0_vld_tmp[g1*2+1],
+                                                emax_l0_exp_tmp[g1*2+1]);
+        end
+        emax_l1_vld_tmp[2] = emax_l0_vld_tmp[4];
+        emax_l1_exp_tmp[2] = emax_l0_exp_tmp[4];
+
+        emax_l2_vld_tmp[0] = emax_pick_vld(emax_l1_vld_tmp[0], emax_l1_vld_tmp[1]);
+        emax_l2_exp_tmp[0] = emax_pick_exp(emax_l1_vld_tmp[0], emax_l1_exp_tmp[0],
+                                           emax_l1_vld_tmp[1], emax_l1_exp_tmp[1]);
+        emax_l2_vld_tmp[1] = emax_l1_vld_tmp[2];
+        emax_l2_exp_tmp[1] = emax_l1_exp_tmp[2];
 
         s1_d.gamma_sign_flat = s1_gamma_sign_flat_tmp;
         s1_d.gamma_mag_flat  = s1_gamma_mag_flat_tmp;
         s1_d.gamma_exp_flat  = s1_gamma_exp_flat_tmp;
+        s1_d.emax = emax_pick_exp(emax_l2_vld_tmp[0], emax_l2_exp_tmp[0],
+                                  emax_l2_vld_tmp[1], emax_l2_exp_tmp[1]);
     end
 
     logic signed [C_EXP_W-1:0] gamma_exp_ext;
-    logic signed [C_EXP_W-1:0] gamma_norm_exp_tmp;
-    logic signed [C_EXP_W-1:0] c_norm_exp_tmp;
     logic [ALIGN_MAG_W-1:0]    gamma_align_mag_tmp;
     logic [ALIGN_MAG_W-1:0]    c_align_mag_tmp;
-    logic signed [C_EXP_W-1:0] emax_tmp;
-    logic                      emax_vld_tmp_s2;
 
     always_comb begin
         s2_d = '0;
@@ -547,29 +612,11 @@ module fp4_dot_prod (
         s2_d.special_valid  = s1_q.special_valid;
         s2_d.special_result = s1_q.special_result;
         gamma_exp_ext       = '0;
-        gamma_norm_exp_tmp  = '0;
-        c_norm_exp_tmp      = '0;
         gamma_align_mag_tmp = '0;
         c_align_mag_tmp     = '0;
 
-        // GDFS Step 5: search emax using normalized significand exponents,
-        // then align raw integer significands with 35 fractional bits.
-        emax_tmp = '0;
-        emax_vld_tmp_s2 = 1'b0;
-        if (s1_q.c_mag != '0) begin
-            c_norm_exp_tmp = s1_q.c_exp + C_NORM_EXP;
-            emax_tmp = c_norm_exp_tmp;
-            emax_vld_tmp_s2 = 1'b1;
-        end
-        for (g2 = 0; g2 < NUM_BLOCKS; g2 = g2 + 1) begin
-            gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g2*C_EXP_W +: C_EXP_W]);
-            gamma_norm_exp_tmp = gamma_exp_ext + GAMMA_NORM_EXP;
-            if (!emax_vld_tmp_s2 || (gamma_norm_exp_tmp > emax_tmp)) begin
-                emax_tmp = gamma_norm_exp_tmp;
-                emax_vld_tmp_s2 = 1'b1;
-            end
-        end
-        s2_d.emax = emax_tmp;
+        // GDFS Step 5 alignment uses the normalized emax registered in S1.
+        s2_d.emax = s1_q.emax;
 
         for (g3 = 0; g3 < NUM_BLOCKS; g3 = g3 + 1) begin
             gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g3*C_EXP_W +: C_EXP_W]);
@@ -580,12 +627,12 @@ module fp4_dot_prod (
                 align_fixed_rz(s1_gamma_sign_flat_hold[g3],
                                gamma_align_mag_tmp,
                                gamma_exp_ext + GAMMA_NORM_EXP,
-                               emax_tmp);
+                               s1_q.emax);
         end
         s2_d.gamma_aligned_flat = s2_gamma_aligned_flat_tmp;
 
         c_align_mag_tmp = {{C_ALIGN_PAD_W{1'b0}}, s1_q.c_mag, {C_ALIGN_LSHIFT_W{1'b0}}};
-        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_align_mag_tmp, s1_q.c_exp + C_NORM_EXP, emax_tmp);
+        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_align_mag_tmp, s1_q.c_exp + C_NORM_EXP, s1_q.emax);
     end
 
     logic signed [SUM_W-1:0] sum_acc;
