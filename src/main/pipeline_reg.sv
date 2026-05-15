@@ -25,10 +25,12 @@ module pipeline_reg #(
     
     // 寄存器
     always_ff @(posedge clk or negedge rst_n) begin
+        /* verilator coverage_off */
         if (!rst_n) begin
             out_valid <= 1'b0;
             out_data  <= '0;
         end else begin
+            /* verilator coverage_on */
             // 写入新数据
             if (fire_in) begin
                 out_valid <= 1'b1;
