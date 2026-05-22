@@ -3,7 +3,7 @@
 ## 1. 功能定义
 
 该单元实现 64 元素 E2M1/FP4 点积加 FP32 累加操作，并通过 `fp4_mode_i`
-选择 NVFP4、MXFP4 或不带 micro-scale 的纯 FP4 模式。
+选择 NVFP4、MXFP4 block32、MXFP4 block16 或不带 micro-scale 的纯 FP4 模式。
 
 通用形式如下：
 
@@ -18,7 +18,8 @@ $$
 
 * $a_i$、$b_i$ 为 E2M1 FP4 数据；
 * NVFP4 模式下每 16 个元素共用 1 个 UE4M3 scale；
-* MXFP4 模式下每 32 个元素共用 1 个 E8M0 scale；
+* MXFP4 block32 模式下每 32 个元素共用 1 个 E8M0 scale；
+* MXFP4 block16 模式下每 16 个元素共用 1 个 E8M0 scale；
 * FP4 模式下 scale 固定为 1，`a_sf_i` / `b_sf_i` 被忽略；
 * $c$ 为 FP32 输入累加值；
 * $d$ 为 FP32 输出结果。
@@ -80,9 +81,9 @@ out_fire = out_vld_o & out_rdy_i
 | `fp4_mode_i` | 模式 | scale 语义 |
 | --- | --- | --- |
 | `2'd0` | NVFP4 | `sf[8*g +: 8]` 对应 16-lane group `g=0..3`，格式 UE4M3 |
-| `2'd1` | MXFP4 | `sf[7:0]` 覆盖 lane 0..31，`sf[15:8]` 覆盖 lane 32..63，格式 E8M0，`sf[31:16]` 忽略 |
+| `2'd1` | MXFP4 block32 | `sf[7:0]` 覆盖 lane 0..31，`sf[15:8]` 覆盖 lane 32..63，格式 E8M0，`sf[31:16]` 忽略 |
 | `2'd2` | FP4 | scale 固定为 1，`a_sf_i` / `b_sf_i` 忽略 |
-| 其他 | NVFP4 | 预留编码按 NVFP4 处理 |
+| `2'd3` | MXFP4 block16 | `sf[8*g +: 8]` 对应 16-lane group `g=0..3`，格式 E8M0 |
 
 ---
 
@@ -116,8 +117,8 @@ $$
 
 ### 3.2 Scale 格式
 
-NVFP4 模式使用 UE4M3 scale。MXFP4 模式使用 E8M0 scale。FP4 模式不解码
-scale，内部注入 unit scale。
+NVFP4 模式使用 UE4M3 scale。MXFP4 block32/block16 模式使用 E8M0 scale。
+FP4 模式不解码 scale，内部注入 unit scale。
 
 #### 3.2.1 UE4M3 scale 格式
 
@@ -167,7 +168,7 @@ $$
 
 #### 3.2.2 E8M0 scale 格式
 
-MXFP4 模式下每个 scale factor 使用 8 bit E8M0 编码：
+MXFP4 block32/block16 模式下每个 scale factor 使用 8 bit E8M0 编码：
 
 ```text
 scale_raw == 8'hff : NaN

@@ -1,6 +1,6 @@
 // ============================================================================
 // File Name   : fp16_dot_prod.sv
-// Author      : Codex
+// Author      : LIU YUXUAN
 // Date        : 2026-04-26
 // Description : 16-element FP16/BF16 dot-product with FP32 accumulate. The
 //               datapath follows the F=25 FDA pipeline defined in
@@ -9,8 +9,8 @@
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-26  v0.1      Codex       Initial version
-//   2026-04-28  v0.2      Codex       Add BF16 input mode
+//   2026-04-26  v0.1      LIU YUXUAN       Initial version
+//   2026-04-28  v0.2      LIU YUXUAN       Add BF16 input mode
 // ============================================================================
 
 module fp16_dot_prod (

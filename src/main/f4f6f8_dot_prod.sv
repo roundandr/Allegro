@@ -1,18 +1,18 @@
 // ============================================================================
-// File Name   : f6f8_dot_prod.sv
-// Author      : Codex
+// File Name   : f4f6f8_dot_prod.sv
+// Author      : LIU YUXUAN
 // Date        : 2026-04-22
-// Description : 32-element FP8/FP6/MXFP8/MXFP6 dot-product with FP32
+// Description : 32-element FP4/FP6/FP8/MX low-precision dot-product with FP32
 //               accumulate. The datapath follows the 5-stage FDA pipeline
-//               defined in doc/F6F8_DotProd.md.
+//               defined in doc/F4F6F8_DotProd.md.
 //
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-22  v0.1      Codex       Initial version
+//   2026-04-22  v0.1      LIU YUXUAN       Initial version
 // ============================================================================
 
-module f6f8_dot_prod (
+module f4f6f8_dot_prod (
     input  logic         clk,
     input  logic         rst_n,
     input  logic         in_vld_i,
@@ -20,9 +20,8 @@ module f6f8_dot_prod (
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
-    input  logic         fp8_format_i,
-    input  logic         fp6_en_i,
-    input  logic         fp6_format_i,
+    input  logic [2:0]   a_type_i,
+    input  logic [2:0]   b_type_i,
     input  logic         mxfp8_en_i,
     input  logic [7:0]   a_mx_scale_i,
     input  logic [7:0]   b_mx_scale_i,
@@ -33,6 +32,7 @@ module f6f8_dot_prod (
 
     localparam int FP8_W            = 8;
     localparam int FP6_W            = 6;
+    localparam int FP4_W            = 4;
     localparam int NUM_ELEMS        = 32;
     localparam int FP8_SIG_W        = 4;
     localparam int PROD_SIG_W       = 8;
@@ -55,6 +55,11 @@ module f6f8_dot_prod (
 
     localparam logic FP6_FORMAT_E2M3 = 1'b0;
     localparam logic FP6_FORMAT_E3M2 = 1'b1;
+    localparam logic [2:0] F4F6F8_TYPE_E4M3 = 3'd0;
+    localparam logic [2:0] F4F6F8_TYPE_E5M2 = 3'd1;
+    localparam logic [2:0] F4F6F8_TYPE_E2M3 = 3'd2;
+    localparam logic [2:0] F4F6F8_TYPE_E3M2 = 3'd3;
+    localparam logic [2:0] F4F6F8_TYPE_E2M1 = 3'd4;
 
     typedef struct packed {
         logic                      sign;
@@ -189,9 +194,12 @@ module f6f8_dot_prod (
                 dec.is_inf  = 1'b0;
                 dec.is_nan  = (fp8_i[6:3] == 4'b1111) && (mant_raw == 3'b111);
 
-                if (dec.is_zero || dec.is_nan) begin
+                if (dec.is_nan) begin
                     dec.sig = '0;
                     dec.exp = '0;
+                end else if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = -10'sd126;
                 end else if (fp8_i[6:3] == 4'b0000) begin
                     dec.sig = {1'b0, mant_raw};
                     dec.exp = -10'sd6;
@@ -206,9 +214,12 @@ module f6f8_dot_prod (
                 dec.is_inf  = (fp8_i[6:2] == 5'b11111) && (fp8_i[1:0] == 2'b00);
                 dec.is_nan  = (fp8_i[6:2] == 5'b11111) && (fp8_i[1:0] != 2'b00);
 
-                if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                if (dec.is_inf || dec.is_nan) begin
                     dec.sig = '0;
                     dec.exp = '0;
+                end else if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = -10'sd126;
                 end else if (fp8_i[6:2] == 5'b00000) begin
                     dec.sig = {1'b0, fp8_i[1:0], 1'b0};
                     dec.exp = -10'sd14;
@@ -244,10 +255,15 @@ module f6f8_dot_prod (
                 dec.is_zero = (exp_e3m2 == 3'b000) && (frac_e3m2 == 2'b00);
                 if (dec.is_zero) begin
                     dec.sig = '0;
-                    dec.exp = '0;
+                    dec.exp = -10'sd126;
                 end else if (exp_e3m2 == 3'b000) begin
-                    dec.sig = {1'b0, frac_e3m2, 1'b0};
-                    dec.exp = 10'sd1 - FP6_E3M2_BIAS_EXP;
+                    if (frac_e3m2[1]) begin
+                        dec.sig = {1'b1, frac_e3m2[0], 2'b00};
+                        dec.exp = -10'sd3;
+                    end else begin
+                        dec.sig = 4'd8;
+                        dec.exp = -10'sd4;
+                    end
                 end else begin
                     dec.sig = {1'b1, frac_e3m2, 1'b0};
                     dec.exp = $signed({7'd0, exp_e3m2}) - FP6_E3M2_BIAS_EXP;
@@ -259,15 +275,75 @@ module f6f8_dot_prod (
                 dec.is_zero = (exp_e2m3 == 2'b00) && (frac_e2m3 == 3'b000);
                 if (dec.is_zero) begin
                     dec.sig = '0;
-                    dec.exp = '0;
+                    dec.exp = -10'sd126;
                 end else if (exp_e2m3 == 2'b00) begin
-                    dec.sig = {1'b0, frac_e2m3};
-                    dec.exp = 10'sd1 - FP6_E2M3_BIAS_EXP;
+                    if (frac_e2m3[2]) begin
+                        dec.sig = {1'b1, frac_e2m3[1:0], 1'b0};
+                        dec.exp = -10'sd1;
+                    end else if (frac_e2m3[1]) begin
+                        dec.sig = {1'b1, frac_e2m3[0], 2'b00};
+                        dec.exp = -10'sd2;
+                    end else begin
+                        dec.sig = 4'd8;
+                        dec.exp = -10'sd3;
+                    end
                 end else begin
                     dec.sig = {1'b1, frac_e2m3};
                     dec.exp = $signed({8'd0, exp_e2m3}) - FP6_E2M3_BIAS_EXP;
                 end
             end
+
+            return dec;
+        end
+    endfunction
+
+    function automatic fp8_dec_t decode_e2m1(
+        input logic [FP4_W-1:0] fp4_i
+    );
+        fp8_dec_t dec;
+        logic [2:0] mag_raw;
+        begin
+            dec        = '0;
+            dec.sign   = fp4_i[3];
+            dec.is_inf = 1'b0;
+            dec.is_nan = 1'b0;
+            mag_raw    = fp4_i[2:0];
+            dec.is_zero = (mag_raw == 3'd0);
+
+            case (mag_raw)
+                3'd0: begin
+                    dec.sig = 4'd0;
+                    dec.exp = -10'sd126;
+                end
+                3'd1: begin
+                    dec.sig = 4'd8;
+                    dec.exp = -10'sd1;
+                end
+                3'd2: begin
+                    dec.sig = 4'd8;
+                    dec.exp = 10'sd0;
+                end
+                3'd3: begin
+                    dec.sig = 4'd12;
+                    dec.exp = 10'sd0;
+                end
+                3'd4: begin
+                    dec.sig = 4'd8;
+                    dec.exp = 10'sd1;
+                end
+                3'd5: begin
+                    dec.sig = 4'd12;
+                    dec.exp = 10'sd1;
+                end
+                3'd6: begin
+                    dec.sig = 4'd8;
+                    dec.exp = 10'sd2;
+                end
+                default: begin
+                    dec.sig = 4'd12;
+                    dec.exp = 10'sd2;
+                end
+            endcase
 
             return dec;
         end
@@ -289,9 +365,12 @@ module f6f8_dot_prod (
             dec.is_inf  = (exp_raw == 8'hff) && (frac_raw == 23'h0);
             dec.is_nan  = (exp_raw == 8'hff) && (frac_raw != 23'h0);
 
-            if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+            if (dec.is_inf || dec.is_nan) begin
                 dec.sig = '0;
                 dec.exp = '0;
+            end else if (dec.is_zero) begin
+                dec.sig = '0;
+                dec.exp = -10'sd126;
             end else if (exp_raw == 8'h00) begin
                 dec.sig = {1'b0, frac_raw};
                 dec.exp = -10'sd126;
@@ -447,13 +526,41 @@ module f6f8_dot_prod (
         s0_d.c_mag = c_mag_tmp_s0;
 
         for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
-            if (fp6_en_i) begin
-                a_dec_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], fp6_format_i);
-                b_dec_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], fp6_format_i);
-            end else begin
-                a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
-                b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], fp8_format_i);
-            end
+            case (a_type_i)
+                F4F6F8_TYPE_E5M2: begin
+                    a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], 1'b1);
+                end
+                F4F6F8_TYPE_E2M3: begin
+                    a_dec_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E2M3);
+                end
+                F4F6F8_TYPE_E3M2: begin
+                    a_dec_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E3M2);
+                end
+                F4F6F8_TYPE_E2M1: begin
+                    a_dec_tmp = decode_e2m1(a_vec_i[idx0*FP4_W +: FP4_W]);
+                end
+                default: begin
+                    a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], 1'b0);
+                end
+            endcase
+
+            case (b_type_i)
+                F4F6F8_TYPE_E5M2: begin
+                    b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], 1'b1);
+                end
+                F4F6F8_TYPE_E2M3: begin
+                    b_dec_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E2M3);
+                end
+                F4F6F8_TYPE_E3M2: begin
+                    b_dec_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E3M2);
+                end
+                F4F6F8_TYPE_E2M1: begin
+                    b_dec_tmp = decode_e2m1(b_vec_i[idx0*FP4_W +: FP4_W]);
+                end
+                default: begin
+                    b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], 1'b0);
+                end
+            endcase
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
             lane_has_inf_tmp   = ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
@@ -486,12 +593,8 @@ module f6f8_dot_prod (
                                      {PROD_ALIGN_PAD_W{1'b0}}};
                 s0_prod_mag_flat_tmp[idx0*(ALIGN_TERM_W-1) +: (ALIGN_TERM_W-1)] = lane_prod_mag_tmp;
 
-                if (a_dec_tmp.is_zero || b_dec_tmp.is_zero) begin
-                    s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = '0;
-                end else begin
-                    s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] =
-                        a_dec_tmp.exp + b_dec_tmp.exp + mx_scale_exp_sum_tmp;
-                end
+                s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] =
+                    a_dec_tmp.exp + b_dec_tmp.exp + mx_scale_exp_sum_tmp;
             end
         end
 
@@ -576,10 +679,10 @@ module f6f8_dot_prod (
         s1_d.c_zero         = s0_q.c_zero;
 
         for (idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
-            emax_l0_vld_tmp[idx1] = !s0_prod_zero_q_flat[idx1];
+            emax_l0_vld_tmp[idx1] = 1'b1;
             emax_l0_exp_tmp[idx1] = $signed(s0_prod_exp_q_flat[idx1*EXP_W +: EXP_W]);
         end
-        emax_l0_vld_tmp[32] = !s0_q.c_zero;
+        emax_l0_vld_tmp[32] = 1'b1;
         emax_l0_exp_tmp[32] = s0_q.c_exp;
 
         for (idx1 = 0; idx1 < 16; idx1 = idx1 + 1) begin

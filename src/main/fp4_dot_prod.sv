@@ -1,16 +1,17 @@
 // ============================================================================
 // File Name   : fp4_dot_prod.sv
-// Author      : Codex
+// Author      : LIU YUXUAN
 // Date        : 2026-04-22
-// Description : 64-element FP4 dot-product with NVFP4, MXFP4, or unscaled FP4
-//               mode and FP32 accumulate. The datapath follows the 5-stage pipeline
-//               defined in doc/FP4_DotProd.md.
+// Description : 64-element FP4 dot-product with NVFP4, MXFP4 block32,
+//               MXFP4 block16, or unscaled FP4 mode and FP32 accumulate. The
+//               datapath follows the 5-stage pipeline defined in doc/FP4_DotProd.md.
 //
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-22  v0.1      Codex       Initial version
-//   2026-04-28  v0.2      Codex       Add MXFP4 and unscaled FP4 modes
+//   2026-04-22  v0.1      LIU YUXUAN       Initial version
+//   2026-04-28  v0.2      LIU YUXUAN       Add MXFP4 and unscaled FP4 modes
+//   2026-05-22  v0.3      LIU YUXUAN       Add MXFP4 block16 scale mode
 // ============================================================================
 
 module fp4_dot_prod (
@@ -33,9 +34,10 @@ module fp4_dot_prod (
     localparam int NUM_ELEMS      = 64;
     localparam int BLOCK_SIZE     = 16;
     localparam int NUM_BLOCKS     = 4;
-    localparam logic [1:0] FP4_MODE_NVFP4 = 2'd0;
-    localparam logic [1:0] FP4_MODE_MXFP4 = 2'd1;
-    localparam logic [1:0] FP4_MODE_FP4   = 2'd2;
+    localparam logic [1:0] FP4_MODE_NVFP4     = 2'd0;
+    localparam logic [1:0] FP4_MODE_MXFP4     = 2'd1;
+    localparam logic [1:0] FP4_MODE_FP4       = 2'd2;
+    localparam logic [1:0] FP4_MODE_MXFP4_4X  = 2'd3;
     localparam int SCALE_W        = 8;
     localparam int FP4_PROD_W     = 9;
     localparam int SIGMA_W        = 13;
@@ -441,6 +443,10 @@ module fp4_dot_prod (
                 FP4_MODE_MXFP4: begin
                     scale_dec_a = decode_e8m0_scale(a_sf_i[(g0 >> 1)*SCALE_W +: SCALE_W]);
                     scale_dec_b = decode_e8m0_scale(b_sf_i[(g0 >> 1)*SCALE_W +: SCALE_W]);
+                end
+                FP4_MODE_MXFP4_4X: begin
+                    scale_dec_a = decode_e8m0_scale(a_sf_i[g0*SCALE_W +: SCALE_W]);
+                    scale_dec_b = decode_e8m0_scale(b_sf_i[g0*SCALE_W +: SCALE_W]);
                 end
                 FP4_MODE_FP4: begin
                     scale_dec_a = make_unit_scale();

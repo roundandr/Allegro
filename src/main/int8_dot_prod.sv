@@ -1,6 +1,6 @@
 // ============================================================================
 // File Name   : int8_dot_prod.sv
-// Author      : Codex
+// Author      : LIU YUXUAN
 // Date        : 2026-04-27
 // Description : 32-element INT8 dot-product with INT32 accumulate. The datapath
 //               follows the 4-stage pipeline defined in doc/INT8_DotProd.md.
@@ -8,7 +8,7 @@
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-27  v0.1      Codex       Initial version
+//   2026-04-27  v0.1      LIU YUXUAN       Initial version
 // ============================================================================
 
 module int8_dot_prod (

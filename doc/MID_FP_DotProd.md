@@ -9,6 +9,7 @@ D = C + Σ(A[k] × B[k])
 ```
 
 其中 TF32 使用 K=8，BF16/FP16 使用 K=16。三种模式共用一套 16-lane、11-bit significand 乘法与 FP32 accumulate datapath。
+可选的 `scale_input_d_i` 在 C operand preprocess 中先执行 `C * 2^-scale_input_d_i`，用于承接 TCGen05 `.kind::tf32/.kind::f16` 的 `scale-input-d` 语义；普通 dot 调用将该端口接 0。
 
 | 项目 | 规格 |
 | --- | --- |
@@ -33,7 +34,7 @@ D = C + Σ(A[k] × B[k])
 1. 删除独立 TF32 dot8 core 与 FP16/BF16 dot16 core 之间重复的 mantissa multiplier、exponent add、align、accumulate、pack 硬件。
 2. 保持 TF32 单 request 只占 1 个 cycle 输入吞吐，不把 TF32 K8 拆成两拍或与 FP16 做 time-mux。
 3. 将 TF32/BF16/FP16 的输入 decode 差异限制在 S0，其后进入统一 11-bit significand + signed unbiased exponent datapath。
-4. 允许 `mode_i` 随 request 逐拍变化；是否禁止不同 dtype 短窗口交错由上层 `dot_cluster_top` 的 admission policy 决定。
+4. 允许 `a_mode_i` / `b_mode_i` 随 request 逐拍变化；是否禁止不同 dtype 短窗口交错由上层 `dot_cluster_top` 的 admission policy 决定。
 
 ## 2. 顶层接口
 
@@ -47,10 +48,12 @@ module mid_fp_dot_prod (
     input  logic         rst_n,
     input  logic         in_vld_i,
     output logic         in_rdy_o,
-    input  logic [1:0]   mode_i,
+    input  logic [1:0]   a_mode_i,
+    input  logic [1:0]   b_mode_i,
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
+    input  logic [3:0]   scale_input_d_i,
     output logic         out_vld_o,
     input  logic         out_rdy_i,
     output logic [31:0]  d_o
@@ -63,10 +66,12 @@ module mid_fp_dot_prod (
 | `rst_n` | 1 | input | 低有效异步复位 |
 | `in_vld_i` | 1 | input | 输入有效 |
 | `in_rdy_o` | 1 | output | 输入可接收 |
-| `mode_i` | 2 | input | 输入格式模式，编码见 2.2 |
+| `a_mode_i` | 2 | input | A 输入格式模式，编码见 2.2 |
+| `b_mode_i` | 2 | input | B 输入格式模式，编码见 2.2 |
 | `a_vec_i` | 256 | input | A packed 输入向量 |
 | `b_vec_i` | 256 | input | B packed 输入向量 |
 | `c_i` | 32 | input | FP32 累加输入 C |
+| `scale_input_d_i` | 4 | input | C operand 预缩放，`C_eff = C * 2^-scale_input_d_i`；普通 dot 接 0 |
 | `out_vld_o` | 1 | output | 输出有效 |
 | `out_rdy_i` | 1 | input | 下游可接收 |
 | `d_o` | 32 | output | FP32 输出 D |
@@ -93,7 +98,7 @@ localparam logic [1:0] MID_FP_MODE_BF16 = 2'd1;
 localparam logic [1:0] MID_FP_MODE_FP16 = 2'd2;
 ```
 
-| `mode_i` | 模式 | Dot width | A/B packed 布局 |
+| `a_mode_i` / `b_mode_i` | 模式 | Dot width | A/B packed 布局 |
 | --- | --- | ---: | --- |
 | `2'd0` | TF32 | 8 | `a_vec_i[k*32 +: 32]` / `b_vec_i[k*32 +: 32]`, `k=0..7` |
 | `2'd1` | BF16 | 16 | `a_vec_i[k*16 +: 16]` / `b_vec_i[k*16 +: 16]`, `k=0..15` |
@@ -104,7 +109,7 @@ TF32 模式下，`a_vec_i[255:0]` 正好承载 8 个 FP32 bit pattern。共享 d
 
 ### 2.3 集成边界
 
-RTL 只提供一个综合/集成入口：`mid_fp_dot_prod`。TF32、BF16、FP16 由同一套 shared datapath 执行，上层通过 `mode_i` 选择精度。
+RTL 只提供一个综合/集成入口：`mid_fp_dot_prod`。TF32、BF16、FP16 由同一套 shared datapath 执行，上层通过 `a_mode_i` / `b_mode_i` 分别选择 A/B 精度。
 
 不再提供按精度拆分的兼容 wrapper，避免上层误实例化多个 wrapper 后复制多份 mid-FP core。若某个旧单元测试需要数组形式输入，应在 testbench 内完成 pack，不应在 RTL 中增加 wrapper module。
 
@@ -114,7 +119,7 @@ RTL 只提供一个综合/集成入口：`mid_fp_dot_prod`。TF32、BF16、FP16 
 
 | Stage | RTL payload | 功能 |
 | --- | --- | --- |
-| S0 | `stage0_data_t` | 输入寄存；按 `mode_i` 解码 TF32/BF16/FP16 A/B；生成 lane valid mask；FP32 C 解码；NaN/Inf/`0*Inf` 特殊值检测 |
+| S0 | `stage0_data_t` | 输入寄存；按 `a_mode_i` / `b_mode_i` 解码 TF32/BF16/FP16 A/B；生成 lane valid mask；执行 C operand `scale-input-d` 预处理并解码 FP32 C；NaN/Inf/`0*Inf` 特殊值检测 |
 | S1 | `stage1_data_t` | 16 路 11-bit significand 乘法；product sign/exponent/zero 生成；平衡比较树搜索并寄存 `emax` |
 | S2 | `stage2_data_t` | product/C 转换到 F=25；使用寄存后的 `emax` 对齐到 signed Q7.25 |
 | S3 | `stage3_data_t` | 16 products + C 的 33-bit signed Q7.25 累加；无效 lane 累加项为 0 |
@@ -286,7 +291,7 @@ typedef struct packed {
 C 是 NaN
 任意 valid A[k] × B[k] 出现 0 × ∞ 或 ∞ × 0
 同时存在 +∞ 和 -∞
-mode_i 为 reserved 且实现选择防御性返回 NaN
+`a_mode_i` 或 `b_mode_i` 为 reserved 且实现选择防御性返回 NaN
 ```
 
 输出：
@@ -583,7 +588,7 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 | --- | --- |
 | TF32/BF16/FP16 decode | `function automatic mid_fp_dec_t decode_mid_fp` |
 | FP32 decode | `function automatic fp32_dec_t decode_fp32` |
-| lane valid mask | S0 根据 `mode_i` 和 lane index 生成 |
+| lane valid mask | S0 根据 `a_mode_i` / `b_mode_i` 和 lane index 生成 |
 | special case handler | S0 `always_comb`，所有 A/B special 统计受 `lane_valid` gating |
 | shared product array | S1 `always_comb` loop，16 路 `11 × 11` |
 | product exponent adder | S1 `a_exp + b_exp`，16 路 signed 10-bit |
@@ -609,7 +614,7 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 | 设计点 | RTL 对齐后的规格 |
 | --- | --- |
 | 主模块 | `mid_fp_dot_prod` |
-| 输入格式 | `mode_i=TF32/BF16/FP16` |
+| 输入格式 | `a_mode_i` / `b_mode_i` = TF32/BF16/FP16 |
 | valid-ready | 主模块支持 `in_vld_i/in_rdy_o/out_vld_o/out_rdy_i` |
 | TF32 packed 布局 | `a_vec_i[k*32 +: 32]` / `b_vec_i[k*32 +: 32]`，`k=0..7` |
 | BF16/FP16 packed 布局 | `a_vec_i[k*16 +: 16]` / `b_vec_i[k*16 +: 16]`，`k=0..15` |

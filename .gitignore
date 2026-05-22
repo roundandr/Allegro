@@ -1,0 +1,14 @@
+.DS_Store
+.vscode/
+__pycache__/
+*.py[cod]
+
+MMA-Sim/
+
+src/test/cocotb/results.xml
+src/test/cocotb/sim_build/
+src/test/cocotb/sim_build_*/
+src/test/cocotb/coverage*.dat
+src/test/cocotb/coverage_annotated*/
+src/test/cocotb/coverage_final*/
+

@@ -1,8 +1,8 @@
-# 32-Element F6/F8 Dot Product Unit Spec Based on FDA Algorithm
+# 32-Element F4/F6/F8 Dot Product Unit Spec Based on FDA Algorithm
 
 ## 1. 设计目标
 
-该单元用于实现 32 个 FP8 / FP6 / MXFP8 / MXFP6 元素的点积累加。普通 FP8 / FP6 模式：
+该单元用于实现 32 个 FP4 / FP6 / FP8 / MX 低精度元素的点积累加。普通 FP4 / FP6 / FP8 模式：
 
 $$
 D = C + \sum_{k=0}^{31} A_k \times B_k
@@ -11,7 +11,7 @@ $$
 其中：
 
 * 输入向量长度：32
-* 输入数据格式：FP8 或 FP6
+* 输入数据格式：FP4、FP6 或 FP8
 
   * 支持 E4M3 / E5M2，可通过参数选择
   * 支持 E2M3 / E3M2 FP6，低 192-bit payload 被前端 exact widening 后复用 F6/F8 core
@@ -837,7 +837,7 @@ $$
 
 # 7. 子模块划分
 
-## 7.1 `f6f8_decode_unit`
+## 7.1 `f4f6f8_decode_unit`
 
 ### 功能
 
@@ -869,7 +869,7 @@ $$
 
 ---
 
-## 7.2 `f6f8_product_unit`
+## 7.2 `f4f6f8_product_unit`
 
 ### 功能
 

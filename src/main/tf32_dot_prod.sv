@@ -1,6 +1,6 @@
 // ============================================================================
 // File Name   : tf32_dot_prod.sv
-// Author      : Codex
+// Author      : LIU YUXUAN
 // Date        : 2026-04-28
 // Description : 8-element TF32 dot-product with FP32 accumulate. The datapath
 //               follows the F=25 FDA pipeline defined in doc/TF32_DotProd.md.
@@ -8,7 +8,7 @@
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-28  v0.1      Codex       Initial version
+//   2026-04-28  v0.1      LIU YUXUAN       Initial version
 // ============================================================================
 
 module tf32_dot_prod (

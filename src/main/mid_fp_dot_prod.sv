@@ -1,6 +1,6 @@
 // ============================================================================
 // File Name   : mid_fp_dot_prod.sv
-// Author      : Codex
+// Author      : LIU YUXUAN
 // Date        : 2026-04-29
 // Description : Shared TF32/BF16/FP16 dot-product with FP32 accumulate. The
 //               datapath follows the F=25 FDA pipeline defined in
@@ -9,7 +9,8 @@
 // Revision History:
 //   Date        Version   Author      Description
 //   ----------  --------  ----------  ----------------------------------------
-//   2026-04-29  v0.1      Codex       Initial version
+//   2026-04-29  v0.1      LIU YUXUAN       Initial version
+//   2026-05-22  v0.2      LIU YUXUAN       Add scale-input-d C operand preprocess
 // ============================================================================
 
 module mid_fp_dot_prod (
@@ -17,10 +18,12 @@ module mid_fp_dot_prod (
     input  logic         rst_n,
     input  logic         in_vld_i,
     output logic         in_rdy_o,
-    input  logic [1:0]   mode_i,
+    input  logic [1:0]   a_mode_i,
+    input  logic [1:0]   b_mode_i,
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
+    input  logic [3:0]   scale_input_d_i,
     output logic         out_vld_o,
     input  logic         out_rdy_i,
     output logic [31:0]  d_o
@@ -85,6 +88,7 @@ module mid_fp_dot_prod (
         logic [NUM_ELEMS*EXP_W-1:0]      a_exp_flat;
         logic [NUM_ELEMS*EXP_W-1:0]      b_exp_flat;
         logic [NUM_ELEMS-1:0]            prod_zero_flat;
+        logic [NUM_ELEMS-1:0]            prod_emax_vld_flat;
         logic                            c_sign;
         logic [FP32_SIG_W-1:0]           c_sig;
         logic signed [EXP_W-1:0]         c_exp;
@@ -154,6 +158,7 @@ module mid_fp_dot_prod (
     logic [NUM_ELEMS*EXP_W-1:0]       s0_a_exp_flat_tmp;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_b_exp_flat_tmp;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_tmp;
+    logic [NUM_ELEMS-1:0]             s0_prod_emax_vld_flat_tmp;
 
     logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_hold;
     logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_hold;
@@ -161,6 +166,7 @@ module mid_fp_dot_prod (
     logic [NUM_ELEMS*EXP_W-1:0]       s0_a_exp_flat_hold;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_b_exp_flat_hold;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_hold;
+    logic [NUM_ELEMS-1:0]             s0_prod_emax_vld_flat_hold;
 
     logic [NUM_ELEMS-1:0]             s1_prod_sign_flat_tmp;
     logic [NUM_ELEMS*PROD_SIG_W-1:0]  s1_prod_sig_flat_tmp;
@@ -180,6 +186,7 @@ module mid_fp_dot_prod (
     assign s0_a_exp_flat_hold        = s0_q.a_exp_flat;
     assign s0_b_exp_flat_hold        = s0_q.b_exp_flat;
     assign s0_prod_zero_flat_hold    = s0_q.prod_zero_flat;
+    assign s0_prod_emax_vld_flat_hold = s0_q.prod_emax_vld_flat;
     assign s1_prod_sign_flat_hold    = s1_q.prod_sign_flat;
     assign s1_prod_sig_flat_hold     = s1_q.prod_sig_flat;
     assign s1_prod_exp_flat_hold     = s1_q.prod_exp_flat;
@@ -219,9 +226,12 @@ module mid_fp_dot_prod (
                 dec.is_inf  = (exp_raw == 8'hff) && (frac_raw == 23'h0);
                 dec.is_nan  = (exp_raw == 8'hff) && (frac_raw != 23'h0);
 
-                if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                if (dec.is_inf || dec.is_nan) begin
                     dec.sig = '0;
                     dec.exp = '0;
+                end else if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = -10'sd126;
                 end else if (exp_raw == 8'h00) begin
                     dec.sig = {1'b0, tf32_frac};
                     dec.exp = -10'sd126;
@@ -258,9 +268,12 @@ module mid_fp_dot_prod (
                 dec.is_inf  = (bf16_exp_raw == 8'hff) && (bf16_frac_raw == 7'h00);
                 dec.is_nan  = (bf16_exp_raw == 8'hff) && (bf16_frac_raw != 7'h00);
 
-                if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                if (dec.is_inf || dec.is_nan) begin
                     dec.sig = '0;
                     dec.exp = '0;
+                end else if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = -10'sd126;
                 end else if (bf16_exp_raw == 8'h00) begin
                     dec.sig = {1'b0, bf16_frac_raw, {BF16_SIG_PAD_W{1'b0}}};
                     dec.exp = -10'sd126;
@@ -273,9 +286,12 @@ module mid_fp_dot_prod (
                 dec.is_inf  = (exp_raw == 5'h1f) && (frac_raw == 10'h000);
                 dec.is_nan  = (exp_raw == 5'h1f) && (frac_raw != 10'h000);
 
-                if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+                if (dec.is_inf || dec.is_nan) begin
                     dec.sig = '0;
                     dec.exp = '0;
+                end else if (dec.is_zero) begin
+                    dec.sig = '0;
+                    dec.exp = -10'sd126;
                 end else if (exp_raw == 5'h00) begin
                     dec.sig = {1'b0, frac_raw};
                     dec.exp = -10'sd14;
@@ -303,9 +319,12 @@ module mid_fp_dot_prod (
             dec.is_inf  = (exp_raw == 8'hff) && (frac_raw == 23'h0);
             dec.is_nan  = (exp_raw == 8'hff) && (frac_raw != 23'h0);
 
-            if (dec.is_zero || dec.is_inf || dec.is_nan) begin
+            if (dec.is_inf || dec.is_nan) begin
                 dec.sig = '0;
                 dec.exp = '0;
+            end else if (dec.is_zero) begin
+                dec.sig = '0;
+                dec.exp = -10'sd126;
             end else if (exp_raw == 8'h00) begin
                 dec.sig = {1'b0, frac_raw};
                 dec.exp = -10'sd126;
@@ -315,6 +334,45 @@ module mid_fp_dot_prod (
             end
 
             return dec;
+        end
+    endfunction
+
+    function automatic logic [FP32_W-1:0] scale_fp32_pow2_rz(
+        input logic [FP32_W-1:0] value_i,
+        input logic [3:0]        shift_i
+    );
+        logic                    sign;
+        logic [FP32_EXP_W-1:0]   exp_raw;
+        logic [FP32_FRAC_W-1:0]  frac_raw;
+        logic [FP32_SIG_W-1:0]   sig24;
+        integer                  new_exp;
+        integer                  sub_shift;
+        logic [FP32_SIG_W-1:0]   sub_sig;
+        begin
+            sign      = value_i[31];
+            exp_raw   = value_i[30:23];
+            frac_raw  = value_i[22:0];
+            sig24     = {1'b1, frac_raw};
+            new_exp   = int'(exp_raw) - int'(shift_i);
+            sub_shift = 0;
+            sub_sig   = '0;
+            scale_fp32_pow2_rz = value_i;
+
+            if ((shift_i == 4'd0) || (exp_raw == 8'hff) || (value_i[30:0] == 31'd0)) begin
+                scale_fp32_pow2_rz = value_i;
+            end else if (exp_raw == 8'h00) begin
+                scale_fp32_pow2_rz = {sign, 8'h00, frac_raw >> shift_i};
+            end else if (new_exp > 0) begin
+                scale_fp32_pow2_rz = {sign, 8'(new_exp), frac_raw};
+            end else begin
+                sub_shift = int'(shift_i) + 1 - int'(exp_raw);
+                if (sub_shift >= FP32_SIG_W) begin
+                    sub_sig = '0;
+                end else begin
+                    sub_sig = sig24 >> sub_shift;
+                end
+                scale_fp32_pow2_rz = {sign, 8'h00, sub_sig[FP32_FRAC_W-1:0]};
+            end
         end
     endfunction
 
@@ -452,6 +510,7 @@ module mid_fp_dot_prod (
     mid_fp_dec_t a_dec_tmp;
     mid_fp_dec_t b_dec_tmp;
     fp32_dec_t c_dec_tmp;
+    logic [FP32_W-1:0] c_preprocessed_tmp;
     logic any_nan_tmp;
     logic has_pos_inf_tmp;
     logic has_neg_inf_tmp;
@@ -469,13 +528,21 @@ module mid_fp_dot_prod (
         s0_a_exp_flat_tmp     = '0;
         s0_b_exp_flat_tmp     = '0;
         s0_prod_zero_flat_tmp = '0;
+        s0_prod_emax_vld_flat_tmp = '0;
 
-        c_dec_tmp            = decode_fp32(c_i);
-        reserved_mode_tmp    = (mode_i == 2'd3);
+        c_preprocessed_tmp   = scale_fp32_pow2_rz(c_i, scale_input_d_i);
+        c_dec_tmp            = decode_fp32(c_preprocessed_tmp);
+        reserved_mode_tmp    = (a_mode_i == 2'd3) ||
+                                (b_mode_i == 2'd3) ||
+                                ((a_mode_i == MID_FP_MODE_TF32) !=
+                                 (b_mode_i == MID_FP_MODE_TF32));
         any_nan_tmp          = c_dec_tmp.is_nan || reserved_mode_tmp;
         has_pos_inf_tmp      = c_dec_tmp.is_inf && !c_dec_tmp.sign;
         has_neg_inf_tmp      = c_dec_tmp.is_inf && c_dec_tmp.sign;
         has_zero_mul_inf_tmp = 1'b0;
+        lane_has_inf_tmp     = 1'b0;
+        lane_valid_tmp       = 1'b0;
+        lane_prod_sign_tmp   = 1'b0;
 
         s0_d.c_sign = c_dec_tmp.sign;
         s0_d.c_sig  = c_dec_tmp.sig;
@@ -485,28 +552,22 @@ module mid_fp_dot_prod (
         for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
             a_dec_tmp = decode_disabled_lane();
             b_dec_tmp = decode_disabled_lane();
+            lane_valid_tmp = 1'b0;
 
-            case (mode_i)
-                MID_FP_MODE_TF32: begin
-                    lane_valid_tmp = (idx0 < TF32_NUM_ELEMS);
-                    if (lane_valid_tmp) begin
-                        a_dec_tmp = decode_tf32_from_fp32(1'b1, a_vec_i[idx0*FP32_W +: FP32_W]);
-                        b_dec_tmp = decode_tf32_from_fp32(1'b1, b_vec_i[idx0*FP32_W +: FP32_W]);
-                    end
+            if (!reserved_mode_tmp &&
+                (a_mode_i == MID_FP_MODE_TF32) &&
+                (b_mode_i == MID_FP_MODE_TF32)) begin
+                lane_valid_tmp = (idx0 < TF32_NUM_ELEMS);
+                if (lane_valid_tmp) begin
+                    a_dec_tmp = decode_tf32_from_fp32(1'b1, a_vec_i[idx0*FP32_W +: FP32_W]);
+                    b_dec_tmp = decode_tf32_from_fp32(1'b1, b_vec_i[idx0*FP32_W +: FP32_W]);
                 end
-                MID_FP_MODE_BF16: begin
-                    a_dec_tmp = decode_fp16_bf16(1'b1, a_vec_i[idx0*FP16_W +: FP16_W]);
-                    b_dec_tmp = decode_fp16_bf16(1'b1, b_vec_i[idx0*FP16_W +: FP16_W]);
-                end
-                MID_FP_MODE_FP16: begin
-                    a_dec_tmp = decode_fp16_bf16(1'b0, a_vec_i[idx0*FP16_W +: FP16_W]);
-                    b_dec_tmp = decode_fp16_bf16(1'b0, b_vec_i[idx0*FP16_W +: FP16_W]);
-                end
-                default: begin
-                    a_dec_tmp = decode_disabled_lane();
-                    b_dec_tmp = decode_disabled_lane();
-                end
-            endcase
+            end else if (!reserved_mode_tmp) begin
+                a_dec_tmp = decode_fp16_bf16(a_mode_i == MID_FP_MODE_BF16,
+                                             a_vec_i[idx0*FP16_W +: FP16_W]);
+                b_dec_tmp = decode_fp16_bf16(b_mode_i == MID_FP_MODE_BF16,
+                                             b_vec_i[idx0*FP16_W +: FP16_W]);
+            end
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
             lane_has_inf_tmp   = a_dec_tmp.valid && b_dec_tmp.valid &&
@@ -532,6 +593,9 @@ module mid_fp_dot_prod (
                                           a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
                                           a_dec_tmp.is_inf  || b_dec_tmp.is_inf  ||
                                           a_dec_tmp.is_nan  || b_dec_tmp.is_nan;
+            s0_prod_emax_vld_flat_tmp[idx0] = a_dec_tmp.valid && b_dec_tmp.valid &&
+                                               !a_dec_tmp.is_inf && !b_dec_tmp.is_inf &&
+                                               !a_dec_tmp.is_nan && !b_dec_tmp.is_nan;
         end
 
         s0_d.prod_sign_flat = s0_prod_sign_flat_tmp;
@@ -540,6 +604,7 @@ module mid_fp_dot_prod (
         s0_d.a_exp_flat     = s0_a_exp_flat_tmp;
         s0_d.b_exp_flat     = s0_b_exp_flat_tmp;
         s0_d.prod_zero_flat = s0_prod_zero_flat_tmp;
+        s0_d.prod_emax_vld_flat = s0_prod_emax_vld_flat_tmp;
 
         if (any_nan_tmp || has_zero_mul_inf_tmp || (has_pos_inf_tmp && has_neg_inf_tmp)) begin
             s0_d.special_vld    = 1'b1;
@@ -600,10 +665,10 @@ module mid_fp_dot_prod (
             s1_prod_exp_flat_tmp[idx1*EXP_W +: EXP_W] =
                 s0_prod_zero_flat_hold[idx1] ? '0 : prod_exp_s1_tmp;
 
-            emax_l0_vld_tmp[idx1] = !s0_prod_zero_flat_hold[idx1];
+            emax_l0_vld_tmp[idx1] = s0_prod_emax_vld_flat_hold[idx1];
             emax_l0_exp_tmp[idx1] = prod_exp_s1_tmp;
         end
-        emax_l0_vld_tmp[16] = !s0_q.c_zero;
+        emax_l0_vld_tmp[16] = 1'b1;
         emax_l0_exp_tmp[16] = s0_q.c_exp;
 
         for (int idx1 = 0; idx1 < 8; idx1 = idx1 + 1) begin
