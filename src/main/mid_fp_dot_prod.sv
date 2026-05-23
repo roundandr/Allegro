@@ -55,8 +55,14 @@ module mid_fp_dot_prod (
     localparam int ALIGN_MAG_W          = ALIGN_INT_BITS + ALIGN_FRAC_BITS;
     localparam int ALIGN_TERM_W         = ALIGN_MAG_W + 1;
     localparam int SUM_W                = ALIGN_TERM_W;
+    localparam int PACK_FRAC_W          = 23;
+    localparam int PACK_LOD_GRP_W       = 7;
+    localparam int PACK_LOD_GRP_N       = (SUM_W + PACK_LOD_GRP_W - 1) / PACK_LOD_GRP_W;
     localparam int PROD_ALIGN_PAD_W     = ALIGN_FRAC_BITS - PROD_SIG_FRAC_BITS;
     localparam int C_ALIGN_PAD_W        = ALIGN_FRAC_BITS - FP32_FRAC_W;
+    localparam int FP32_EXP_MAX         = 127;
+    localparam int FP32_EXP_MIN_NORMAL  = -126;
+    localparam int FP32_EXP_MIN_SUB     = -149;
     localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = 10'sd25;
     localparam logic signed [EXP_W:0]   ALIGN_MAG_W_EXP     = 11'sd32;
 
@@ -121,7 +127,9 @@ module mid_fp_dot_prod (
     typedef struct packed {
         logic                         special_vld;
         logic [31:0]                  special_result;
-        logic signed [SUM_W-1:0]      sum;
+        logic                         sum_nonzero;
+        logic                         sum_sign;
+        logic [SUM_W-1:0]             sum_abs;
         logic signed [EXP_W-1:0]      base_exp;
     } stage3_data_t;
 
@@ -432,66 +440,112 @@ module mid_fp_dot_prod (
         end
     endfunction
 
+    function automatic integer pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
+        integer grp_idx;
+        integer bit_idx;
+        integer sum_idx;
+        integer grp_msb_idx;
+        logic   grp_vld;
+        begin
+            pack_msb_idx = 0;
+
+            for (grp_idx = 0; grp_idx < PACK_LOD_GRP_N; grp_idx = grp_idx + 1) begin
+                grp_vld     = 1'b0;
+                grp_msb_idx = 0;
+
+                for (bit_idx = 0; bit_idx < PACK_LOD_GRP_W; bit_idx = bit_idx + 1) begin
+                    sum_idx = grp_idx * PACK_LOD_GRP_W + bit_idx;
+                    if (sum_idx < SUM_W) begin
+                        if (abs_sum_i[sum_idx]) begin
+                            grp_vld     = 1'b1;
+                            grp_msb_idx = bit_idx;
+                        end
+                    end
+                end
+
+                if (grp_vld) begin
+                    pack_msb_idx = grp_idx * PACK_LOD_GRP_W + grp_msb_idx;
+                end
+            end
+        end
+    endfunction
+
+    function automatic logic [PACK_FRAC_W-1:0] pack_normal_frac_from_abs(
+        input logic [SUM_W-1:0] abs_sum_i,
+        input integer           msb_idx_i
+    );
+        integer frac_idx;
+        integer sum_idx;
+        begin
+            pack_normal_frac_from_abs = '0;
+
+            for (frac_idx = 0; frac_idx < PACK_FRAC_W; frac_idx = frac_idx + 1) begin
+                sum_idx = msb_idx_i - (PACK_FRAC_W - frac_idx);
+                if ((sum_idx >= 0) && (sum_idx < SUM_W)) begin
+                    pack_normal_frac_from_abs[frac_idx] = abs_sum_i[sum_idx];
+                end
+            end
+        end
+    endfunction
+
+    function automatic logic [PACK_FRAC_W-1:0] pack_subnormal_frac_from_abs(
+        input logic [SUM_W-1:0] abs_sum_i,
+        input integer           base_exp_int_i
+    );
+        integer frac_idx;
+        integer sum_idx;
+        begin
+            pack_subnormal_frac_from_abs = '0;
+
+            for (frac_idx = 0; frac_idx < PACK_FRAC_W; frac_idx = frac_idx + 1) begin
+                sum_idx = frac_idx + FP32_EXP_MIN_SUB - base_exp_int_i;
+                if ((sum_idx >= 0) && (sum_idx < SUM_W)) begin
+                    pack_subnormal_frac_from_abs[frac_idx] = abs_sum_i[sum_idx];
+                end
+            end
+        end
+    endfunction
+
     function automatic logic [31:0] pack_fp32_rz(
-        input logic signed [SUM_W-1:0] sum_i,
+        input logic                    sum_nonzero_i,
+        input logic                    sign_i,
+        input logic [SUM_W-1:0]        abs_sum_i,
         input logic signed [EXP_W-1:0] base_exp_i
     );
         logic             sign_bit;
         logic [SUM_W-1:0] abs_sum;
-        logic [SUM_W-1:0] norm_sum;
-        logic [23:0]      sig24;
         logic [22:0]      frac_field;
         logic [7:0]       exp_field;
         integer           msb_idx;
-        integer           norm_lshift;
         integer           unbiased_exp;
-        integer           shift_sub;
-        integer           idx;
+        integer           base_exp_int;
         begin
             pack_fp32_rz = 32'h0000_0000;
-            sign_bit     = sum_i[SUM_W-1];
-            abs_sum      = '0;
-            norm_sum     = '0;
-            sig24        = '0;
+            sign_bit     = sign_i;
+            abs_sum      = abs_sum_i;
             frac_field   = '0;
             exp_field    = '0;
             msb_idx      = 0;
-            norm_lshift  = 0;
             unbiased_exp = 0;
-            shift_sub    = 0;
+            base_exp_int = 0;
 
-            if (sum_i != '0) begin
-                if (sign_bit) begin
-                    abs_sum = -sum_i;
-                end else begin
-                    abs_sum = sum_i;
-                end
+            if (sum_nonzero_i) begin
+                base_exp_int = $signed({{(32-EXP_W){base_exp_i[EXP_W-1]}}, base_exp_i});
+                msb_idx      = pack_msb_idx(abs_sum);
+                unbiased_exp = base_exp_int + msb_idx;
 
-                for (idx = 0; idx < SUM_W; idx = idx + 1) begin
-                    if (abs_sum[idx]) begin
-                        msb_idx = idx;
-                    end
-                end
-
-                unbiased_exp = $signed({{(32-EXP_W){base_exp_i[EXP_W-1]}}, base_exp_i}) + msb_idx;
-                norm_lshift  = (SUM_W - 1) - msb_idx;
-                norm_sum     = abs_sum << norm_lshift;
-                sig24        = norm_sum[SUM_W-1 -: 24];
-
-                if (unbiased_exp > 127) begin
+                if (unbiased_exp > FP32_EXP_MAX) begin
                     exp_field  = 8'hff;
                     frac_field = 23'h0;
-                end else if (unbiased_exp >= -126) begin
+                end else if (unbiased_exp >= FP32_EXP_MIN_NORMAL) begin
                     exp_field  = 8'(unbiased_exp + 127);
-                    frac_field = sig24[22:0];
-                end else if (unbiased_exp < -149) begin
+                    frac_field = pack_normal_frac_from_abs(abs_sum, msb_idx);
+                end else if (unbiased_exp < FP32_EXP_MIN_SUB) begin
                     exp_field  = 8'h00;
                     frac_field = 23'h0;
                 end else begin
-                    shift_sub  = -126 - unbiased_exp;
-                    sig24      = sig24 >> shift_sub;
                     exp_field  = 8'h00;
-                    frac_field = sig24[22:0];
+                    frac_field = pack_subnormal_frac_from_abs(abs_sum, base_exp_int);
                 end
 
                 pack_fp32_rz = {sign_bit, exp_field, frac_field};
@@ -774,13 +828,20 @@ module mid_fp_dot_prod (
             sum_acc_tmp = sum_acc_tmp
                         + $signed(s2_aligned_prod_flat_hold[idx3*ALIGN_TERM_W +: ALIGN_TERM_W]);
         end
-        s3_d.sum = sum_acc_tmp;
+        s3_d.sum_nonzero = (sum_acc_tmp != '0);
+        s3_d.sum_sign    = sum_acc_tmp[SUM_W-1];
+        if (sum_acc_tmp[SUM_W-1]) begin
+            s3_d.sum_abs = -sum_acc_tmp;
+        end else begin
+            s3_d.sum_abs = sum_acc_tmp;
+        end
     end
 
     always_comb begin
         s4_d = '0;
         s4_d.result = s3_q.special_vld ? s3_q.special_result
-                                       : pack_fp32_rz(s3_q.sum, s3_q.base_exp);
+                                       : pack_fp32_rz(s3_q.sum_nonzero, s3_q.sum_sign,
+                                                      s3_q.sum_abs, s3_q.base_exp);
     end
 
     pipeline_reg #(
