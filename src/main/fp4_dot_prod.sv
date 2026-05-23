@@ -74,11 +74,9 @@ module fp4_dot_prod (
     typedef struct packed {
         logic                    special_valid;
         logic [31:0]             special_result;
-        logic [NUM_ELEMS*FP4_PROD_W-1:0] prod_flat;
-        logic [NUM_BLOCKS*SF_SIG_W-1:0]  a_sf_sig_flat;
-        logic [NUM_BLOCKS*SF_SIG_W-1:0]  b_sf_sig_flat;
-        logic [NUM_BLOCKS*SF_EXP_W-1:0]  a_sf_exp_flat;
-        logic [NUM_BLOCKS*SF_EXP_W-1:0]  b_sf_exp_flat;
+        logic [NUM_BLOCKS*SIGMA_W-1:0]   sigma_flat;
+        logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] sf_sig_prod_flat;
+        logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  sf_exp_sum_flat;
         logic                    c_sign;
         logic [C_SIG_W-1:0]      c_sig;
         logic signed [C_EXP_W-1:0] c_exp;
@@ -140,17 +138,13 @@ module fp4_dot_prod (
     logic s3_rdy;
     logic s4_rdy;
 
-    logic [NUM_ELEMS*FP4_PROD_W-1:0] s0_prod_flat_tmp;
-    logic [NUM_BLOCKS*SF_SIG_W-1:0]  s0_a_sf_sig_flat_tmp;
-    logic [NUM_BLOCKS*SF_SIG_W-1:0]  s0_b_sf_sig_flat_tmp;
-    logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_a_sf_exp_flat_tmp;
-    logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_b_sf_exp_flat_tmp;
+    logic [NUM_BLOCKS*SIGMA_W-1:0]   s0_sigma_flat_tmp;
+    logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] s0_sf_sig_prod_flat_tmp;
+    logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  s0_sf_exp_sum_flat_tmp;
 
-    logic [NUM_ELEMS*FP4_PROD_W-1:0] s0_prod_flat_hold;
-    logic [NUM_BLOCKS*SF_SIG_W-1:0]  s0_a_sf_sig_flat_hold;
-    logic [NUM_BLOCKS*SF_SIG_W-1:0]  s0_b_sf_sig_flat_hold;
-    logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_a_sf_exp_flat_hold;
-    logic [NUM_BLOCKS*SF_EXP_W-1:0]  s0_b_sf_exp_flat_hold;
+    logic [NUM_BLOCKS*SIGMA_W-1:0]   s0_sigma_flat_hold;
+    logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] s0_sf_sig_prod_flat_hold;
+    logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  s0_sf_exp_sum_flat_hold;
 
     logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_tmp;
     logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  s1_gamma_mag_flat_tmp;
@@ -163,11 +157,9 @@ module fp4_dot_prod (
     logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_tmp;
     logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_hold;
 
-    assign s0_prod_flat_hold     = s0_q.prod_flat;
-    assign s0_a_sf_sig_flat_hold = s0_q.a_sf_sig_flat;
-    assign s0_b_sf_sig_flat_hold = s0_q.b_sf_sig_flat;
-    assign s0_a_sf_exp_flat_hold = s0_q.a_sf_exp_flat;
-    assign s0_b_sf_exp_flat_hold = s0_q.b_sf_exp_flat;
+    assign s0_sigma_flat_hold    = s0_q.sigma_flat;
+    assign s0_sf_sig_prod_flat_hold = s0_q.sf_sig_prod_flat;
+    assign s0_sf_exp_sum_flat_hold  = s0_q.sf_exp_sum_flat;
     assign s1_gamma_sign_flat_hold = s1_q.gamma_sign_flat;
     assign s1_gamma_mag_flat_hold  = s1_q.gamma_mag_flat;
     assign s1_gamma_exp_flat_hold  = s1_q.gamma_exp_flat;
@@ -204,6 +196,39 @@ module fp4_dot_prod (
             prod_sign = a_i[3] ^ b_i[3];
             prod_signed = $signed({1'b0, prod_mag});
             fp4_product = prod_sign ? -prod_signed : prod_signed;
+        end
+    endfunction
+
+    function automatic logic signed [SIGMA_W-1:0] fp4_block_sigma(
+        input logic [BLOCK_SIZE*FP4_W-1:0] a_blk_i,
+        input logic [BLOCK_SIZE*FP4_W-1:0] b_blk_i
+    );
+        logic signed [FP4_PROD_W-1:0] prod_tmp;
+        logic signed [SIGMA_W-1:0]    sigma_l0 [0:15];
+        logic signed [SIGMA_W-1:0]    sigma_l1 [0:7];
+        logic signed [SIGMA_W-1:0]    sigma_l2 [0:3];
+        logic signed [SIGMA_W-1:0]    sigma_l3 [0:1];
+        integer idx;
+        begin
+            prod_tmp = '0;
+            for (idx = 0; idx < BLOCK_SIZE; idx = idx + 1) begin
+                prod_tmp = fp4_product(a_blk_i[idx*FP4_W +: FP4_W],
+                                       b_blk_i[idx*FP4_W +: FP4_W]);
+                sigma_l0[idx] = $signed({{(SIGMA_W-FP4_PROD_W){prod_tmp[FP4_PROD_W-1]}},
+                                         prod_tmp});
+            end
+
+            for (idx = 0; idx < 8; idx = idx + 1) begin
+                sigma_l1[idx] = sigma_l0[idx*2] + sigma_l0[idx*2+1];
+            end
+            for (idx = 0; idx < 4; idx = idx + 1) begin
+                sigma_l2[idx] = sigma_l1[idx*2] + sigma_l1[idx*2+1];
+            end
+            for (idx = 0; idx < 2; idx = idx + 1) begin
+                sigma_l3[idx] = sigma_l2[idx*2] + sigma_l2[idx*2+1];
+            end
+
+            fp4_block_sigma = sigma_l3[0] + sigma_l3[1];
         end
     endfunction
 
@@ -474,32 +499,35 @@ module fp4_dot_prod (
         end
     endfunction
 
-    integer idx0;
     integer g0;
     integer g1;
     integer g3;
     integer g4;
-    integer k1;
     logic [SF_EXP_W+4:0] scale_dec_a;
     logic [SF_EXP_W+4:0] scale_dec_b;
+    logic [SF_SIG_W-1:0] scale_sig_a_tmp;
+    logic [SF_SIG_W-1:0] scale_sig_b_tmp;
+    logic signed [SF_EXP_W-1:0] scale_exp_a_tmp;
+    logic signed [SF_EXP_W-1:0] scale_exp_b_tmp;
     logic [37:0]         c_dec;
     logic        any_scale_nan;
 
     always_comb begin
         s0_d = '0;
         any_scale_nan = 1'b0;
-        s0_prod_flat_tmp     = '0;
-        s0_a_sf_sig_flat_tmp = '0;
-        s0_b_sf_sig_flat_tmp = '0;
-        s0_a_sf_exp_flat_tmp = '0;
-        s0_b_sf_exp_flat_tmp = '0;
-
-        for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
-            s0_prod_flat_tmp[idx0*FP4_PROD_W +: FP4_PROD_W] =
-                fp4_product(a_fp4_i[idx0*FP4_W +: FP4_W], b_fp4_i[idx0*FP4_W +: FP4_W]);
-        end
+        s0_sigma_flat_tmp    = '0;
+        s0_sf_sig_prod_flat_tmp = '0;
+        s0_sf_exp_sum_flat_tmp  = '0;
+        scale_sig_a_tmp = '0;
+        scale_sig_b_tmp = '0;
+        scale_exp_a_tmp = '0;
+        scale_exp_b_tmp = '0;
 
         for (g0 = 0; g0 < NUM_BLOCKS; g0 = g0 + 1) begin
+            s0_sigma_flat_tmp[g0*SIGMA_W +: SIGMA_W] =
+                fp4_block_sigma(a_fp4_i[g0*BLOCK_SIZE*FP4_W +: BLOCK_SIZE*FP4_W],
+                                b_fp4_i[g0*BLOCK_SIZE*FP4_W +: BLOCK_SIZE*FP4_W]);
+
             case (fp4_mode_i)
                 FP4_MODE_MXFP4: begin
                     scale_dec_a = decode_e8m0_scale(a_sf_i[(g0 >> 1)*SCALE_W +: SCALE_W]);
@@ -518,18 +546,20 @@ module fp4_dot_prod (
                     scale_dec_b = decode_ue4m3_scale(b_sf_i[g0*SCALE_W +: SCALE_W]);
                 end
             endcase
-            s0_a_sf_sig_flat_tmp[g0*SF_SIG_W +: SF_SIG_W] = scale_dec_a[SF_EXP_W+3:SF_EXP_W];
-            s0_b_sf_sig_flat_tmp[g0*SF_SIG_W +: SF_SIG_W] = scale_dec_b[SF_EXP_W+3:SF_EXP_W];
-            s0_a_sf_exp_flat_tmp[g0*SF_EXP_W +: SF_EXP_W] = scale_dec_a[SF_EXP_W-1:0];
-            s0_b_sf_exp_flat_tmp[g0*SF_EXP_W +: SF_EXP_W] = scale_dec_b[SF_EXP_W-1:0];
+            scale_sig_a_tmp = scale_dec_a[SF_EXP_W+3:SF_EXP_W];
+            scale_sig_b_tmp = scale_dec_b[SF_EXP_W+3:SF_EXP_W];
+            scale_exp_a_tmp = $signed(scale_dec_a[SF_EXP_W-1:0]);
+            scale_exp_b_tmp = $signed(scale_dec_b[SF_EXP_W-1:0]);
+            s0_sf_sig_prod_flat_tmp[g0*SF_SIG_PROD_W +: SF_SIG_PROD_W] =
+                scale_sig_a_tmp * scale_sig_b_tmp;
+            s0_sf_exp_sum_flat_tmp[g0*SF_EXP_SUM_W +: SF_EXP_SUM_W] =
+                scale_exp_a_tmp + scale_exp_b_tmp;
             any_scale_nan = any_scale_nan | scale_dec_a[SF_EXP_W+4] | scale_dec_b[SF_EXP_W+4];
         end
 
-        s0_d.prod_flat     = s0_prod_flat_tmp;
-        s0_d.a_sf_sig_flat = s0_a_sf_sig_flat_tmp;
-        s0_d.b_sf_sig_flat = s0_b_sf_sig_flat_tmp;
-        s0_d.a_sf_exp_flat = s0_a_sf_exp_flat_tmp;
-        s0_d.b_sf_exp_flat = s0_b_sf_exp_flat_tmp;
+        s0_d.sigma_flat       = s0_sigma_flat_tmp;
+        s0_d.sf_sig_prod_flat = s0_sf_sig_prod_flat_tmp;
+        s0_d.sf_exp_sum_flat  = s0_sf_exp_sum_flat_tmp;
 
         c_dec         = decode_c(c_fp32_i);
         s0_d.c_sign   = c_dec[37];
@@ -549,10 +579,6 @@ module fp4_dot_prod (
     end
 
     logic signed [SIGMA_W-1:0]      sigma_tmp;
-    logic signed [15:0]             sigma_acc;
-    logic signed [SF_EXP_W-1:0]     a_sf_exp_tmp;
-    logic signed [SF_EXP_W-1:0]     b_sf_exp_tmp;
-    logic signed [FP4_PROD_W-1:0]   prod_s0_tmp;
     logic [SF_SIG_PROD_W-1:0]       sf_sig_prod_tmp;
     logic signed [SF_EXP_SUM_W-1:0] sf_exp_sum_tmp_s1;
     logic signed [GAMMA_SIG_W-1:0]  gamma_sig_tmp_s1;
@@ -578,10 +604,6 @@ module fp4_dot_prod (
         s1_d.special_result = s0_q.special_result;
         s1_d.c_sign         = s0_q.c_sign;
         sigma_tmp           = '0;
-        sigma_acc           = '0;
-        a_sf_exp_tmp        = '0;
-        b_sf_exp_tmp        = '0;
-        prod_s0_tmp         = '0;
         sf_sig_prod_tmp     = '0;
         sf_exp_sum_tmp_s1   = '0;
         gamma_sig_tmp_s1    = '0;
@@ -600,19 +622,10 @@ module fp4_dot_prod (
         end
 
         for (g1 = 0; g1 < NUM_BLOCKS; g1 = g1 + 1) begin
-            sigma_acc = '0;
-            for (k1 = 0; k1 < BLOCK_SIZE; k1 = k1 + 1) begin
-                prod_s0_tmp = $signed(s0_prod_flat_hold[(g1*BLOCK_SIZE+k1)*FP4_PROD_W +: FP4_PROD_W]);
-                sigma_acc = sigma_acc
-                          + $signed({{(16-FP4_PROD_W){prod_s0_tmp[FP4_PROD_W-1]}}, prod_s0_tmp});
-            end
-            sigma_tmp = sigma_acc[SIGMA_W-1:0];
-            sf_sig_prod_tmp =
-                s0_a_sf_sig_flat_hold[g1*SF_SIG_W +: SF_SIG_W]
-              * s0_b_sf_sig_flat_hold[g1*SF_SIG_W +: SF_SIG_W];
-            a_sf_exp_tmp = $signed(s0_a_sf_exp_flat_hold[g1*SF_EXP_W +: SF_EXP_W]);
-            b_sf_exp_tmp = $signed(s0_b_sf_exp_flat_hold[g1*SF_EXP_W +: SF_EXP_W]);
-            sf_exp_sum_tmp_s1 = a_sf_exp_tmp + b_sf_exp_tmp;
+            sigma_tmp = $signed(s0_sigma_flat_hold[g1*SIGMA_W +: SIGMA_W]);
+            sf_sig_prod_tmp = s0_sf_sig_prod_flat_hold[g1*SF_SIG_PROD_W +: SF_SIG_PROD_W];
+            sf_exp_sum_tmp_s1 =
+                $signed(s0_sf_exp_sum_flat_hold[g1*SF_EXP_SUM_W +: SF_EXP_SUM_W]);
 
             gamma_sig_tmp_s1 = sigma_tmp * $signed({1'b0, sf_sig_prod_tmp});
             gamma_exp_tmp_s1 = $signed(sf_exp_sum_tmp_s1) + FP4_DOT_EXP;
