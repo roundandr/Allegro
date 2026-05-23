@@ -85,14 +85,14 @@ module mid_fp_dot_prod (
         logic [NUM_ELEMS-1:0]            prod_sign_flat;
         logic [NUM_ELEMS*SIG_W-1:0]      a_sig_flat;
         logic [NUM_ELEMS*SIG_W-1:0]      b_sig_flat;
-        logic [NUM_ELEMS*EXP_W-1:0]      a_exp_flat;
-        logic [NUM_ELEMS*EXP_W-1:0]      b_exp_flat;
+        logic [NUM_ELEMS*EXP_W-1:0]      prod_exp_flat;
         logic [NUM_ELEMS-1:0]            prod_zero_flat;
-        logic [NUM_ELEMS-1:0]            prod_emax_vld_flat;
         logic                            c_sign;
         logic [FP32_SIG_W-1:0]           c_sig;
         logic signed [EXP_W-1:0]         c_exp;
         logic                            c_zero;
+        logic signed [EXP_W-1:0]         emax;
+        logic                            emax_vld;
     } stage0_data_t;
 
     typedef struct packed {
@@ -155,22 +155,17 @@ module mid_fp_dot_prod (
     logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_tmp;
     logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_tmp;
     logic [NUM_ELEMS*SIG_W-1:0]       s0_b_sig_flat_tmp;
-    logic [NUM_ELEMS*EXP_W-1:0]       s0_a_exp_flat_tmp;
-    logic [NUM_ELEMS*EXP_W-1:0]       s0_b_exp_flat_tmp;
+    logic [NUM_ELEMS*EXP_W-1:0]       s0_prod_exp_flat_tmp;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_tmp;
-    logic [NUM_ELEMS-1:0]             s0_prod_emax_vld_flat_tmp;
 
     logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_hold;
     logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_hold;
     logic [NUM_ELEMS*SIG_W-1:0]       s0_b_sig_flat_hold;
-    logic [NUM_ELEMS*EXP_W-1:0]       s0_a_exp_flat_hold;
-    logic [NUM_ELEMS*EXP_W-1:0]       s0_b_exp_flat_hold;
+    logic [NUM_ELEMS*EXP_W-1:0]       s0_prod_exp_flat_hold;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_hold;
-    logic [NUM_ELEMS-1:0]             s0_prod_emax_vld_flat_hold;
 
     logic [NUM_ELEMS-1:0]             s1_prod_sign_flat_tmp;
     logic [NUM_ELEMS*PROD_SIG_W-1:0]  s1_prod_sig_flat_tmp;
-    logic [NUM_ELEMS*EXP_W-1:0]       s1_prod_exp_flat_tmp;
 
     logic [NUM_ELEMS-1:0]             s1_prod_sign_flat_hold;
     logic [NUM_ELEMS*PROD_SIG_W-1:0]  s1_prod_sig_flat_hold;
@@ -183,10 +178,8 @@ module mid_fp_dot_prod (
     assign s0_prod_sign_flat_hold    = s0_q.prod_sign_flat;
     assign s0_a_sig_flat_hold        = s0_q.a_sig_flat;
     assign s0_b_sig_flat_hold        = s0_q.b_sig_flat;
-    assign s0_a_exp_flat_hold        = s0_q.a_exp_flat;
-    assign s0_b_exp_flat_hold        = s0_q.b_exp_flat;
+    assign s0_prod_exp_flat_hold     = s0_q.prod_exp_flat;
     assign s0_prod_zero_flat_hold    = s0_q.prod_zero_flat;
-    assign s0_prod_emax_vld_flat_hold = s0_q.prod_emax_vld_flat;
     assign s1_prod_sign_flat_hold    = s1_q.prod_sign_flat;
     assign s1_prod_sig_flat_hold     = s1_q.prod_sig_flat;
     assign s1_prod_exp_flat_hold     = s1_q.prod_exp_flat;
@@ -516,7 +509,20 @@ module mid_fp_dot_prod (
     logic has_neg_inf_tmp;
     logic has_zero_mul_inf_tmp;
     logic lane_prod_sign_tmp;
+    logic lane_prod_zero_tmp;
+    logic lane_prod_emax_vld_tmp;
+    logic signed [EXP_W-1:0] prod_exp_s0_tmp;
     logic reserved_mode_tmp;
+    logic                         emax_s0_l0_vld_tmp [0:16];
+    logic signed [EXP_W-1:0]      emax_s0_l0_exp_tmp [0:16];
+    logic                         emax_s0_l1_vld_tmp [0:8];
+    logic signed [EXP_W-1:0]      emax_s0_l1_exp_tmp [0:8];
+    logic                         emax_s0_l2_vld_tmp [0:4];
+    logic signed [EXP_W-1:0]      emax_s0_l2_exp_tmp [0:4];
+    logic                         emax_s0_l3_vld_tmp [0:2];
+    logic signed [EXP_W-1:0]      emax_s0_l3_exp_tmp [0:2];
+    logic                         emax_s0_l4_vld_tmp [0:1];
+    logic signed [EXP_W-1:0]      emax_s0_l4_exp_tmp [0:1];
     always_comb begin
         logic lane_has_inf_tmp;
         logic lane_valid_tmp;
@@ -525,10 +531,8 @@ module mid_fp_dot_prod (
         s0_prod_sign_flat_tmp = '0;
         s0_a_sig_flat_tmp     = '0;
         s0_b_sig_flat_tmp     = '0;
-        s0_a_exp_flat_tmp     = '0;
-        s0_b_exp_flat_tmp     = '0;
+        s0_prod_exp_flat_tmp  = '0;
         s0_prod_zero_flat_tmp = '0;
-        s0_prod_emax_vld_flat_tmp = '0;
 
         c_preprocessed_tmp   = scale_fp32_pow2_rz(c_i, scale_input_d_i);
         c_dec_tmp            = decode_fp32(c_preprocessed_tmp);
@@ -543,6 +547,9 @@ module mid_fp_dot_prod (
         lane_has_inf_tmp     = 1'b0;
         lane_valid_tmp       = 1'b0;
         lane_prod_sign_tmp   = 1'b0;
+        lane_prod_zero_tmp   = 1'b0;
+        lane_prod_emax_vld_tmp = 1'b0;
+        prod_exp_s0_tmp      = '0;
 
         s0_d.c_sign = c_dec_tmp.sign;
         s0_d.c_sig  = c_dec_tmp.sig;
@@ -570,9 +577,17 @@ module mid_fp_dot_prod (
             end
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
+            prod_exp_s0_tmp    = a_dec_tmp.exp + b_dec_tmp.exp;
             lane_has_inf_tmp   = a_dec_tmp.valid && b_dec_tmp.valid &&
                                   ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
                                    (b_dec_tmp.is_inf && !a_dec_tmp.is_zero && !a_dec_tmp.is_nan));
+            lane_prod_zero_tmp = (!a_dec_tmp.valid) || (!b_dec_tmp.valid) ||
+                                  a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
+                                  a_dec_tmp.is_inf  || b_dec_tmp.is_inf  ||
+                                  a_dec_tmp.is_nan  || b_dec_tmp.is_nan;
+            lane_prod_emax_vld_tmp = a_dec_tmp.valid && b_dec_tmp.valid &&
+                                      !a_dec_tmp.is_inf && !b_dec_tmp.is_inf &&
+                                      !a_dec_tmp.is_nan && !b_dec_tmp.is_nan;
 
             any_nan_tmp = any_nan_tmp ||
                           (a_dec_tmp.valid && a_dec_tmp.is_nan) ||
@@ -587,24 +602,73 @@ module mid_fp_dot_prod (
             s0_prod_sign_flat_tmp[idx0] = lane_prod_sign_tmp;
             s0_a_sig_flat_tmp[idx0*SIG_W +: SIG_W] = a_dec_tmp.sig;
             s0_b_sig_flat_tmp[idx0*SIG_W +: SIG_W] = b_dec_tmp.sig;
-            s0_a_exp_flat_tmp[idx0*EXP_W +: EXP_W] = a_dec_tmp.exp;
-            s0_b_exp_flat_tmp[idx0*EXP_W +: EXP_W] = b_dec_tmp.exp;
-            s0_prod_zero_flat_tmp[idx0] = (!a_dec_tmp.valid) || (!b_dec_tmp.valid) ||
-                                          a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
-                                          a_dec_tmp.is_inf  || b_dec_tmp.is_inf  ||
-                                          a_dec_tmp.is_nan  || b_dec_tmp.is_nan;
-            s0_prod_emax_vld_flat_tmp[idx0] = a_dec_tmp.valid && b_dec_tmp.valid &&
-                                               !a_dec_tmp.is_inf && !b_dec_tmp.is_inf &&
-                                               !a_dec_tmp.is_nan && !b_dec_tmp.is_nan;
+            s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = lane_prod_zero_tmp ? '0 : prod_exp_s0_tmp;
+            s0_prod_zero_flat_tmp[idx0] = lane_prod_zero_tmp;
+            emax_s0_l0_vld_tmp[idx0] = lane_prod_emax_vld_tmp;
+            emax_s0_l0_exp_tmp[idx0] = prod_exp_s0_tmp;
         end
+        emax_s0_l0_vld_tmp[16] = 1'b1;
+        emax_s0_l0_exp_tmp[16] = c_dec_tmp.exp;
+
+        for (int idx0_l1 = 0; idx0_l1 < 8; idx0_l1 = idx0_l1 + 1) begin
+            emax_s0_l1_vld_tmp[idx0_l1] =
+                emax_pick_vld(emax_s0_l0_vld_tmp[idx0_l1*2],
+                              emax_s0_l0_vld_tmp[idx0_l1*2+1]);
+            emax_s0_l1_exp_tmp[idx0_l1] =
+                emax_pick_exp(emax_s0_l0_vld_tmp[idx0_l1*2],
+                              emax_s0_l0_exp_tmp[idx0_l1*2],
+                              emax_s0_l0_vld_tmp[idx0_l1*2+1],
+                              emax_s0_l0_exp_tmp[idx0_l1*2+1]);
+        end
+        emax_s0_l1_vld_tmp[8] = emax_s0_l0_vld_tmp[16];
+        emax_s0_l1_exp_tmp[8] = emax_s0_l0_exp_tmp[16];
+
+        for (int idx0_l2 = 0; idx0_l2 < 4; idx0_l2 = idx0_l2 + 1) begin
+            emax_s0_l2_vld_tmp[idx0_l2] =
+                emax_pick_vld(emax_s0_l1_vld_tmp[idx0_l2*2],
+                              emax_s0_l1_vld_tmp[idx0_l2*2+1]);
+            emax_s0_l2_exp_tmp[idx0_l2] =
+                emax_pick_exp(emax_s0_l1_vld_tmp[idx0_l2*2],
+                              emax_s0_l1_exp_tmp[idx0_l2*2],
+                              emax_s0_l1_vld_tmp[idx0_l2*2+1],
+                              emax_s0_l1_exp_tmp[idx0_l2*2+1]);
+        end
+        emax_s0_l2_vld_tmp[4] = emax_s0_l1_vld_tmp[8];
+        emax_s0_l2_exp_tmp[4] = emax_s0_l1_exp_tmp[8];
+
+        for (int idx0_l3 = 0; idx0_l3 < 2; idx0_l3 = idx0_l3 + 1) begin
+            emax_s0_l3_vld_tmp[idx0_l3] =
+                emax_pick_vld(emax_s0_l2_vld_tmp[idx0_l3*2],
+                              emax_s0_l2_vld_tmp[idx0_l3*2+1]);
+            emax_s0_l3_exp_tmp[idx0_l3] =
+                emax_pick_exp(emax_s0_l2_vld_tmp[idx0_l3*2],
+                              emax_s0_l2_exp_tmp[idx0_l3*2],
+                              emax_s0_l2_vld_tmp[idx0_l3*2+1],
+                              emax_s0_l2_exp_tmp[idx0_l3*2+1]);
+        end
+        emax_s0_l3_vld_tmp[2] = emax_s0_l2_vld_tmp[4];
+        emax_s0_l3_exp_tmp[2] = emax_s0_l2_exp_tmp[4];
+
+        emax_s0_l4_vld_tmp[0] = emax_pick_vld(emax_s0_l3_vld_tmp[0],
+                                              emax_s0_l3_vld_tmp[1]);
+        emax_s0_l4_exp_tmp[0] = emax_pick_exp(emax_s0_l3_vld_tmp[0],
+                                              emax_s0_l3_exp_tmp[0],
+                                              emax_s0_l3_vld_tmp[1],
+                                              emax_s0_l3_exp_tmp[1]);
+        emax_s0_l4_vld_tmp[1] = emax_s0_l3_vld_tmp[2];
+        emax_s0_l4_exp_tmp[1] = emax_s0_l3_exp_tmp[2];
 
         s0_d.prod_sign_flat = s0_prod_sign_flat_tmp;
         s0_d.a_sig_flat     = s0_a_sig_flat_tmp;
         s0_d.b_sig_flat     = s0_b_sig_flat_tmp;
-        s0_d.a_exp_flat     = s0_a_exp_flat_tmp;
-        s0_d.b_exp_flat     = s0_b_exp_flat_tmp;
+        s0_d.prod_exp_flat  = s0_prod_exp_flat_tmp;
         s0_d.prod_zero_flat = s0_prod_zero_flat_tmp;
-        s0_d.prod_emax_vld_flat = s0_prod_emax_vld_flat_tmp;
+        s0_d.emax_vld       = emax_pick_vld(emax_s0_l4_vld_tmp[0],
+                                            emax_s0_l4_vld_tmp[1]);
+        s0_d.emax           = emax_pick_exp(emax_s0_l4_vld_tmp[0],
+                                           emax_s0_l4_exp_tmp[0],
+                                           emax_s0_l4_vld_tmp[1],
+                                           emax_s0_l4_exp_tmp[1]);
 
         if (any_nan_tmp || has_zero_mul_inf_tmp || (has_pos_inf_tmp && has_neg_inf_tmp)) begin
             s0_d.special_vld    = 1'b1;
@@ -624,24 +688,10 @@ module mid_fp_dot_prod (
     logic [SIG_W-1:0]             a_sig_s1_tmp;
     logic [SIG_W-1:0]             b_sig_s1_tmp;
     logic [PROD_SIG_W-1:0]        prod_sig_s1_tmp;
-    logic                         emax_l0_vld_tmp [0:16];
-    logic signed [EXP_W-1:0]      emax_l0_exp_tmp [0:16];
-    logic                         emax_l1_vld_tmp [0:8];
-    logic signed [EXP_W-1:0]      emax_l1_exp_tmp [0:8];
-    logic                         emax_l2_vld_tmp [0:4];
-    logic signed [EXP_W-1:0]      emax_l2_exp_tmp [0:4];
-    logic                         emax_l3_vld_tmp [0:2];
-    logic signed [EXP_W-1:0]      emax_l3_exp_tmp [0:2];
-    logic                         emax_l4_vld_tmp [0:1];
-    logic signed [EXP_W-1:0]      emax_l4_exp_tmp [0:1];
     always_comb begin
-        logic signed [EXP_W-1:0] a_exp_s1_tmp;
-        logic signed [EXP_W-1:0] b_exp_s1_tmp;
-        logic signed [EXP_W-1:0] prod_exp_s1_tmp;
         s1_d = '0;
         s1_prod_sign_flat_tmp = '0;
         s1_prod_sig_flat_tmp  = '0;
-        s1_prod_exp_flat_tmp  = '0;
 
         s1_d.special_vld    = s0_q.special_vld;
         s1_d.special_result = s0_q.special_result;
@@ -650,72 +700,21 @@ module mid_fp_dot_prod (
         s1_d.c_sig          = s0_q.c_sig;
         s1_d.c_exp          = s0_q.c_exp;
         s1_d.c_zero         = s0_q.c_zero;
+        s1_d.prod_exp_flat  = s0_prod_exp_flat_hold;
+        s1_d.emax_vld       = s0_q.emax_vld;
+        s1_d.emax           = s0_q.emax;
 
         for (int idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
             a_sig_s1_tmp = s0_a_sig_flat_hold[idx1*SIG_W +: SIG_W];
             b_sig_s1_tmp = s0_b_sig_flat_hold[idx1*SIG_W +: SIG_W];
-            a_exp_s1_tmp = $signed(s0_a_exp_flat_hold[idx1*EXP_W +: EXP_W]);
-            b_exp_s1_tmp = $signed(s0_b_exp_flat_hold[idx1*EXP_W +: EXP_W]);
-
             prod_sig_s1_tmp = a_sig_s1_tmp * b_sig_s1_tmp;
-            prod_exp_s1_tmp = a_exp_s1_tmp + b_exp_s1_tmp;
 
             s1_prod_sign_flat_tmp[idx1] = s0_prod_sign_flat_hold[idx1];
             s1_prod_sig_flat_tmp[idx1*PROD_SIG_W +: PROD_SIG_W] = prod_sig_s1_tmp;
-            s1_prod_exp_flat_tmp[idx1*EXP_W +: EXP_W] =
-                s0_prod_zero_flat_hold[idx1] ? '0 : prod_exp_s1_tmp;
-
-            emax_l0_vld_tmp[idx1] = s0_prod_emax_vld_flat_hold[idx1];
-            emax_l0_exp_tmp[idx1] = prod_exp_s1_tmp;
         end
-        emax_l0_vld_tmp[16] = 1'b1;
-        emax_l0_exp_tmp[16] = s0_q.c_exp;
-
-        for (int idx1 = 0; idx1 < 8; idx1 = idx1 + 1) begin
-            emax_l1_vld_tmp[idx1] = emax_pick_vld(emax_l0_vld_tmp[idx1*2],
-                                                  emax_l0_vld_tmp[idx1*2+1]);
-            emax_l1_exp_tmp[idx1] = emax_pick_exp(emax_l0_vld_tmp[idx1*2],
-                                                  emax_l0_exp_tmp[idx1*2],
-                                                  emax_l0_vld_tmp[idx1*2+1],
-                                                  emax_l0_exp_tmp[idx1*2+1]);
-        end
-        emax_l1_vld_tmp[8] = emax_l0_vld_tmp[16];
-        emax_l1_exp_tmp[8] = emax_l0_exp_tmp[16];
-
-        for (int idx1 = 0; idx1 < 4; idx1 = idx1 + 1) begin
-            emax_l2_vld_tmp[idx1] = emax_pick_vld(emax_l1_vld_tmp[idx1*2],
-                                                  emax_l1_vld_tmp[idx1*2+1]);
-            emax_l2_exp_tmp[idx1] = emax_pick_exp(emax_l1_vld_tmp[idx1*2],
-                                                  emax_l1_exp_tmp[idx1*2],
-                                                  emax_l1_vld_tmp[idx1*2+1],
-                                                  emax_l1_exp_tmp[idx1*2+1]);
-        end
-        emax_l2_vld_tmp[4] = emax_l1_vld_tmp[8];
-        emax_l2_exp_tmp[4] = emax_l1_exp_tmp[8];
-
-        for (int idx1 = 0; idx1 < 2; idx1 = idx1 + 1) begin
-            emax_l3_vld_tmp[idx1] = emax_pick_vld(emax_l2_vld_tmp[idx1*2],
-                                                  emax_l2_vld_tmp[idx1*2+1]);
-            emax_l3_exp_tmp[idx1] = emax_pick_exp(emax_l2_vld_tmp[idx1*2],
-                                                  emax_l2_exp_tmp[idx1*2],
-                                                  emax_l2_vld_tmp[idx1*2+1],
-                                                  emax_l2_exp_tmp[idx1*2+1]);
-        end
-        emax_l3_vld_tmp[2] = emax_l2_vld_tmp[4];
-        emax_l3_exp_tmp[2] = emax_l2_exp_tmp[4];
-
-        emax_l4_vld_tmp[0] = emax_pick_vld(emax_l3_vld_tmp[0], emax_l3_vld_tmp[1]);
-        emax_l4_exp_tmp[0] = emax_pick_exp(emax_l3_vld_tmp[0], emax_l3_exp_tmp[0],
-                                           emax_l3_vld_tmp[1], emax_l3_exp_tmp[1]);
-        emax_l4_vld_tmp[1] = emax_l3_vld_tmp[2];
-        emax_l4_exp_tmp[1] = emax_l3_exp_tmp[2];
 
         s1_d.prod_sign_flat = s1_prod_sign_flat_tmp;
         s1_d.prod_sig_flat  = s1_prod_sig_flat_tmp;
-        s1_d.prod_exp_flat  = s1_prod_exp_flat_tmp;
-        s1_d.emax_vld       = emax_pick_vld(emax_l4_vld_tmp[0], emax_l4_vld_tmp[1]);
-        s1_d.emax           = emax_pick_exp(emax_l4_vld_tmp[0], emax_l4_exp_tmp[0],
-                                           emax_l4_vld_tmp[1], emax_l4_exp_tmp[1]);
     end
     logic signed [EXP_W-1:0] prod_exp_s2_tmp;
     logic [PROD_SIG_W-1:0]   prod_sig_s2_tmp;

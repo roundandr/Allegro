@@ -365,11 +365,19 @@ module fp4_dot_prod (
         integer           shift_sub;
         integer           i;
         begin
-            sign_bit = sum_i[SUM_W-1];
+            pack_fp32_rz = 32'h0000_0000;
+            sign_bit     = sum_i[SUM_W-1];
+            abs_sum      = '0;
+            norm_sum     = '0;
+            sig24        = '0;
+            frac_field   = '0;
+            exp_field    = '0;
+            unbiased_exp = 0;
+            msb_idx      = 0;
+            norm_lshift  = 0;
+            shift_sub    = 0;
 
-            if (sum_i == '0) begin
-                pack_fp32_rz = 32'h0000_0000;
-            end else begin
+            if (sum_i != '0) begin
                 if (sign_bit) begin
                     abs_sum = -sum_i;
                 end else begin
@@ -404,11 +412,7 @@ module fp4_dot_prod (
                     frac_field  = sig24[22:0];
                 end
 
-                if ((exp_field == 8'h00) && (frac_field == 23'h0)) begin
-                    pack_fp32_rz = 32'h0000_0000;
-                end else begin
-                    pack_fp32_rz = {sign_bit, exp_field, frac_field};
-                end
+                pack_fp32_rz = {sign_bit, exp_field, frac_field};
             end
         end
     endfunction
