@@ -56,6 +56,9 @@ module fp4_dot_prod (
     localparam int ALIGN_TERM_W   = ALIGN_MAG_W + 1;
     localparam int ALIGN_SHIFT_W  = $clog2(ALIGN_MAG_W + 1);
     localparam int SUM_W          = ALIGN_TERM_W + 3;
+    localparam int PACK_SIG_W     = 24;
+    localparam int PACK_LOD_GRP_W = 10;
+    localparam int PACK_LOD_GRP_N = (SUM_W + PACK_LOD_GRP_W - 1) / PACK_LOD_GRP_W;
     localparam logic signed [C_EXP_W-1:0] FP4_DOT_EXP = -10'sd2;
     localparam logic signed [C_EXP_W-1:0] ALIGN_FRAC_EXP = ALIGN_FRAC_W;
     localparam logic signed [C_EXP_W-1:0] GAMMA_NORM_EXP = 10'sd8;
@@ -349,32 +352,75 @@ module fp4_dot_prod (
         end
     endfunction
 
+    function automatic integer pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
+        integer grp_idx;
+        integer bit_idx;
+        integer sum_idx;
+        integer grp_msb_idx;
+        logic   grp_vld;
+        begin
+            pack_msb_idx = 0;
+
+            for (grp_idx = 0; grp_idx < PACK_LOD_GRP_N; grp_idx = grp_idx + 1) begin
+                grp_vld     = 1'b0;
+                grp_msb_idx = 0;
+
+                for (bit_idx = 0; bit_idx < PACK_LOD_GRP_W; bit_idx = bit_idx + 1) begin
+                    sum_idx = grp_idx * PACK_LOD_GRP_W + bit_idx;
+                    if (sum_idx < SUM_W) begin
+                        if (abs_sum_i[sum_idx]) begin
+                            grp_vld     = 1'b1;
+                            grp_msb_idx = bit_idx;
+                        end
+                    end
+                end
+
+                if (grp_vld) begin
+                    pack_msb_idx = grp_idx * PACK_LOD_GRP_W + grp_msb_idx;
+                end
+            end
+        end
+    endfunction
+
+    function automatic logic [PACK_SIG_W-1:0] pack_sig24_from_abs(
+        input logic [SUM_W-1:0] abs_sum_i,
+        input integer           msb_idx_i
+    );
+        integer sig_idx;
+        integer sum_idx;
+        begin
+            pack_sig24_from_abs = '0;
+
+            for (sig_idx = 0; sig_idx < PACK_SIG_W; sig_idx = sig_idx + 1) begin
+                sum_idx = msb_idx_i - (PACK_SIG_W - 1 - sig_idx);
+                if (sum_idx >= 0) begin
+                    pack_sig24_from_abs[sig_idx] = abs_sum_i[sum_idx];
+                end
+            end
+        end
+    endfunction
+
     function automatic logic [31:0] pack_fp32_rz(
         input logic signed [SUM_W-1:0] sum_i,
         input logic signed [C_EXP_W-1:0] base_exp_i
     );
         logic             sign_bit;
         logic [SUM_W-1:0] abs_sum;
-        logic [SUM_W-1:0] norm_sum;
         logic [23:0]      sig24;
         logic [22:0]      frac_field;
         logic [7:0]       exp_field;
         integer           msb_idx;
-        integer           norm_lshift;
         integer           unbiased_exp;
         integer           shift_sub;
-        integer           i;
         begin
             pack_fp32_rz = 32'h0000_0000;
             sign_bit     = sum_i[SUM_W-1];
             abs_sum      = '0;
-            norm_sum     = '0;
             sig24        = '0;
             frac_field   = '0;
             exp_field    = '0;
             unbiased_exp = 0;
             msb_idx      = 0;
-            norm_lshift  = 0;
             shift_sub    = 0;
 
             if (sum_i != '0) begin
@@ -384,17 +430,9 @@ module fp4_dot_prod (
                     abs_sum = sum_i;
                 end
 
-                msb_idx = 0;
-                for (i = 0; i < SUM_W; i = i + 1) begin
-                    if (abs_sum[i]) begin
-                        msb_idx = i;
-                    end
-                end
-
+                msb_idx      = pack_msb_idx(abs_sum);
                 unbiased_exp = base_exp_i + msb_idx;
-                norm_lshift  = (SUM_W - 1) - msb_idx;
-                norm_sum     = abs_sum << norm_lshift;
-                sig24        = norm_sum[SUM_W-1 -: 24];
+                sig24        = pack_sig24_from_abs(abs_sum, msb_idx);
 
                 if (unbiased_exp > 127) begin
                     exp_field   = 8'hff;

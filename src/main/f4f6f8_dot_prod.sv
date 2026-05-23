@@ -90,6 +90,8 @@ module f4f6f8_dot_prod (
         logic [ALIGN_TERM_W-2:0]        c_mag;
         logic signed [EXP_W-1:0]        c_exp;
         logic                           c_zero;
+        logic signed [EXP_W-1:0]        emax;
+        logic                           emax_vld;
     } stage0_data_t;
 
     typedef struct packed {
@@ -493,10 +495,25 @@ module f4f6f8_dot_prod (
     logic lane_has_inf_tmp;
     logic lane_prod_sign_tmp;
     logic [PROD_SIG_W-1:0] lane_prod_sig_tmp;
+    logic signed [EXP_W-1:0] lane_prod_exp_tmp;
     logic [ALIGN_TERM_W-2:0] lane_prod_mag_tmp;
     logic [ALIGN_TERM_W-2:0] c_mag_tmp_s0;
     logic mx_scale_nan_tmp;
     logic signed [EXP_W-1:0] mx_scale_exp_sum_tmp;
+    logic                                  emax_l0_vld_tmp [0:32];
+    logic signed [EXP_W-1:0]               emax_l0_exp_tmp [0:32];
+    logic                                  emax_l1_vld_tmp [0:16];
+    logic signed [EXP_W-1:0]               emax_l1_exp_tmp [0:16];
+    logic                                  emax_l2_vld_tmp [0:8];
+    logic signed [EXP_W-1:0]               emax_l2_exp_tmp [0:8];
+    logic                                  emax_l3_vld_tmp [0:4];
+    logic signed [EXP_W-1:0]               emax_l3_exp_tmp [0:4];
+    logic                                  emax_l4_vld_tmp [0:2];
+    logic signed [EXP_W-1:0]               emax_l4_exp_tmp [0:2];
+    logic                                  emax_l5_vld_tmp [0:1];
+    logic signed [EXP_W-1:0]               emax_l5_exp_tmp [0:1];
+    logic                                  emax_result_vld_tmp;
+    logic signed [EXP_W-1:0]               emax_result_exp_tmp;
 
     always @(*) begin
         s0_d = '0;
@@ -515,7 +532,10 @@ module f4f6f8_dot_prod (
         has_neg_inf_tmp      = c_dec_tmp.is_inf && c_dec_tmp.sign;
         has_zero_mul_inf_tmp = 1'b0;
         lane_prod_sig_tmp    = '0;
+        lane_prod_exp_tmp    = '0;
         lane_prod_mag_tmp    = '0;
+        emax_result_vld_tmp  = 1'b0;
+        emax_result_exp_tmp  = '0;
 
         s0_d.c_sign = c_dec_tmp.sign;
         s0_d.c_exp  = c_dec_tmp.exp;
@@ -584,24 +604,85 @@ module f4f6f8_dot_prod (
                 s0_prod_mag_flat_tmp[idx0*(ALIGN_TERM_W-1) +: (ALIGN_TERM_W-1)] = '0;
                 s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = '0;
                 s0_prod_zero_flat_tmp[idx0] = 1'b1;
+                lane_prod_exp_tmp = '0;
             end else begin
                 s0_prod_sign_flat_tmp[idx0] = lane_prod_sign_tmp;
                 s0_prod_zero_flat_tmp[idx0] = a_dec_tmp.is_zero || b_dec_tmp.is_zero;
                 lane_prod_sig_tmp = a_dec_tmp.sig * b_dec_tmp.sig;
+                lane_prod_exp_tmp = a_dec_tmp.exp + b_dec_tmp.exp + mx_scale_exp_sum_tmp;
                 lane_prod_mag_tmp = {{(ALIGN_TERM_W-1-PROD_SIG_W-PROD_ALIGN_PAD_W){1'b0}},
                                      lane_prod_sig_tmp,
                                      {PROD_ALIGN_PAD_W{1'b0}}};
                 s0_prod_mag_flat_tmp[idx0*(ALIGN_TERM_W-1) +: (ALIGN_TERM_W-1)] = lane_prod_mag_tmp;
 
-                s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] =
-                    a_dec_tmp.exp + b_dec_tmp.exp + mx_scale_exp_sum_tmp;
+                s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = lane_prod_exp_tmp;
             end
+
+            emax_l0_vld_tmp[idx0] = 1'b1;
+            emax_l0_exp_tmp[idx0] = lane_prod_exp_tmp;
         end
+        emax_l0_vld_tmp[32] = 1'b1;
+        emax_l0_exp_tmp[32] = c_dec_tmp.exp;
+
+        for (idx0 = 0; idx0 < 16; idx0 = idx0 + 1) begin
+            emax_l1_vld_tmp[idx0] = emax_pick_vld(emax_l0_vld_tmp[idx0*2],
+                                                   emax_l0_vld_tmp[idx0*2+1]);
+            emax_l1_exp_tmp[idx0] = emax_pick_exp(emax_l0_vld_tmp[idx0*2],
+                                                   emax_l0_exp_tmp[idx0*2],
+                                                   emax_l0_vld_tmp[idx0*2+1],
+                                                   emax_l0_exp_tmp[idx0*2+1]);
+        end
+        emax_l1_vld_tmp[16] = emax_l0_vld_tmp[32];
+        emax_l1_exp_tmp[16] = emax_l0_exp_tmp[32];
+
+        for (idx0 = 0; idx0 < 8; idx0 = idx0 + 1) begin
+            emax_l2_vld_tmp[idx0] = emax_pick_vld(emax_l1_vld_tmp[idx0*2],
+                                                   emax_l1_vld_tmp[idx0*2+1]);
+            emax_l2_exp_tmp[idx0] = emax_pick_exp(emax_l1_vld_tmp[idx0*2],
+                                                   emax_l1_exp_tmp[idx0*2],
+                                                   emax_l1_vld_tmp[idx0*2+1],
+                                                   emax_l1_exp_tmp[idx0*2+1]);
+        end
+        emax_l2_vld_tmp[8] = emax_l1_vld_tmp[16];
+        emax_l2_exp_tmp[8] = emax_l1_exp_tmp[16];
+
+        for (idx0 = 0; idx0 < 4; idx0 = idx0 + 1) begin
+            emax_l3_vld_tmp[idx0] = emax_pick_vld(emax_l2_vld_tmp[idx0*2],
+                                                   emax_l2_vld_tmp[idx0*2+1]);
+            emax_l3_exp_tmp[idx0] = emax_pick_exp(emax_l2_vld_tmp[idx0*2],
+                                                   emax_l2_exp_tmp[idx0*2],
+                                                   emax_l2_vld_tmp[idx0*2+1],
+                                                   emax_l2_exp_tmp[idx0*2+1]);
+        end
+        emax_l3_vld_tmp[4] = emax_l2_vld_tmp[8];
+        emax_l3_exp_tmp[4] = emax_l2_exp_tmp[8];
+
+        for (idx0 = 0; idx0 < 2; idx0 = idx0 + 1) begin
+            emax_l4_vld_tmp[idx0] = emax_pick_vld(emax_l3_vld_tmp[idx0*2],
+                                                   emax_l3_vld_tmp[idx0*2+1]);
+            emax_l4_exp_tmp[idx0] = emax_pick_exp(emax_l3_vld_tmp[idx0*2],
+                                                   emax_l3_exp_tmp[idx0*2],
+                                                   emax_l3_vld_tmp[idx0*2+1],
+                                                   emax_l3_exp_tmp[idx0*2+1]);
+        end
+        emax_l4_vld_tmp[2] = emax_l3_vld_tmp[4];
+        emax_l4_exp_tmp[2] = emax_l3_exp_tmp[4];
+
+        emax_l5_vld_tmp[0] = emax_pick_vld(emax_l4_vld_tmp[0], emax_l4_vld_tmp[1]);
+        emax_l5_exp_tmp[0] = emax_pick_exp(emax_l4_vld_tmp[0], emax_l4_exp_tmp[0],
+                                           emax_l4_vld_tmp[1], emax_l4_exp_tmp[1]);
+        emax_l5_vld_tmp[1] = emax_l4_vld_tmp[2];
+        emax_l5_exp_tmp[1] = emax_l4_exp_tmp[2];
+        emax_result_vld_tmp = emax_pick_vld(emax_l5_vld_tmp[0], emax_l5_vld_tmp[1]);
+        emax_result_exp_tmp = emax_pick_exp(emax_l5_vld_tmp[0], emax_l5_exp_tmp[0],
+                                            emax_l5_vld_tmp[1], emax_l5_exp_tmp[1]);
 
         s0_d.prod_sign_flat = s0_prod_sign_flat_tmp;
         s0_d.prod_mag_flat  = s0_prod_mag_flat_tmp;
         s0_d.prod_exp_flat  = s0_prod_exp_flat_tmp;
         s0_d.prod_zero_flat = s0_prod_zero_flat_tmp;
+        s0_d.emax           = emax_result_exp_tmp;
+        s0_d.emax_vld       = emax_result_vld_tmp;
 
         if (any_nan_tmp || has_zero_mul_inf_tmp || (has_pos_inf_tmp && has_neg_inf_tmp)) begin
             s0_d.special_vld    = 1'b1;
@@ -646,26 +727,8 @@ module f4f6f8_dot_prod (
         end
     endfunction
 
-    integer idx1;
-    logic                                  emax_l0_vld_tmp [0:32];
-    logic signed [EXP_W-1:0]               emax_l0_exp_tmp [0:32];
-    logic                                  emax_l1_vld_tmp [0:16];
-    logic signed [EXP_W-1:0]               emax_l1_exp_tmp [0:16];
-    logic                                  emax_l2_vld_tmp [0:8];
-    logic signed [EXP_W-1:0]               emax_l2_exp_tmp [0:8];
-    logic                                  emax_l3_vld_tmp [0:4];
-    logic signed [EXP_W-1:0]               emax_l3_exp_tmp [0:4];
-    logic                                  emax_l4_vld_tmp [0:2];
-    logic signed [EXP_W-1:0]               emax_l4_exp_tmp [0:2];
-    logic                                  emax_l5_vld_tmp [0:1];
-    logic signed [EXP_W-1:0]               emax_l5_exp_tmp [0:1];
-    logic                                  emax_result_vld_tmp;
-    logic signed [EXP_W-1:0]               emax_result_exp_tmp;
-
     always @(*) begin
         s1_d = '0;
-        emax_result_vld_tmp  = 1'b0;
-        emax_result_exp_tmp  = '0;
 
         s1_d.special_vld    = s0_q.special_vld;
         s1_d.special_result = s0_q.special_result;
@@ -677,69 +740,8 @@ module f4f6f8_dot_prod (
         s1_d.c_mag          = s0_q.c_mag;
         s1_d.c_exp          = s0_q.c_exp;
         s1_d.c_zero         = s0_q.c_zero;
-
-        for (idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
-            emax_l0_vld_tmp[idx1] = 1'b1;
-            emax_l0_exp_tmp[idx1] = $signed(s0_prod_exp_q_flat[idx1*EXP_W +: EXP_W]);
-        end
-        emax_l0_vld_tmp[32] = 1'b1;
-        emax_l0_exp_tmp[32] = s0_q.c_exp;
-
-        for (idx1 = 0; idx1 < 16; idx1 = idx1 + 1) begin
-            emax_l1_vld_tmp[idx1] = emax_pick_vld(emax_l0_vld_tmp[idx1*2],
-                                                   emax_l0_vld_tmp[idx1*2+1]);
-            emax_l1_exp_tmp[idx1] = emax_pick_exp(emax_l0_vld_tmp[idx1*2],
-                                                   emax_l0_exp_tmp[idx1*2],
-                                                   emax_l0_vld_tmp[idx1*2+1],
-                                                   emax_l0_exp_tmp[idx1*2+1]);
-        end
-        emax_l1_vld_tmp[16] = emax_l0_vld_tmp[32];
-        emax_l1_exp_tmp[16] = emax_l0_exp_tmp[32];
-
-        for (idx1 = 0; idx1 < 8; idx1 = idx1 + 1) begin
-            emax_l2_vld_tmp[idx1] = emax_pick_vld(emax_l1_vld_tmp[idx1*2],
-                                                   emax_l1_vld_tmp[idx1*2+1]);
-            emax_l2_exp_tmp[idx1] = emax_pick_exp(emax_l1_vld_tmp[idx1*2],
-                                                   emax_l1_exp_tmp[idx1*2],
-                                                   emax_l1_vld_tmp[idx1*2+1],
-                                                   emax_l1_exp_tmp[idx1*2+1]);
-        end
-        emax_l2_vld_tmp[8] = emax_l1_vld_tmp[16];
-        emax_l2_exp_tmp[8] = emax_l1_exp_tmp[16];
-
-        for (idx1 = 0; idx1 < 4; idx1 = idx1 + 1) begin
-            emax_l3_vld_tmp[idx1] = emax_pick_vld(emax_l2_vld_tmp[idx1*2],
-                                                   emax_l2_vld_tmp[idx1*2+1]);
-            emax_l3_exp_tmp[idx1] = emax_pick_exp(emax_l2_vld_tmp[idx1*2],
-                                                   emax_l2_exp_tmp[idx1*2],
-                                                   emax_l2_vld_tmp[idx1*2+1],
-                                                   emax_l2_exp_tmp[idx1*2+1]);
-        end
-        emax_l3_vld_tmp[4] = emax_l2_vld_tmp[8];
-        emax_l3_exp_tmp[4] = emax_l2_exp_tmp[8];
-
-        for (idx1 = 0; idx1 < 2; idx1 = idx1 + 1) begin
-            emax_l4_vld_tmp[idx1] = emax_pick_vld(emax_l3_vld_tmp[idx1*2],
-                                                   emax_l3_vld_tmp[idx1*2+1]);
-            emax_l4_exp_tmp[idx1] = emax_pick_exp(emax_l3_vld_tmp[idx1*2],
-                                                   emax_l3_exp_tmp[idx1*2],
-                                                   emax_l3_vld_tmp[idx1*2+1],
-                                                   emax_l3_exp_tmp[idx1*2+1]);
-        end
-        emax_l4_vld_tmp[2] = emax_l3_vld_tmp[4];
-        emax_l4_exp_tmp[2] = emax_l3_exp_tmp[4];
-
-        emax_l5_vld_tmp[0] = emax_pick_vld(emax_l4_vld_tmp[0], emax_l4_vld_tmp[1]);
-        emax_l5_exp_tmp[0] = emax_pick_exp(emax_l4_vld_tmp[0], emax_l4_exp_tmp[0],
-                                           emax_l4_vld_tmp[1], emax_l4_exp_tmp[1]);
-        emax_l5_vld_tmp[1] = emax_l4_vld_tmp[2];
-        emax_l5_exp_tmp[1] = emax_l4_exp_tmp[2];
-        emax_result_vld_tmp = emax_pick_vld(emax_l5_vld_tmp[0], emax_l5_vld_tmp[1]);
-        emax_result_exp_tmp = emax_pick_exp(emax_l5_vld_tmp[0], emax_l5_exp_tmp[0],
-                                            emax_l5_vld_tmp[1], emax_l5_exp_tmp[1]);
-
-        s1_d.emax          = emax_result_exp_tmp;
-        s1_d.emax_vld      = emax_result_vld_tmp;
+        s1_d.emax          = s0_q.emax;
+        s1_d.emax_vld      = s0_q.emax_vld;
     end
 
     integer idx2;
