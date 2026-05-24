@@ -34,6 +34,10 @@ module fp4_dot_prod (
     localparam int NUM_ELEMS      = 64;
     localparam int BLOCK_SIZE     = 16;
     localparam int NUM_BLOCKS     = 4;
+    localparam int SUM_TERM_N     = NUM_BLOCKS + 1;
+    localparam int SUM_TREE_L0_N  = (SUM_TERM_N + 1) / 2;
+    localparam int SUM_TREE_L1_N  = (SUM_TREE_L0_N + 1) / 2;
+    localparam int SUM_TREE_L2_N  = (SUM_TREE_L1_N + 1) / 2;
     localparam logic [1:0] FP4_MODE_NVFP4     = 2'd0;
     localparam logic [1:0] FP4_MODE_MXFP4     = 2'd1;
     localparam logic [1:0] FP4_MODE_FP4       = 2'd2;
@@ -61,10 +65,15 @@ module fp4_dot_prod (
     localparam int PACK_MSB_IDX_W = $clog2(SUM_W);
     localparam int PACK_LOD_GRP_W = 10;
     localparam int PACK_LOD_GRP_N = (SUM_W + PACK_LOD_GRP_W - 1) / PACK_LOD_GRP_W;
+    localparam int PACK_EXP_CLASS_W = C_EXP_W + 1;
     localparam int FP32_EXP_BIAS       = 127;
     localparam int FP32_EXP_MAX        = 127;
     localparam int FP32_EXP_MIN_NORMAL = -126;
     localparam int FP32_EXP_MIN_SUB    = -149;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_BIAS_PACK       = FP32_EXP_BIAS;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MAX_PACK        = FP32_EXP_MAX;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MIN_NORMAL_PACK = FP32_EXP_MIN_NORMAL;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MIN_SUB_PACK    = FP32_EXP_MIN_SUB;
     localparam logic signed [C_EXP_W-1:0] FP4_DOT_EXP = -10'sd2;
     localparam logic signed [C_EXP_W-1:0] ALIGN_FRAC_EXP = ALIGN_FRAC_W;
     localparam logic signed [C_EXP_W-1:0] GAMMA_NORM_EXP = 10'sd8;
@@ -258,7 +267,7 @@ module fp4_dot_prod (
 
             if (is_zero) begin
                 sig = 4'd0;
-                exp = '0;
+                exp = -9'sd129;
             end else if (exp_raw == 4'b0000) begin
                 sig = {1'b0, mant_raw};
                 exp = -9'sd9;
@@ -391,39 +400,87 @@ module fp4_dot_prod (
         end
     endfunction
 
-    function automatic integer pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
+    function automatic logic signed [SUM_W-1:0] csa_sum3(
+        input logic signed [SUM_W-1:0] a_i,
+        input logic signed [SUM_W-1:0] b_i,
+        input logic signed [SUM_W-1:0] z_i
+    );
+        begin
+            csa_sum3 = $signed(a_i ^ b_i ^ z_i);
+        end
+    endfunction
+
+    function automatic logic signed [SUM_W-1:0] csa_carry3(
+        input logic signed [SUM_W-1:0] a_i,
+        input logic signed [SUM_W-1:0] b_i,
+        input logic signed [SUM_W-1:0] z_i
+    );
+        logic [SUM_W-1:0] carry_bits;
+        begin
+            carry_bits = (a_i & b_i) | (a_i & z_i) | (b_i & z_i);
+            csa_carry3 = $signed({carry_bits[SUM_W-2:0], 1'b0});
+        end
+    endfunction
+
+    function automatic logic [PACK_MSB_IDX_W-1:0] pack_lod_group_idx(
+        input logic [PACK_LOD_GRP_W-1:0] grp_bits_i
+    );
+        begin
+            casez (grp_bits_i)
+                10'b1?????????: pack_lod_group_idx = PACK_MSB_IDX_W'(9);
+                10'b01????????: pack_lod_group_idx = PACK_MSB_IDX_W'(8);
+                10'b001???????: pack_lod_group_idx = PACK_MSB_IDX_W'(7);
+                10'b0001??????: pack_lod_group_idx = PACK_MSB_IDX_W'(6);
+                10'b00001?????: pack_lod_group_idx = PACK_MSB_IDX_W'(5);
+                10'b000001????: pack_lod_group_idx = PACK_MSB_IDX_W'(4);
+                10'b0000001???: pack_lod_group_idx = PACK_MSB_IDX_W'(3);
+                10'b00000001??: pack_lod_group_idx = PACK_MSB_IDX_W'(2);
+                10'b000000001?: pack_lod_group_idx = PACK_MSB_IDX_W'(1);
+                default:        pack_lod_group_idx = '0;
+            endcase
+        end
+    endfunction
+
+    function automatic logic [PACK_MSB_IDX_W-1:0] pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
         integer grp_idx;
         integer bit_idx;
         integer sum_idx;
-        integer grp_msb_idx;
-        logic   grp_vld;
+        logic [PACK_LOD_GRP_W-1:0]     grp_bits [0:PACK_LOD_GRP_N-1];
+        logic [PACK_LOD_GRP_N-1:0]     grp_vld;
+        logic [PACK_MSB_IDX_W-1:0]     grp_msb_idx [0:PACK_LOD_GRP_N-1];
         begin
             pack_msb_idx = 0;
 
             for (grp_idx = 0; grp_idx < PACK_LOD_GRP_N; grp_idx = grp_idx + 1) begin
-                grp_vld     = 1'b0;
-                grp_msb_idx = 0;
+                grp_bits[grp_idx]    = '0;
+                grp_vld[grp_idx]     = 1'b0;
+                grp_msb_idx[grp_idx] = '0;
 
                 for (bit_idx = 0; bit_idx < PACK_LOD_GRP_W; bit_idx = bit_idx + 1) begin
                     sum_idx = grp_idx * PACK_LOD_GRP_W + bit_idx;
                     if (sum_idx < SUM_W) begin
-                        if (abs_sum_i[sum_idx]) begin
-                            grp_vld     = 1'b1;
-                            grp_msb_idx = bit_idx;
-                        end
+                        grp_bits[grp_idx][bit_idx] = abs_sum_i[sum_idx];
                     end
                 end
 
-                if (grp_vld) begin
-                    pack_msb_idx = grp_idx * PACK_LOD_GRP_W + grp_msb_idx;
-                end
+                grp_vld[grp_idx]     = |grp_bits[grp_idx];
+                grp_msb_idx[grp_idx] = pack_lod_group_idx(grp_bits[grp_idx]);
             end
+
+            casez (grp_vld)
+                5'b1????: pack_msb_idx = PACK_MSB_IDX_W'(4*PACK_LOD_GRP_W) + grp_msb_idx[4];
+                5'b01???: pack_msb_idx = PACK_MSB_IDX_W'(3*PACK_LOD_GRP_W) + grp_msb_idx[3];
+                5'b001??: pack_msb_idx = PACK_MSB_IDX_W'(2*PACK_LOD_GRP_W) + grp_msb_idx[2];
+                5'b0001?: pack_msb_idx = PACK_MSB_IDX_W'(1*PACK_LOD_GRP_W) + grp_msb_idx[1];
+                5'b00001: pack_msb_idx = grp_msb_idx[0];
+                default:  pack_msb_idx = '0;
+            endcase
         end
     endfunction
 
     function automatic logic [PACK_SIG_W-1:0] pack_sig24_from_abs(
         input logic [SUM_W-1:0] abs_sum_i,
-        input integer           msb_idx_i
+        input logic [PACK_MSB_IDX_W-1:0] msb_idx_i
     );
         integer sig_idx;
         integer sum_idx;
@@ -719,11 +776,16 @@ module fp4_dot_prod (
     end
 
     logic signed [SUM_W-1:0] sum_acc;
+    logic signed [SUM_W-1:0] sum_term_s3_tmp [0:SUM_TERM_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l0_s3_tmp [0:3];
+    logic signed [SUM_W-1:0] sum_csa_l1_s3_tmp [0:2];
+    logic signed [SUM_W-1:0] sum_csa_l2_s3_tmp [0:1];
     logic [SUM_W-1:0]        sum_abs_s3_tmp;
     logic [PACK_MSB_IDX_W-1:0] pack_msb_idx_s3_tmp;
-    integer                  pack_msb_idx_int_s3_tmp;
-    integer                  pack_base_exp_int_s3_tmp;
-    integer                  pack_unbiased_exp_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_base_exp_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_msb_idx_ext_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_unbiased_exp_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_biased_exp_s3_tmp;
 
     always_comb begin
         s3_d = '0;
@@ -732,16 +794,36 @@ module fp4_dot_prod (
         s3_d.base_exp       = s2_q.emax - ALIGN_FRAC_EXP;
         sum_abs_s3_tmp      = '0;
         pack_msb_idx_s3_tmp = '0;
-        pack_msb_idx_int_s3_tmp = 0;
-        pack_base_exp_int_s3_tmp = 0;
-        pack_unbiased_exp_s3_tmp = 0;
+        pack_base_exp_s3_tmp = '0;
+        pack_msb_idx_ext_s3_tmp = '0;
+        pack_unbiased_exp_s3_tmp = '0;
+        pack_biased_exp_s3_tmp = '0;
 
-        sum_acc = $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}}, s2_q.c_aligned});
+        sum_term_s3_tmp[0] =
+            $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}},
+                     s2_q.c_aligned});
         for (g4 = 0; g4 < NUM_BLOCKS; g4 = g4 + 1) begin
-            sum_acc = sum_acc
-                    + $signed({{(SUM_W-ALIGN_TERM_W){s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
-                               s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W +: ALIGN_TERM_W]});
+            sum_term_s3_tmp[g4+1] =
+                $signed({{(SUM_W-ALIGN_TERM_W){s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
+                         s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W +: ALIGN_TERM_W]});
         end
+        sum_csa_l0_s3_tmp[0] = csa_sum3(sum_term_s3_tmp[0], sum_term_s3_tmp[1],
+                                        sum_term_s3_tmp[2]);
+        sum_csa_l0_s3_tmp[1] = csa_carry3(sum_term_s3_tmp[0], sum_term_s3_tmp[1],
+                                          sum_term_s3_tmp[2]);
+        sum_csa_l0_s3_tmp[2] = sum_term_s3_tmp[3];
+        sum_csa_l0_s3_tmp[3] = sum_term_s3_tmp[4];
+        sum_csa_l1_s3_tmp[0] = csa_sum3(sum_csa_l0_s3_tmp[0], sum_csa_l0_s3_tmp[1],
+                                        sum_csa_l0_s3_tmp[2]);
+        sum_csa_l1_s3_tmp[1] = csa_carry3(sum_csa_l0_s3_tmp[0], sum_csa_l0_s3_tmp[1],
+                                          sum_csa_l0_s3_tmp[2]);
+        sum_csa_l1_s3_tmp[2] = sum_csa_l0_s3_tmp[3];
+        sum_csa_l2_s3_tmp[0] = csa_sum3(sum_csa_l1_s3_tmp[0], sum_csa_l1_s3_tmp[1],
+                                        sum_csa_l1_s3_tmp[2]);
+        sum_csa_l2_s3_tmp[1] = csa_carry3(sum_csa_l1_s3_tmp[0], sum_csa_l1_s3_tmp[1],
+                                          sum_csa_l1_s3_tmp[2]);
+        sum_acc = sum_csa_l2_s3_tmp[0] + sum_csa_l2_s3_tmp[1];
+
         s3_d.sum_nonzero = (sum_acc != '0);
         s3_d.sum_sign    = sum_acc[SUM_W-1];
         if (sum_acc[SUM_W-1]) begin
@@ -752,20 +834,22 @@ module fp4_dot_prod (
         s3_d.sum_abs = sum_abs_s3_tmp;
 
         if (sum_acc != '0) begin
-            pack_msb_idx_int_s3_tmp   = pack_msb_idx(sum_abs_s3_tmp);
-            pack_msb_idx_s3_tmp       = pack_msb_idx_int_s3_tmp;
-            pack_base_exp_int_s3_tmp  = $signed({{(32-C_EXP_W){s3_d.base_exp[C_EXP_W-1]}}, s3_d.base_exp});
-            pack_unbiased_exp_s3_tmp  = pack_base_exp_int_s3_tmp + pack_msb_idx_int_s3_tmp;
+            pack_msb_idx_s3_tmp      = pack_msb_idx(sum_abs_s3_tmp);
+            pack_base_exp_s3_tmp     = $signed({s3_d.base_exp[C_EXP_W-1], s3_d.base_exp});
+            pack_msb_idx_ext_s3_tmp  =
+                $signed({{(PACK_EXP_CLASS_W-PACK_MSB_IDX_W){1'b0}}, pack_msb_idx_s3_tmp});
+            pack_unbiased_exp_s3_tmp = pack_base_exp_s3_tmp + pack_msb_idx_ext_s3_tmp;
+            pack_biased_exp_s3_tmp   = pack_unbiased_exp_s3_tmp + FP32_EXP_BIAS_PACK;
             s3_d.pack_msb_idx         = pack_msb_idx_s3_tmp;
-            s3_d.pack_sub_lsb_idx     = FP32_EXP_MIN_SUB - pack_base_exp_int_s3_tmp;
+            s3_d.pack_sub_lsb_idx     = FP32_EXP_MIN_SUB_PACK - pack_base_exp_s3_tmp;
 
-            if (pack_unbiased_exp_s3_tmp > FP32_EXP_MAX) begin
+            if (pack_unbiased_exp_s3_tmp > FP32_EXP_MAX_PACK) begin
                 s3_d.pack_overflow  = 1'b1;
                 s3_d.pack_exp_field = 8'hff;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_NORMAL) begin
+            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_NORMAL_PACK) begin
                 s3_d.pack_normal    = 1'b1;
-                s3_d.pack_exp_field = pack_unbiased_exp_s3_tmp + FP32_EXP_BIAS;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_SUB) begin
+                s3_d.pack_exp_field = pack_biased_exp_s3_tmp[7:0];
+            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_SUB_PACK) begin
                 s3_d.pack_subnormal = 1'b1;
             end
         end

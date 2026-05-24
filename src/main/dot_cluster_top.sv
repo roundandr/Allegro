@@ -76,6 +76,10 @@ module dot_cluster_top #(
     localparam logic [7:0] STATUS_INT_OVERFLOW        = 8'h04;
 
     localparam int RSP_META_W = TAG_W + 8;
+    localparam int SPARSE_2TO4_GROUPS = 16;
+    localparam int SPARSE_4TO8_GROUPS = 16;
+    localparam int SPARSE_2TO4_SEL_W  = 2;
+    localparam int SPARSE_4TO8_SEL_W  = 3;
 
     function automatic logic [3:0] popcount4(input logic [3:0] value_i);
         integer bit_idx;
@@ -308,6 +312,31 @@ module dot_cluster_top #(
     logic [7:0]  outstanding_q;
     logic        share_group_allow;
 
+    logic        bf16_sel;
+    logic        fp16_dtype_sel;
+    logic        fp8_e4m3_sel;
+    logic        fp8_e5m2_sel;
+    logic        fp6_e3m2_sel;
+    logic        fp6_e2m3_sel;
+
+    logic [SPARSE_2TO4_GROUPS-1:0] sparse_2to4_valid_flat;
+    logic [SPARSE_4TO8_GROUPS-1:0] sparse_4to8_valid_flat;
+    logic [SPARSE_2TO4_GROUPS*SPARSE_2TO4_SEL_W-1:0] sparse_2to4_sel0_flat;
+    logic [SPARSE_2TO4_GROUPS*SPARSE_2TO4_SEL_W-1:0] sparse_2to4_sel1_flat;
+    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel0_flat;
+    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel1_flat;
+    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel2_flat;
+    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel3_flat;
+    logic meta_2to4_valid_4;
+    logic meta_2to4_valid_8;
+    logic meta_2to4_valid_16;
+    logic meta_4to8_valid_16;
+
+    logic [255:0] b_tf32_sparse;
+    logic [255:0] b_fp16_sparse;
+    logic [255:0] b_8b_lane_sparse;
+    logic [255:0] b_fp6_sparse;
+    logic [255:0] b_fp4_sparse;
     logic [255:0] b_tf32_core;
     logic [255:0] b_fp16_core;
     logic [255:0] b_mid_fp_core;
@@ -335,6 +364,10 @@ module dot_cluster_top #(
     logic int8_meta_in_rdy;
     logic fp4_meta_in_rdy;
 
+    logic mid_fp_req_rdy;
+    logic f4f6f8_req_rdy;
+    logic int8_req_rdy;
+    logic fp4_req_rdy;
     logic selected_core_rdy;
     logic core_req_fire;
     logic err_can_accept;
@@ -385,52 +418,167 @@ module dot_cluster_top #(
 
     logic [7:0] outstanding_nxt;
     logic core_rsp_fire;
+    logic [7:0] int8_status;
 
-    assign req_supported       = supported_dtype(req_dtype_i);
-    assign req_meta_valid      = (!req_sparse_en_i) || meta_valid_by_dtype(req_dtype_i, req_meta_i);
+    integer meta_grp;
+    integer meta_lane;
+    integer sparse_grp;
+    integer sparse_count_tmp;
+
+    always_comb begin
+        sparse_2to4_valid_flat = '0;
+        sparse_4to8_valid_flat = '0;
+        sparse_2to4_sel0_flat  = '0;
+        sparse_2to4_sel1_flat  = '0;
+        sparse_4to8_sel0_flat  = '0;
+        sparse_4to8_sel1_flat  = '0;
+        sparse_4to8_sel2_flat  = '0;
+        sparse_4to8_sel3_flat  = '0;
+
+        for (meta_grp = 0; meta_grp < SPARSE_2TO4_GROUPS; meta_grp = meta_grp + 1) begin
+            sparse_count_tmp = 0;
+            for (meta_lane = 0; meta_lane < 4; meta_lane = meta_lane + 1) begin
+                if (req_meta_i[meta_grp*4 + meta_lane]) begin
+                    if (sparse_count_tmp == 0) begin
+                        sparse_2to4_sel0_flat[meta_grp*SPARSE_2TO4_SEL_W +: SPARSE_2TO4_SEL_W] =
+                            meta_lane[SPARSE_2TO4_SEL_W-1:0];
+                    end else if (sparse_count_tmp == 1) begin
+                        sparse_2to4_sel1_flat[meta_grp*SPARSE_2TO4_SEL_W +: SPARSE_2TO4_SEL_W] =
+                            meta_lane[SPARSE_2TO4_SEL_W-1:0];
+                    end
+                    sparse_count_tmp = sparse_count_tmp + 1;
+                end
+            end
+            sparse_2to4_valid_flat[meta_grp] = (sparse_count_tmp == 2);
+        end
+
+        for (meta_grp = 0; meta_grp < SPARSE_4TO8_GROUPS; meta_grp = meta_grp + 1) begin
+            sparse_count_tmp = 0;
+            for (meta_lane = 0; meta_lane < 8; meta_lane = meta_lane + 1) begin
+                if (req_meta_i[meta_grp*8 + meta_lane]) begin
+                    if (sparse_count_tmp == 0) begin
+                        sparse_4to8_sel0_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
+                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
+                    end else if (sparse_count_tmp == 1) begin
+                        sparse_4to8_sel1_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
+                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
+                    end else if (sparse_count_tmp == 2) begin
+                        sparse_4to8_sel2_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
+                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
+                    end else if (sparse_count_tmp == 3) begin
+                        sparse_4to8_sel3_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
+                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
+                    end
+                    sparse_count_tmp = sparse_count_tmp + 1;
+                end
+            end
+            sparse_4to8_valid_flat[meta_grp] = (sparse_count_tmp == 4);
+        end
+    end
+
+    assign meta_2to4_valid_4  = &sparse_2to4_valid_flat[3:0];
+    assign meta_2to4_valid_8  = &sparse_2to4_valid_flat[7:0];
+    assign meta_2to4_valid_16 = &sparse_2to4_valid_flat[15:0];
+    assign meta_4to8_valid_16 = &sparse_4to8_valid_flat[15:0];
+
+    assign tf32_sel       = (req_dtype_i == DTYPE_TF32);
+    assign bf16_sel       = (req_dtype_i == DTYPE_BF16);
+    assign fp16_dtype_sel = (req_dtype_i == DTYPE_FP16);
+    assign fp8_e4m3_sel   = (req_dtype_i == DTYPE_FP8_E4M3);
+    assign fp8_e5m2_sel   = (req_dtype_i == DTYPE_FP8_E5M2);
+    assign int8_sel       = (req_dtype_i == DTYPE_INT8);
+    assign fp4_sel        = (req_dtype_i == DTYPE_FP4);
+    assign fp6_e3m2_sel   = (req_dtype_i == DTYPE_FP6_E3M2);
+    assign fp6_e2m3_sel   = (req_dtype_i == DTYPE_FP6_E2M3);
+    assign fp16_sel       = bf16_sel || fp16_dtype_sel;
+    assign mid_fp_sel     = tf32_sel || fp16_sel;
+    assign fp6_sel        = fp6_e3m2_sel || fp6_e2m3_sel;
+    assign f4f6f8_sel     = fp8_e4m3_sel || fp8_e5m2_sel || fp6_sel;
+
+    assign req_supported  = mid_fp_sel || f4f6f8_sel || int8_sel || fp4_sel;
+    assign req_meta_valid = (!req_sparse_en_i) ||
+                            (tf32_sel       && meta_2to4_valid_4)  ||
+                            ((bf16_sel || fp16_dtype_sel) && meta_2to4_valid_8) ||
+                            ((fp8_e4m3_sel || fp8_e5m2_sel || fp6_sel || int8_sel) &&
+                             meta_2to4_valid_16) ||
+                            (fp4_sel && meta_4to8_valid_16);
     assign invalid_sparse_meta = req_sparse_en_i && req_supported && !req_meta_valid;
     assign unsupported_dtype   = !req_supported;
     assign err_path            = unsupported_dtype || invalid_sparse_meta;
-    assign req_share_group     = dtype_share_group(req_dtype_i);
+    assign req_share_group     = mid_fp_sel  ? SHARE_GROUP_MIDFP :
+                                 f4f6f8_sel  ? SHARE_GROUP_F4F6F8 :
+                                 int8_sel    ? SHARE_GROUP_INT8 :
+                                 fp4_sel     ? SHARE_GROUP_FP4 :
+                                               SHARE_GROUP_NONE;
 
-    assign b_tf32_core     = req_sparse_en_i ? select_b_2to4_32(req_b_packed_i, req_meta_i) : req_b_packed_i[255:0];
-    assign b_fp16_core     = req_sparse_en_i ? select_b_2to4_16(req_b_packed_i, req_meta_i) : req_b_packed_i[255:0];
+    always_comb begin
+        b_tf32_sparse    = '0;
+        b_fp16_sparse    = '0;
+        b_8b_lane_sparse = '0;
+        b_fp6_sparse     = '0;
+        b_fp4_sparse     = '0;
+
+        for (sparse_grp = 0; sparse_grp < 4; sparse_grp = sparse_grp + 1) begin
+            b_tf32_sparse[(sparse_grp*2)*32 +: 32] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*32 +: 32];
+            b_tf32_sparse[(sparse_grp*2+1)*32 +: 32] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*32 +: 32];
+        end
+
+        for (sparse_grp = 0; sparse_grp < 8; sparse_grp = sparse_grp + 1) begin
+            b_fp16_sparse[(sparse_grp*2)*16 +: 16] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*16 +: 16];
+            b_fp16_sparse[(sparse_grp*2+1)*16 +: 16] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*16 +: 16];
+        end
+
+        for (sparse_grp = 0; sparse_grp < 16; sparse_grp = sparse_grp + 1) begin
+            b_8b_lane_sparse[(sparse_grp*2)*8 +: 8] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*8 +: 8];
+            b_8b_lane_sparse[(sparse_grp*2+1)*8 +: 8] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*8 +: 8];
+
+            b_fp6_sparse[(sparse_grp*2)*6 +: 6] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*6 +: 6];
+            b_fp6_sparse[(sparse_grp*2+1)*6 +: 6] =
+                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*6 +: 6];
+
+            b_fp4_sparse[(sparse_grp*4)*4 +: 4] =
+                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel0_flat[sparse_grp*3 +: 3])*4 +: 4];
+            b_fp4_sparse[(sparse_grp*4+1)*4 +: 4] =
+                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel1_flat[sparse_grp*3 +: 3])*4 +: 4];
+            b_fp4_sparse[(sparse_grp*4+2)*4 +: 4] =
+                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel2_flat[sparse_grp*3 +: 3])*4 +: 4];
+            b_fp4_sparse[(sparse_grp*4+3)*4 +: 4] =
+                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel3_flat[sparse_grp*3 +: 3])*4 +: 4];
+        end
+    end
+
+    assign b_tf32_core     = req_sparse_en_i ? b_tf32_sparse    : req_b_packed_i[255:0];
+    assign b_fp16_core     = req_sparse_en_i ? b_fp16_sparse    : req_b_packed_i[255:0];
     assign b_mid_fp_core   = tf32_sel ? b_tf32_core : b_fp16_core;
-    assign b_8b_lane_core  = req_sparse_en_i ? select_b_2to4_8(req_b_packed_i, req_meta_i)  : req_b_packed_i[255:0];
-    assign b_fp6_core      = req_sparse_en_i ? select_b_2to4_6(req_b_packed_i, req_meta_i)  : req_b_packed_i[255:0];
-    assign b_fp4_core      = req_sparse_en_i ? select_b_4to8_4(req_b_packed_i, req_meta_i)  : req_b_packed_i[255:0];
+    assign b_8b_lane_core  = req_sparse_en_i ? b_8b_lane_sparse : req_b_packed_i[255:0];
+    assign b_fp6_core      = req_sparse_en_i ? b_fp6_sparse     : req_b_packed_i[255:0];
+    assign b_fp4_core      = req_sparse_en_i ? b_fp4_sparse     : req_b_packed_i[255:0];
 
-    assign tf32_sel = (req_dtype_i == DTYPE_TF32);
-    assign fp16_sel = (req_dtype_i == DTYPE_FP16) || (req_dtype_i == DTYPE_BF16);
-    assign mid_fp_sel = tf32_sel || fp16_sel;
-    assign fp6_sel   = (req_dtype_i == DTYPE_FP6_E3M2) || (req_dtype_i == DTYPE_FP6_E2M3);
-    assign f4f6f8_sel  = (req_dtype_i == DTYPE_FP8_E4M3) || (req_dtype_i == DTYPE_FP8_E5M2) ||
-                       fp6_sel;
-    assign int8_sel = (req_dtype_i == DTYPE_INT8);
-    assign fp4_sel  = (req_dtype_i == DTYPE_FP4);
     assign mid_fp_mode = tf32_sel ? MID_FP_MODE_TF32 :
-                         ((req_dtype_i == DTYPE_BF16) ? MID_FP_MODE_BF16 :
-                                                         MID_FP_MODE_FP16);
-    assign f4f6f8_type = (req_dtype_i == DTYPE_FP8_E5M2) ? F4F6F8_TYPE_E5M2 :
-                       (req_dtype_i == DTYPE_FP6_E2M3) ? F4F6F8_TYPE_E2M3 :
-                       (req_dtype_i == DTYPE_FP6_E3M2) ? F4F6F8_TYPE_E3M2 :
-                                                         F4F6F8_TYPE_E4M3;
+                         (bf16_sel ? MID_FP_MODE_BF16 : MID_FP_MODE_FP16);
+    assign f4f6f8_type = fp8_e5m2_sel ? F4F6F8_TYPE_E5M2 :
+                         fp6_e2m3_sel ? F4F6F8_TYPE_E2M3 :
+                         fp6_e3m2_sel ? F4F6F8_TYPE_E3M2 :
+                                        F4F6F8_TYPE_E4M3;
 
     assign share_group_allow = (outstanding_q == 8'd0) ||
                                (req_share_group == active_share_group_q);
 
-    always_comb begin
-        selected_core_rdy = 1'b0;
-        if (mid_fp_sel) begin
-            selected_core_rdy = mid_fp_in_rdy && mid_fp_meta_in_rdy;
-        end else if (f4f6f8_sel) begin
-            selected_core_rdy = f4f6f8_in_rdy && f4f6f8_meta_in_rdy;
-        end else if (int8_sel) begin
-            selected_core_rdy = int8_in_rdy && int8_meta_in_rdy;
-        end else if (fp4_sel) begin
-            selected_core_rdy = fp4_in_rdy && fp4_meta_in_rdy;
-        end
-    end
+    assign mid_fp_req_rdy  = mid_fp_in_rdy  && mid_fp_meta_in_rdy;
+    assign f4f6f8_req_rdy  = f4f6f8_in_rdy  && f4f6f8_meta_in_rdy;
+    assign int8_req_rdy    = int8_in_rdy    && int8_meta_in_rdy;
+    assign fp4_req_rdy     = fp4_in_rdy     && fp4_meta_in_rdy;
+    assign selected_core_rdy = (mid_fp_sel  && mid_fp_req_rdy) ||
+                               (f4f6f8_sel  && f4f6f8_req_rdy) ||
+                               (int8_sel    && int8_req_rdy) ||
+                               (fp4_sel     && fp4_req_rdy);
 
     assign err_can_accept = !err_vld_q || err_out_fire;
     assign in_rdy_o = err_path ? err_can_accept : (share_group_allow && selected_core_rdy);
@@ -602,33 +750,26 @@ module dot_cluster_top #(
 
     assign out_vld_o = err_vld_q || mid_fp_out_vld || f4f6f8_out_vld ||
                        int8_out_vld || fp4_out_vld;
+    assign int8_status = int8_meta[7:0] | ({8{int8_overflow}} & STATUS_INT_OVERFLOW);
 
     always_comb begin
-        out_d_o      = 32'h0000_0000;
-        out_status_o = STATUS_OK;
-        out_tag_o    = '0;
+        out_d_o = ({32{arb_err_sel}}    & err_d_q) |
+                  ({32{arb_mid_fp_sel}} & mid_fp_d) |
+                  ({32{arb_f4f6f8_sel}} & f4f6f8_d) |
+                  ({32{arb_int8_sel}}   & int8_d) |
+                  ({32{arb_fp4_sel}}    & fp4_d);
 
-        if (arb_err_sel) begin
-            out_d_o      = err_d_q;
-            out_status_o = err_status_q;
-            out_tag_o    = err_tag_q;
-        end else if (arb_mid_fp_sel) begin
-            out_d_o      = mid_fp_d;
-            out_status_o = mid_fp_meta[7:0];
-            out_tag_o    = mid_fp_meta[RSP_META_W-1:8];
-        end else if (arb_f4f6f8_sel) begin
-            out_d_o      = f4f6f8_d;
-            out_status_o = f4f6f8_meta[7:0];
-            out_tag_o    = f4f6f8_meta[RSP_META_W-1:8];
-        end else if (arb_int8_sel) begin
-            out_d_o      = int8_d;
-            out_status_o = int8_meta[7:0] | (int8_overflow ? STATUS_INT_OVERFLOW : STATUS_OK);
-            out_tag_o    = int8_meta[RSP_META_W-1:8];
-        end else if (arb_fp4_sel) begin
-            out_d_o      = fp4_d;
-            out_status_o = fp4_meta[7:0];
-            out_tag_o    = fp4_meta[RSP_META_W-1:8];
-        end
+        out_status_o = ({8{arb_err_sel}}    & err_status_q) |
+                       ({8{arb_mid_fp_sel}} & mid_fp_meta[7:0]) |
+                       ({8{arb_f4f6f8_sel}} & f4f6f8_meta[7:0]) |
+                       ({8{arb_int8_sel}}   & int8_status) |
+                       ({8{arb_fp4_sel}}    & fp4_meta[7:0]);
+
+        out_tag_o = ({TAG_W{arb_err_sel}}    & err_tag_q) |
+                    ({TAG_W{arb_mid_fp_sel}} & mid_fp_meta[RSP_META_W-1:8]) |
+                    ({TAG_W{arb_f4f6f8_sel}} & f4f6f8_meta[RSP_META_W-1:8]) |
+                    ({TAG_W{arb_int8_sel}}   & int8_meta[RSP_META_W-1:8]) |
+                    ({TAG_W{arb_fp4_sel}}    & fp4_meta[RSP_META_W-1:8]);
     end
 
     assign core_rsp_fire = (mid_fp_out_vld && mid_fp_out_rdy) ||

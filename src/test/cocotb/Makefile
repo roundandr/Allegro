@@ -30,6 +30,14 @@ ifeq ($(SIM),verilator)
 COMPILE_ARGS += -Wno-fatal
 COMPILE_ARGS += -CFLAGS -isystem/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
 endif
+else ifeq ($(TOPLEVEL),dot_cluster_top)
+VERILOG_SOURCES ?= $(PWD)/../../main/tcgen05_mma_pkg.sv \
+                   $(PWD)/../../main/pipeline_reg.sv \
+                   $(PWD)/../../main/mid_fp_dot_prod.sv \
+                   $(PWD)/../../main/f4f6f8_dot_prod.sv \
+                   $(PWD)/../../main/int8_dot_prod.sv \
+                   $(PWD)/../../main/fp4_dot_prod.sv \
+                   $(PWD)/../../main/dot_cluster_top.sv
 else
 VERILOG_SOURCES ?= $(PWD)/../../main/pipeline_reg.sv $(PWD)/../../main/fp4_dot_prod.sv
 endif

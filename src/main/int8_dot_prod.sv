@@ -34,7 +34,6 @@ module int8_dot_prod (
     localparam int PSUM_W    = 22;
     localparam int SUM_W     = 33;
     localparam int S1_GROUPS = 8;
-    localparam int S1_GROUP_ELEMS = 4;
 
     localparam logic signed [SUM_W-1:0] INT32_MAX_EXT = 33'sh0_7fff_ffff;
     localparam logic signed [SUM_W-1:0] INT32_MIN_EXT = 33'sh1_8000_0000;
@@ -126,6 +125,55 @@ module int8_dot_prod (
         end
     endfunction
 
+    function automatic logic signed [PSUM_W-1:0] csa_sum3_psum(
+        input logic signed [PSUM_W-1:0] a_i,
+        input logic signed [PSUM_W-1:0] b_i,
+        input logic signed [PSUM_W-1:0] z_i
+    );
+        begin
+            csa_sum3_psum = $signed(a_i ^ b_i ^ z_i);
+        end
+    endfunction
+
+    function automatic logic signed [PSUM_W-1:0] csa_carry3_psum(
+        input logic signed [PSUM_W-1:0] a_i,
+        input logic signed [PSUM_W-1:0] b_i,
+        input logic signed [PSUM_W-1:0] z_i
+    );
+        logic [PSUM_W-1:0] carry_bits;
+        begin
+            carry_bits = (a_i & b_i) | (a_i & z_i) | (b_i & z_i);
+            csa_carry3_psum = $signed({carry_bits[PSUM_W-2:0], 1'b0});
+        end
+    endfunction
+
+    function automatic logic signed [PSUM_W-1:0] partial4_sum(
+        input logic signed [PROD_W-1:0] prod0_i,
+        input logic signed [PROD_W-1:0] prod1_i,
+        input logic signed [PROD_W-1:0] prod2_i,
+        input logic signed [PROD_W-1:0] prod3_i
+    );
+        logic signed [PSUM_W-1:0] prod0_ext;
+        logic signed [PSUM_W-1:0] prod1_ext;
+        logic signed [PSUM_W-1:0] prod2_ext;
+        logic signed [PSUM_W-1:0] prod3_ext;
+        logic signed [PSUM_W-1:0] csa_l0_sum;
+        logic signed [PSUM_W-1:0] csa_l0_carry;
+        logic signed [PSUM_W-1:0] csa_l1_sum;
+        logic signed [PSUM_W-1:0] csa_l1_carry;
+        begin
+            prod0_ext = $signed({{(PSUM_W-PROD_W){prod0_i[PROD_W-1]}}, prod0_i});
+            prod1_ext = $signed({{(PSUM_W-PROD_W){prod1_i[PROD_W-1]}}, prod1_i});
+            prod2_ext = $signed({{(PSUM_W-PROD_W){prod2_i[PROD_W-1]}}, prod2_i});
+            prod3_ext = $signed({{(PSUM_W-PROD_W){prod3_i[PROD_W-1]}}, prod3_i});
+            csa_l0_sum   = csa_sum3_psum(prod0_ext, prod1_ext, prod2_ext);
+            csa_l0_carry = csa_carry3_psum(prod0_ext, prod1_ext, prod2_ext);
+            csa_l1_sum   = csa_sum3_psum(csa_l0_sum, csa_l0_carry, prod3_ext);
+            csa_l1_carry = csa_carry3_psum(csa_l0_sum, csa_l0_carry, prod3_ext);
+            partial4_sum = csa_l1_sum + csa_l1_carry;
+        end
+    endfunction
+
     integer idx0;
 
     always_comb begin
@@ -145,45 +193,116 @@ module int8_dot_prod (
         s0_d.sat_en    = sat_en_i;
     end
 
-    integer group1;
-    integer elem1;
-    integer lane1;
-    logic signed [PROD_W-1:0] prod_s1_tmp;
-    logic signed [PSUM_W-1:0] partial_sum_s1_tmp;
-
     always_comb begin
         s1_d = '0;
         s1_partial_flat_tmp = '0;
 
-        for (group1 = 0; group1 < S1_GROUPS; group1 = group1 + 1) begin
-            partial_sum_s1_tmp = '0;
-            for (elem1 = 0; elem1 < S1_GROUP_ELEMS; elem1 = elem1 + 1) begin
-                lane1 = group1*S1_GROUP_ELEMS + elem1;
-                prod_s1_tmp = $signed(s0_q.prod_flat[lane1*PROD_W +: PROD_W]);
-                partial_sum_s1_tmp = partial_sum_s1_tmp
-                                    + $signed({{(PSUM_W-PROD_W){prod_s1_tmp[PROD_W-1]}},
-                                               prod_s1_tmp});
-            end
-            s1_partial_flat_tmp[group1*PSUM_W +: PSUM_W] = partial_sum_s1_tmp;
-        end
+        s1_partial_flat_tmp[0*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[0*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[1*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[2*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[3*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[1*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[4*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[5*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[6*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[7*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[2*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[8*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[9*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[10*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[11*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[3*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[12*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[13*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[14*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[15*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[4*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[16*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[17*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[18*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[19*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[5*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[20*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[21*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[22*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[23*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[6*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[24*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[25*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[26*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[27*PROD_W +: PROD_W]));
+        s1_partial_flat_tmp[7*PSUM_W +: PSUM_W] =
+            partial4_sum($signed(s0_q.prod_flat[28*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[29*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[30*PROD_W +: PROD_W]),
+                         $signed(s0_q.prod_flat[31*PROD_W +: PROD_W]));
 
         s1_d.partial_flat = s1_partial_flat_tmp;
         s1_d.c            = s0_q.c;
         s1_d.sat_en       = s0_q.sat_en;
     end
 
-    integer group2;
-    logic signed [PSUM_W-1:0] partial_s2_tmp;
+    logic signed [PSUM_W-1:0] partial_s2_tmp0;
+    logic signed [PSUM_W-1:0] partial_s2_tmp1;
+    logic signed [PSUM_W-1:0] partial_s2_tmp2;
+    logic signed [PSUM_W-1:0] partial_s2_tmp3;
+    logic signed [PSUM_W-1:0] partial_s2_tmp4;
+    logic signed [PSUM_W-1:0] partial_s2_tmp5;
+    logic signed [PSUM_W-1:0] partial_s2_tmp6;
+    logic signed [PSUM_W-1:0] partial_s2_tmp7;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l0_tmp0;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l0_tmp1;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l0_tmp2;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l0_tmp3;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l0_tmp4;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l0_tmp5;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l1_tmp0;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l1_tmp1;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l1_tmp2;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l1_tmp3;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l2_tmp0;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l2_tmp1;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l2_tmp2;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l3_tmp0;
+    logic signed [PSUM_W-1:0] psum_s2_csa_l3_tmp1;
     logic signed [PSUM_W-1:0] psum_s2_tmp;
 
     always_comb begin
         s2_d = '0;
-        psum_s2_tmp = '0;
 
-        for (group2 = 0; group2 < S1_GROUPS; group2 = group2 + 1) begin
-            partial_s2_tmp = $signed(s1_q.partial_flat[group2*PSUM_W +: PSUM_W]);
-            psum_s2_tmp = psum_s2_tmp + partial_s2_tmp;
-        end
+        partial_s2_tmp0 = $signed(s1_q.partial_flat[0*PSUM_W +: PSUM_W]);
+        partial_s2_tmp1 = $signed(s1_q.partial_flat[1*PSUM_W +: PSUM_W]);
+        partial_s2_tmp2 = $signed(s1_q.partial_flat[2*PSUM_W +: PSUM_W]);
+        partial_s2_tmp3 = $signed(s1_q.partial_flat[3*PSUM_W +: PSUM_W]);
+        partial_s2_tmp4 = $signed(s1_q.partial_flat[4*PSUM_W +: PSUM_W]);
+        partial_s2_tmp5 = $signed(s1_q.partial_flat[5*PSUM_W +: PSUM_W]);
+        partial_s2_tmp6 = $signed(s1_q.partial_flat[6*PSUM_W +: PSUM_W]);
+        partial_s2_tmp7 = $signed(s1_q.partial_flat[7*PSUM_W +: PSUM_W]);
+        psum_s2_csa_l0_tmp0 = csa_sum3_psum(partial_s2_tmp0, partial_s2_tmp1, partial_s2_tmp2);
+        psum_s2_csa_l0_tmp1 = csa_carry3_psum(partial_s2_tmp0, partial_s2_tmp1, partial_s2_tmp2);
+        psum_s2_csa_l0_tmp2 = csa_sum3_psum(partial_s2_tmp3, partial_s2_tmp4, partial_s2_tmp5);
+        psum_s2_csa_l0_tmp3 = csa_carry3_psum(partial_s2_tmp3, partial_s2_tmp4, partial_s2_tmp5);
+        psum_s2_csa_l0_tmp4 = partial_s2_tmp6;
+        psum_s2_csa_l0_tmp5 = partial_s2_tmp7;
+        psum_s2_csa_l1_tmp0 =
+            csa_sum3_psum(psum_s2_csa_l0_tmp0, psum_s2_csa_l0_tmp1, psum_s2_csa_l0_tmp2);
+        psum_s2_csa_l1_tmp1 =
+            csa_carry3_psum(psum_s2_csa_l0_tmp0, psum_s2_csa_l0_tmp1, psum_s2_csa_l0_tmp2);
+        psum_s2_csa_l1_tmp2 =
+            csa_sum3_psum(psum_s2_csa_l0_tmp3, psum_s2_csa_l0_tmp4, psum_s2_csa_l0_tmp5);
+        psum_s2_csa_l1_tmp3 =
+            csa_carry3_psum(psum_s2_csa_l0_tmp3, psum_s2_csa_l0_tmp4, psum_s2_csa_l0_tmp5);
+        psum_s2_csa_l2_tmp0 =
+            csa_sum3_psum(psum_s2_csa_l1_tmp0, psum_s2_csa_l1_tmp1, psum_s2_csa_l1_tmp2);
+        psum_s2_csa_l2_tmp1 =
+            csa_carry3_psum(psum_s2_csa_l1_tmp0, psum_s2_csa_l1_tmp1, psum_s2_csa_l1_tmp2);
+        psum_s2_csa_l2_tmp2 = psum_s2_csa_l1_tmp3;
+        psum_s2_csa_l3_tmp0 =
+            csa_sum3_psum(psum_s2_csa_l2_tmp0, psum_s2_csa_l2_tmp1, psum_s2_csa_l2_tmp2);
+        psum_s2_csa_l3_tmp1 =
+            csa_carry3_psum(psum_s2_csa_l2_tmp0, psum_s2_csa_l2_tmp1, psum_s2_csa_l2_tmp2);
+        psum_s2_tmp = psum_s2_csa_l3_tmp0 + psum_s2_csa_l3_tmp1;
 
         s2_d.psum   = psum_s2_tmp;
         s2_d.c      = s1_q.c;

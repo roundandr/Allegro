@@ -34,6 +34,15 @@ module f4f6f8_dot_prod (
     localparam int FP6_W            = 6;
     localparam int FP4_W            = 4;
     localparam int NUM_ELEMS        = 32;
+    localparam int SUM_TERM_N       = NUM_ELEMS + 1;
+    localparam int SUM_CSA_L0_N     = ((SUM_TERM_N / 3) * 2) + (SUM_TERM_N % 3);
+    localparam int SUM_CSA_L1_N     = ((SUM_CSA_L0_N / 3) * 2) + (SUM_CSA_L0_N % 3);
+    localparam int SUM_CSA_L2_N     = ((SUM_CSA_L1_N / 3) * 2) + (SUM_CSA_L1_N % 3);
+    localparam int SUM_CSA_L3_N     = ((SUM_CSA_L2_N / 3) * 2) + (SUM_CSA_L2_N % 3);
+    localparam int SUM_CSA_L4_N     = ((SUM_CSA_L3_N / 3) * 2) + (SUM_CSA_L3_N % 3);
+    localparam int SUM_CSA_L5_N     = ((SUM_CSA_L4_N / 3) * 2) + (SUM_CSA_L4_N % 3);
+    localparam int SUM_CSA_L6_N     = ((SUM_CSA_L5_N / 3) * 2) + (SUM_CSA_L5_N % 3);
+    localparam int SUM_CSA_L7_N     = ((SUM_CSA_L6_N / 3) * 2) + (SUM_CSA_L6_N % 3);
     localparam int FP8_SIG_W        = 4;
     localparam int PROD_SIG_W       = 8;
     localparam int C_SIG_W          = 24;
@@ -41,11 +50,13 @@ module f4f6f8_dot_prod (
     localparam int EXP_W            = 10;
     localparam int ALIGN_FRAC_BITS  = 25;
     localparam int ALIGN_TERM_W     = 28;
+    localparam int ALIGN_SHIFT_W    = $clog2(ALIGN_TERM_W);
     localparam int SUM_W            = 35;
     localparam int PACK_FRAC_W      = 23;
     localparam int PACK_MSB_IDX_W   = $clog2(SUM_W);
     localparam int PACK_LOD_GRP_W   = 7;
     localparam int PACK_LOD_GRP_N   = (SUM_W + PACK_LOD_GRP_W - 1) / PACK_LOD_GRP_W;
+    localparam int PACK_EXP_CLASS_W = EXP_W + 1;
     localparam int FP8_SIG_FRAC_BITS = 3;
     localparam int PROD_SIG_FRAC_BITS = 6;
     localparam int C_SIG_FRAC_BITS    = 23;
@@ -55,6 +66,10 @@ module f4f6f8_dot_prod (
     localparam int FP32_EXP_MAX        = 127;
     localparam int FP32_EXP_MIN_NORMAL = -126;
     localparam int FP32_EXP_MIN_SUB    = -149;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_BIAS_PACK       = FP32_EXP_BIAS;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MAX_PACK        = FP32_EXP_MAX;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MIN_NORMAL_PACK = FP32_EXP_MIN_NORMAL;
+    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MIN_SUB_PACK    = FP32_EXP_MIN_SUB;
     localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = 10'sd25;
     localparam logic signed [EXP_W-1:0] MX_SCALE_BIAS_EXP = 10'sd127;
     localparam logic signed [EXP_W-1:0] FP6_E2M3_BIAS_EXP = 10'sd1;
@@ -408,6 +423,37 @@ module f4f6f8_dot_prod (
         end
     endfunction
 
+    function automatic logic signed [EXP_W-1:0] emax_max_exp(
+        input logic signed [EXP_W-1:0] a_exp_i,
+        input logic signed [EXP_W-1:0] b_exp_i
+    );
+        begin
+            emax_max_exp = (b_exp_i > a_exp_i) ? b_exp_i : a_exp_i;
+        end
+    endfunction
+
+    function automatic logic signed [SUM_W-1:0] csa_sum3(
+        input logic signed [SUM_W-1:0] a_i,
+        input logic signed [SUM_W-1:0] b_i,
+        input logic signed [SUM_W-1:0] z_i
+    );
+        begin
+            csa_sum3 = $signed(a_i ^ b_i ^ z_i);
+        end
+    endfunction
+
+    function automatic logic signed [SUM_W-1:0] csa_carry3(
+        input logic signed [SUM_W-1:0] a_i,
+        input logic signed [SUM_W-1:0] b_i,
+        input logic signed [SUM_W-1:0] z_i
+    );
+        logic [SUM_W-1:0] carry_bits;
+        begin
+            carry_bits = (a_i & b_i) | (a_i & z_i) | (b_i & z_i);
+            csa_carry3 = $signed({carry_bits[SUM_W-2:0], 1'b0});
+        end
+    endfunction
+
     function automatic logic signed [ALIGN_TERM_W-1:0] align_fixed_rz(
         input logic                      term_sign_i,
         input logic [ALIGN_TERM_W-2:0]   term_mag_i,
@@ -417,8 +463,14 @@ module f4f6f8_dot_prod (
         logic [ALIGN_TERM_W-2:0] term_mag_shift;
         logic signed [ALIGN_TERM_W-1:0] aligned_val;
         logic signed [EXP_W:0] align_shift;
-        integer shift_i;
+        logic [ALIGN_SHIFT_W-1:0] shift_amt;
         begin
+            align_fixed_rz = '0;
+            term_mag_shift = '0;
+            aligned_val    = '0;
+            align_shift    = '0;
+            shift_amt      = '0;
+
             if (term_mag_i == '0) begin
                 align_fixed_rz = '0;
             end else begin
@@ -429,8 +481,8 @@ module f4f6f8_dot_prod (
                 end else if (align_shift >= ALIGN_TERM_M1_EXP) begin
                     term_mag_shift = '0;
                 end else begin
-                    shift_i = int'(align_shift);
-                    term_mag_shift = term_mag_i >> shift_i;
+                    shift_amt = align_shift[ALIGN_SHIFT_W-1:0];
+                    term_mag_shift = term_mag_i >> shift_amt;
                 end
 
                 aligned_val = $signed({1'b0, term_mag_shift});
@@ -439,39 +491,62 @@ module f4f6f8_dot_prod (
         end
     endfunction
 
-    function automatic integer pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
+    function automatic logic [PACK_MSB_IDX_W-1:0] pack_lod_group_idx(
+        input logic [PACK_LOD_GRP_W-1:0] grp_bits_i
+    );
+        begin
+            casez (grp_bits_i)
+                7'b1??????: pack_lod_group_idx = PACK_MSB_IDX_W'(6);
+                7'b01?????: pack_lod_group_idx = PACK_MSB_IDX_W'(5);
+                7'b001????: pack_lod_group_idx = PACK_MSB_IDX_W'(4);
+                7'b0001???: pack_lod_group_idx = PACK_MSB_IDX_W'(3);
+                7'b00001??: pack_lod_group_idx = PACK_MSB_IDX_W'(2);
+                7'b000001?: pack_lod_group_idx = PACK_MSB_IDX_W'(1);
+                default:    pack_lod_group_idx = '0;
+            endcase
+        end
+    endfunction
+
+    function automatic logic [PACK_MSB_IDX_W-1:0] pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
         integer grp_idx;
         integer bit_idx;
         integer sum_idx;
-        integer grp_msb_idx;
-        logic   grp_vld;
+        logic [PACK_LOD_GRP_W-1:0]     grp_bits [0:PACK_LOD_GRP_N-1];
+        logic [PACK_LOD_GRP_N-1:0]     grp_vld;
+        logic [PACK_MSB_IDX_W-1:0]     grp_msb_idx [0:PACK_LOD_GRP_N-1];
         begin
             pack_msb_idx = 0;
 
             for (grp_idx = 0; grp_idx < PACK_LOD_GRP_N; grp_idx = grp_idx + 1) begin
-                grp_vld     = 1'b0;
-                grp_msb_idx = 0;
+                grp_bits[grp_idx]    = '0;
+                grp_vld[grp_idx]     = 1'b0;
+                grp_msb_idx[grp_idx] = '0;
 
                 for (bit_idx = 0; bit_idx < PACK_LOD_GRP_W; bit_idx = bit_idx + 1) begin
                     sum_idx = grp_idx * PACK_LOD_GRP_W + bit_idx;
                     if (sum_idx < SUM_W) begin
-                        if (abs_sum_i[sum_idx]) begin
-                            grp_vld     = 1'b1;
-                            grp_msb_idx = bit_idx;
-                        end
+                        grp_bits[grp_idx][bit_idx] = abs_sum_i[sum_idx];
                     end
                 end
 
-                if (grp_vld) begin
-                    pack_msb_idx = grp_idx * PACK_LOD_GRP_W + grp_msb_idx;
-                end
+                grp_vld[grp_idx]     = |grp_bits[grp_idx];
+                grp_msb_idx[grp_idx] = pack_lod_group_idx(grp_bits[grp_idx]);
             end
+
+            casez (grp_vld)
+                5'b1????: pack_msb_idx = PACK_MSB_IDX_W'(4*PACK_LOD_GRP_W) + grp_msb_idx[4];
+                5'b01???: pack_msb_idx = PACK_MSB_IDX_W'(3*PACK_LOD_GRP_W) + grp_msb_idx[3];
+                5'b001??: pack_msb_idx = PACK_MSB_IDX_W'(2*PACK_LOD_GRP_W) + grp_msb_idx[2];
+                5'b0001?: pack_msb_idx = PACK_MSB_IDX_W'(1*PACK_LOD_GRP_W) + grp_msb_idx[1];
+                5'b00001: pack_msb_idx = grp_msb_idx[0];
+                default:  pack_msb_idx = '0;
+            endcase
         end
     endfunction
 
     function automatic logic [PACK_FRAC_W-1:0] pack_normal_frac_from_abs(
         input logic [SUM_W-1:0] abs_sum_i,
-        input integer           msb_idx_i
+        input logic [PACK_MSB_IDX_W-1:0] msb_idx_i
     );
         integer frac_idx;
         integer sum_idx;
@@ -549,7 +624,25 @@ module f4f6f8_dot_prod (
     integer idx0;
     fp8_dec_t a_dec_tmp;
     fp8_dec_t b_dec_tmp;
+    fp8_dec_t a_dec_e4m3_tmp;
+    fp8_dec_t a_dec_e5m2_tmp;
+    fp8_dec_t a_dec_e2m3_tmp;
+    fp8_dec_t a_dec_e3m2_tmp;
+    fp8_dec_t a_dec_e2m1_tmp;
+    fp8_dec_t b_dec_e4m3_tmp;
+    fp8_dec_t b_dec_e5m2_tmp;
+    fp8_dec_t b_dec_e2m3_tmp;
+    fp8_dec_t b_dec_e3m2_tmp;
+    fp8_dec_t b_dec_e2m1_tmp;
     fp32_dec_t c_dec_tmp;
+    logic a_type_e5m2_s0_tmp;
+    logic a_type_e2m3_s0_tmp;
+    logic a_type_e3m2_s0_tmp;
+    logic a_type_e2m1_s0_tmp;
+    logic b_type_e5m2_s0_tmp;
+    logic b_type_e2m3_s0_tmp;
+    logic b_type_e3m2_s0_tmp;
+    logic b_type_e2m1_s0_tmp;
     logic any_nan_tmp;
     logic has_pos_inf_tmp;
     logic has_neg_inf_tmp;
@@ -585,6 +678,14 @@ module f4f6f8_dot_prod (
         s0_prod_zero_flat_tmp = '0;
 
         c_dec_tmp            = decode_fp32(c_i);
+        a_type_e5m2_s0_tmp   = (a_type_i == F4F6F8_TYPE_E5M2);
+        a_type_e2m3_s0_tmp   = (a_type_i == F4F6F8_TYPE_E2M3);
+        a_type_e3m2_s0_tmp   = (a_type_i == F4F6F8_TYPE_E3M2);
+        a_type_e2m1_s0_tmp   = (a_type_i == F4F6F8_TYPE_E2M1);
+        b_type_e5m2_s0_tmp   = (b_type_i == F4F6F8_TYPE_E5M2);
+        b_type_e2m3_s0_tmp   = (b_type_i == F4F6F8_TYPE_E2M3);
+        b_type_e3m2_s0_tmp   = (b_type_i == F4F6F8_TYPE_E3M2);
+        b_type_e2m1_s0_tmp   = (b_type_i == F4F6F8_TYPE_E2M1);
         mx_scale_nan_tmp     = mxfp8_en_i && ((a_mx_scale_i == 8'hff) || (b_mx_scale_i == 8'hff));
         mx_scale_exp_sum_tmp = mxfp8_en_i
                              ? (decode_e8m0_exp(a_mx_scale_i) + decode_e8m0_exp(b_mx_scale_i))
@@ -608,41 +709,40 @@ module f4f6f8_dot_prod (
         s0_d.c_mag = c_mag_tmp_s0;
 
         for (idx0 = 0; idx0 < NUM_ELEMS; idx0 = idx0 + 1) begin
-            case (a_type_i)
-                F4F6F8_TYPE_E5M2: begin
-                    a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], 1'b1);
-                end
-                F4F6F8_TYPE_E2M3: begin
-                    a_dec_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E2M3);
-                end
-                F4F6F8_TYPE_E3M2: begin
-                    a_dec_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E3M2);
-                end
-                F4F6F8_TYPE_E2M1: begin
-                    a_dec_tmp = decode_e2m1(a_vec_i[idx0*FP4_W +: FP4_W]);
-                end
-                default: begin
-                    a_dec_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], 1'b0);
-                end
-            endcase
+            a_dec_e4m3_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], 1'b0);
+            a_dec_e5m2_tmp = decode_fp8(a_vec_i[idx0*FP8_W +: FP8_W], 1'b1);
+            a_dec_e2m3_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E2M3);
+            a_dec_e3m2_tmp = decode_fp6(a_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E3M2);
+            a_dec_e2m1_tmp = decode_e2m1(a_vec_i[idx0*FP4_W +: FP4_W]);
+            b_dec_e4m3_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], 1'b0);
+            b_dec_e5m2_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], 1'b1);
+            b_dec_e2m3_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E2M3);
+            b_dec_e3m2_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E3M2);
+            b_dec_e2m1_tmp = decode_e2m1(b_vec_i[idx0*FP4_W +: FP4_W]);
 
-            case (b_type_i)
-                F4F6F8_TYPE_E5M2: begin
-                    b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], 1'b1);
-                end
-                F4F6F8_TYPE_E2M3: begin
-                    b_dec_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E2M3);
-                end
-                F4F6F8_TYPE_E3M2: begin
-                    b_dec_tmp = decode_fp6(b_vec_i[idx0*FP6_W +: FP6_W], FP6_FORMAT_E3M2);
-                end
-                F4F6F8_TYPE_E2M1: begin
-                    b_dec_tmp = decode_e2m1(b_vec_i[idx0*FP4_W +: FP4_W]);
-                end
-                default: begin
-                    b_dec_tmp = decode_fp8(b_vec_i[idx0*FP8_W +: FP8_W], 1'b0);
-                end
-            endcase
+            if (a_type_e5m2_s0_tmp) begin
+                a_dec_tmp = a_dec_e5m2_tmp;
+            end else if (a_type_e2m3_s0_tmp) begin
+                a_dec_tmp = a_dec_e2m3_tmp;
+            end else if (a_type_e3m2_s0_tmp) begin
+                a_dec_tmp = a_dec_e3m2_tmp;
+            end else if (a_type_e2m1_s0_tmp) begin
+                a_dec_tmp = a_dec_e2m1_tmp;
+            end else begin
+                a_dec_tmp = a_dec_e4m3_tmp;
+            end
+
+            if (b_type_e5m2_s0_tmp) begin
+                b_dec_tmp = b_dec_e5m2_tmp;
+            end else if (b_type_e2m3_s0_tmp) begin
+                b_dec_tmp = b_dec_e2m3_tmp;
+            end else if (b_type_e3m2_s0_tmp) begin
+                b_dec_tmp = b_dec_e3m2_tmp;
+            end else if (b_type_e2m1_s0_tmp) begin
+                b_dec_tmp = b_dec_e2m1_tmp;
+            end else begin
+                b_dec_tmp = b_dec_e4m3_tmp;
+            end
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
             lane_has_inf_tmp   = ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
@@ -687,57 +787,43 @@ module f4f6f8_dot_prod (
         emax_l0_exp_tmp[32] = c_dec_tmp.exp;
 
         for (idx0 = 0; idx0 < 16; idx0 = idx0 + 1) begin
-            emax_l1_vld_tmp[idx0] = emax_pick_vld(emax_l0_vld_tmp[idx0*2],
-                                                   emax_l0_vld_tmp[idx0*2+1]);
-            emax_l1_exp_tmp[idx0] = emax_pick_exp(emax_l0_vld_tmp[idx0*2],
-                                                   emax_l0_exp_tmp[idx0*2],
-                                                   emax_l0_vld_tmp[idx0*2+1],
-                                                   emax_l0_exp_tmp[idx0*2+1]);
+            emax_l1_vld_tmp[idx0] = 1'b1;
+            emax_l1_exp_tmp[idx0] = emax_max_exp(emax_l0_exp_tmp[idx0*2],
+                                                  emax_l0_exp_tmp[idx0*2+1]);
         end
-        emax_l1_vld_tmp[16] = emax_l0_vld_tmp[32];
+        emax_l1_vld_tmp[16] = 1'b1;
         emax_l1_exp_tmp[16] = emax_l0_exp_tmp[32];
 
         for (idx0 = 0; idx0 < 8; idx0 = idx0 + 1) begin
-            emax_l2_vld_tmp[idx0] = emax_pick_vld(emax_l1_vld_tmp[idx0*2],
-                                                   emax_l1_vld_tmp[idx0*2+1]);
-            emax_l2_exp_tmp[idx0] = emax_pick_exp(emax_l1_vld_tmp[idx0*2],
-                                                   emax_l1_exp_tmp[idx0*2],
-                                                   emax_l1_vld_tmp[idx0*2+1],
-                                                   emax_l1_exp_tmp[idx0*2+1]);
+            emax_l2_vld_tmp[idx0] = 1'b1;
+            emax_l2_exp_tmp[idx0] = emax_max_exp(emax_l1_exp_tmp[idx0*2],
+                                                  emax_l1_exp_tmp[idx0*2+1]);
         end
-        emax_l2_vld_tmp[8] = emax_l1_vld_tmp[16];
+        emax_l2_vld_tmp[8] = 1'b1;
         emax_l2_exp_tmp[8] = emax_l1_exp_tmp[16];
 
         for (idx0 = 0; idx0 < 4; idx0 = idx0 + 1) begin
-            emax_l3_vld_tmp[idx0] = emax_pick_vld(emax_l2_vld_tmp[idx0*2],
-                                                   emax_l2_vld_tmp[idx0*2+1]);
-            emax_l3_exp_tmp[idx0] = emax_pick_exp(emax_l2_vld_tmp[idx0*2],
-                                                   emax_l2_exp_tmp[idx0*2],
-                                                   emax_l2_vld_tmp[idx0*2+1],
-                                                   emax_l2_exp_tmp[idx0*2+1]);
+            emax_l3_vld_tmp[idx0] = 1'b1;
+            emax_l3_exp_tmp[idx0] = emax_max_exp(emax_l2_exp_tmp[idx0*2],
+                                                  emax_l2_exp_tmp[idx0*2+1]);
         end
-        emax_l3_vld_tmp[4] = emax_l2_vld_tmp[8];
+        emax_l3_vld_tmp[4] = 1'b1;
         emax_l3_exp_tmp[4] = emax_l2_exp_tmp[8];
 
         for (idx0 = 0; idx0 < 2; idx0 = idx0 + 1) begin
-            emax_l4_vld_tmp[idx0] = emax_pick_vld(emax_l3_vld_tmp[idx0*2],
-                                                   emax_l3_vld_tmp[idx0*2+1]);
-            emax_l4_exp_tmp[idx0] = emax_pick_exp(emax_l3_vld_tmp[idx0*2],
-                                                   emax_l3_exp_tmp[idx0*2],
-                                                   emax_l3_vld_tmp[idx0*2+1],
-                                                   emax_l3_exp_tmp[idx0*2+1]);
+            emax_l4_vld_tmp[idx0] = 1'b1;
+            emax_l4_exp_tmp[idx0] = emax_max_exp(emax_l3_exp_tmp[idx0*2],
+                                                  emax_l3_exp_tmp[idx0*2+1]);
         end
-        emax_l4_vld_tmp[2] = emax_l3_vld_tmp[4];
+        emax_l4_vld_tmp[2] = 1'b1;
         emax_l4_exp_tmp[2] = emax_l3_exp_tmp[4];
 
-        emax_l5_vld_tmp[0] = emax_pick_vld(emax_l4_vld_tmp[0], emax_l4_vld_tmp[1]);
-        emax_l5_exp_tmp[0] = emax_pick_exp(emax_l4_vld_tmp[0], emax_l4_exp_tmp[0],
-                                           emax_l4_vld_tmp[1], emax_l4_exp_tmp[1]);
-        emax_l5_vld_tmp[1] = emax_l4_vld_tmp[2];
+        emax_l5_vld_tmp[0] = 1'b1;
+        emax_l5_exp_tmp[0] = emax_max_exp(emax_l4_exp_tmp[0], emax_l4_exp_tmp[1]);
+        emax_l5_vld_tmp[1] = 1'b1;
         emax_l5_exp_tmp[1] = emax_l4_exp_tmp[2];
-        emax_result_vld_tmp = emax_pick_vld(emax_l5_vld_tmp[0], emax_l5_vld_tmp[1]);
-        emax_result_exp_tmp = emax_pick_exp(emax_l5_vld_tmp[0], emax_l5_exp_tmp[0],
-                                            emax_l5_vld_tmp[1], emax_l5_exp_tmp[1]);
+        emax_result_vld_tmp = 1'b1;
+        emax_result_exp_tmp = emax_max_exp(emax_l5_exp_tmp[0], emax_l5_exp_tmp[1]);
 
         s0_d.prod_sign_flat = s0_prod_sign_flat_tmp;
         s0_d.prod_mag_flat  = s0_prod_mag_flat_tmp;
@@ -845,11 +931,21 @@ module f4f6f8_dot_prod (
 
     integer idx3;
     logic signed [SUM_W-1:0] sum_acc_tmp;
+    logic signed [SUM_W-1:0] sum_term_s3_tmp [0:SUM_TERM_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l0_s3_tmp [0:SUM_CSA_L0_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l1_s3_tmp [0:SUM_CSA_L1_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l2_s3_tmp [0:SUM_CSA_L2_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l3_s3_tmp [0:SUM_CSA_L3_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l4_s3_tmp [0:SUM_CSA_L4_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l5_s3_tmp [0:SUM_CSA_L5_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l6_s3_tmp [0:SUM_CSA_L6_N-1];
+    logic signed [SUM_W-1:0] sum_csa_l7_s3_tmp [0:SUM_CSA_L7_N-1];
     logic [SUM_W-1:0]        sum_abs_s3_tmp;
     logic [PACK_MSB_IDX_W-1:0] pack_msb_idx_s3_tmp;
-    integer                  pack_msb_idx_int_s3_tmp;
-    integer                  pack_base_exp_int_s3_tmp;
-    integer                  pack_unbiased_exp_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_base_exp_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_msb_idx_ext_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_unbiased_exp_s3_tmp;
+    logic signed [PACK_EXP_CLASS_W-1:0] pack_biased_exp_s3_tmp;
 
     always @(*) begin
         s3_d = '0;
@@ -858,16 +954,174 @@ module f4f6f8_dot_prod (
         s3_d.base_exp       = s2_q.base_exp;
         sum_abs_s3_tmp      = '0;
         pack_msb_idx_s3_tmp = '0;
-        pack_msb_idx_int_s3_tmp = 0;
-        pack_base_exp_int_s3_tmp = 0;
-        pack_unbiased_exp_s3_tmp = 0;
+        pack_base_exp_s3_tmp = '0;
+        pack_msb_idx_ext_s3_tmp = '0;
+        pack_unbiased_exp_s3_tmp = '0;
+        pack_biased_exp_s3_tmp = '0;
 
-        sum_acc_tmp = $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}}, s2_q.c_aligned});
+        sum_term_s3_tmp[0] =
+            $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}},
+                     s2_q.c_aligned});
         for (idx3 = 0; idx3 < NUM_ELEMS; idx3 = idx3 + 1) begin
-            sum_acc_tmp = sum_acc_tmp
-                        + $signed({{(SUM_W-ALIGN_TERM_W){s2_aligned_prod_q_flat[idx3*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
-                                   s2_aligned_prod_q_flat[idx3*ALIGN_TERM_W +: ALIGN_TERM_W]});
+            sum_term_s3_tmp[idx3+1] =
+                $signed({{(SUM_W-ALIGN_TERM_W){s2_aligned_prod_q_flat[idx3*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
+                         s2_aligned_prod_q_flat[idx3*ALIGN_TERM_W +: ALIGN_TERM_W]});
         end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L0_N; idx3 = idx3 + 1) begin
+            sum_csa_l0_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_TERM_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l0_s3_tmp[idx3*2] =
+                csa_sum3(sum_term_s3_tmp[idx3*3],
+                         sum_term_s3_tmp[idx3*3 + 1],
+                         sum_term_s3_tmp[idx3*3 + 2]);
+            sum_csa_l0_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_term_s3_tmp[idx3*3],
+                           sum_term_s3_tmp[idx3*3 + 1],
+                           sum_term_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_TERM_N % 3) == 1) begin
+            sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1] = sum_term_s3_tmp[SUM_TERM_N-1];
+        end else if ((SUM_TERM_N % 3) == 2) begin
+            sum_csa_l0_s3_tmp[SUM_CSA_L0_N-2] = sum_term_s3_tmp[SUM_TERM_N-2];
+            sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1] = sum_term_s3_tmp[SUM_TERM_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L1_N; idx3 = idx3 + 1) begin
+            sum_csa_l1_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_CSA_L0_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l1_s3_tmp[idx3*2] =
+                csa_sum3(sum_csa_l0_s3_tmp[idx3*3],
+                         sum_csa_l0_s3_tmp[idx3*3 + 1],
+                         sum_csa_l0_s3_tmp[idx3*3 + 2]);
+            sum_csa_l1_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_csa_l0_s3_tmp[idx3*3],
+                           sum_csa_l0_s3_tmp[idx3*3 + 1],
+                           sum_csa_l0_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_CSA_L0_N % 3) == 1) begin
+            sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1] = sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1];
+        end else if ((SUM_CSA_L0_N % 3) == 2) begin
+            sum_csa_l1_s3_tmp[SUM_CSA_L1_N-2] = sum_csa_l0_s3_tmp[SUM_CSA_L0_N-2];
+            sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1] = sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L2_N; idx3 = idx3 + 1) begin
+            sum_csa_l2_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_CSA_L1_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l2_s3_tmp[idx3*2] =
+                csa_sum3(sum_csa_l1_s3_tmp[idx3*3],
+                         sum_csa_l1_s3_tmp[idx3*3 + 1],
+                         sum_csa_l1_s3_tmp[idx3*3 + 2]);
+            sum_csa_l2_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_csa_l1_s3_tmp[idx3*3],
+                           sum_csa_l1_s3_tmp[idx3*3 + 1],
+                           sum_csa_l1_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_CSA_L1_N % 3) == 1) begin
+            sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1] = sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1];
+        end else if ((SUM_CSA_L1_N % 3) == 2) begin
+            sum_csa_l2_s3_tmp[SUM_CSA_L2_N-2] = sum_csa_l1_s3_tmp[SUM_CSA_L1_N-2];
+            sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1] = sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L3_N; idx3 = idx3 + 1) begin
+            sum_csa_l3_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_CSA_L2_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l3_s3_tmp[idx3*2] =
+                csa_sum3(sum_csa_l2_s3_tmp[idx3*3],
+                         sum_csa_l2_s3_tmp[idx3*3 + 1],
+                         sum_csa_l2_s3_tmp[idx3*3 + 2]);
+            sum_csa_l3_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_csa_l2_s3_tmp[idx3*3],
+                           sum_csa_l2_s3_tmp[idx3*3 + 1],
+                           sum_csa_l2_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_CSA_L2_N % 3) == 1) begin
+            sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1] = sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1];
+        end else if ((SUM_CSA_L2_N % 3) == 2) begin
+            sum_csa_l3_s3_tmp[SUM_CSA_L3_N-2] = sum_csa_l2_s3_tmp[SUM_CSA_L2_N-2];
+            sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1] = sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L4_N; idx3 = idx3 + 1) begin
+            sum_csa_l4_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_CSA_L3_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l4_s3_tmp[idx3*2] =
+                csa_sum3(sum_csa_l3_s3_tmp[idx3*3],
+                         sum_csa_l3_s3_tmp[idx3*3 + 1],
+                         sum_csa_l3_s3_tmp[idx3*3 + 2]);
+            sum_csa_l4_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_csa_l3_s3_tmp[idx3*3],
+                           sum_csa_l3_s3_tmp[idx3*3 + 1],
+                           sum_csa_l3_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_CSA_L3_N % 3) == 1) begin
+            sum_csa_l4_s3_tmp[SUM_CSA_L4_N-1] = sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1];
+        end else if ((SUM_CSA_L3_N % 3) == 2) begin
+            sum_csa_l4_s3_tmp[SUM_CSA_L4_N-2] = sum_csa_l3_s3_tmp[SUM_CSA_L3_N-2];
+            sum_csa_l4_s3_tmp[SUM_CSA_L4_N-1] = sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L5_N; idx3 = idx3 + 1) begin
+            sum_csa_l5_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_CSA_L4_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l5_s3_tmp[idx3*2] =
+                csa_sum3(sum_csa_l4_s3_tmp[idx3*3],
+                         sum_csa_l4_s3_tmp[idx3*3 + 1],
+                         sum_csa_l4_s3_tmp[idx3*3 + 2]);
+            sum_csa_l5_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_csa_l4_s3_tmp[idx3*3],
+                           sum_csa_l4_s3_tmp[idx3*3 + 1],
+                           sum_csa_l4_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_CSA_L4_N % 3) == 1) begin
+            sum_csa_l5_s3_tmp[SUM_CSA_L5_N-1] = sum_csa_l4_s3_tmp[SUM_CSA_L4_N-1];
+        end else if ((SUM_CSA_L4_N % 3) == 2) begin
+            sum_csa_l5_s3_tmp[SUM_CSA_L5_N-2] = sum_csa_l4_s3_tmp[SUM_CSA_L4_N-2];
+            sum_csa_l5_s3_tmp[SUM_CSA_L5_N-1] = sum_csa_l4_s3_tmp[SUM_CSA_L4_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L6_N; idx3 = idx3 + 1) begin
+            sum_csa_l6_s3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < (SUM_CSA_L5_N / 3); idx3 = idx3 + 1) begin
+            sum_csa_l6_s3_tmp[idx3*2] =
+                csa_sum3(sum_csa_l5_s3_tmp[idx3*3],
+                         sum_csa_l5_s3_tmp[idx3*3 + 1],
+                         sum_csa_l5_s3_tmp[idx3*3 + 2]);
+            sum_csa_l6_s3_tmp[idx3*2 + 1] =
+                csa_carry3(sum_csa_l5_s3_tmp[idx3*3],
+                           sum_csa_l5_s3_tmp[idx3*3 + 1],
+                           sum_csa_l5_s3_tmp[idx3*3 + 2]);
+        end
+        if ((SUM_CSA_L5_N % 3) == 1) begin
+            sum_csa_l6_s3_tmp[SUM_CSA_L6_N-1] = sum_csa_l5_s3_tmp[SUM_CSA_L5_N-1];
+        end else if ((SUM_CSA_L5_N % 3) == 2) begin
+            sum_csa_l6_s3_tmp[SUM_CSA_L6_N-2] = sum_csa_l5_s3_tmp[SUM_CSA_L5_N-2];
+            sum_csa_l6_s3_tmp[SUM_CSA_L6_N-1] = sum_csa_l5_s3_tmp[SUM_CSA_L5_N-1];
+        end
+
+        for (idx3 = 0; idx3 < SUM_CSA_L7_N; idx3 = idx3 + 1) begin
+            sum_csa_l7_s3_tmp[idx3] = '0;
+        end
+        sum_csa_l7_s3_tmp[0] =
+            csa_sum3(sum_csa_l6_s3_tmp[0],
+                     sum_csa_l6_s3_tmp[1],
+                     sum_csa_l6_s3_tmp[2]);
+        sum_csa_l7_s3_tmp[1] =
+            csa_carry3(sum_csa_l6_s3_tmp[0],
+                       sum_csa_l6_s3_tmp[1],
+                       sum_csa_l6_s3_tmp[2]);
+
+        sum_acc_tmp = sum_csa_l7_s3_tmp[0] + sum_csa_l7_s3_tmp[1];
+
         s3_d.sum_sign = sum_acc_tmp[SUM_W-1];
         if (sum_acc_tmp[SUM_W-1]) begin
             sum_abs_s3_tmp = -sum_acc_tmp;
@@ -877,20 +1131,22 @@ module f4f6f8_dot_prod (
         s3_d.sum_abs = sum_abs_s3_tmp;
 
         if (sum_abs_s3_tmp != '0) begin
-            pack_msb_idx_int_s3_tmp  = pack_msb_idx(sum_abs_s3_tmp);
-            pack_msb_idx_s3_tmp      = pack_msb_idx_int_s3_tmp;
-            pack_base_exp_int_s3_tmp = $signed({{(32-EXP_W){s3_d.base_exp[EXP_W-1]}}, s3_d.base_exp});
-            pack_unbiased_exp_s3_tmp = pack_base_exp_int_s3_tmp + pack_msb_idx_int_s3_tmp;
+            pack_msb_idx_s3_tmp      = pack_msb_idx(sum_abs_s3_tmp);
+            pack_base_exp_s3_tmp     = $signed({s3_d.base_exp[EXP_W-1], s3_d.base_exp});
+            pack_msb_idx_ext_s3_tmp  =
+                $signed({{(PACK_EXP_CLASS_W-PACK_MSB_IDX_W){1'b0}}, pack_msb_idx_s3_tmp});
+            pack_unbiased_exp_s3_tmp = pack_base_exp_s3_tmp + pack_msb_idx_ext_s3_tmp;
+            pack_biased_exp_s3_tmp   = pack_unbiased_exp_s3_tmp + FP32_EXP_BIAS_PACK;
             s3_d.pack_msb_idx        = pack_msb_idx_s3_tmp;
-            s3_d.pack_sub_lsb_idx    = FP32_EXP_MIN_SUB - pack_base_exp_int_s3_tmp;
+            s3_d.pack_sub_lsb_idx    = FP32_EXP_MIN_SUB_PACK - pack_base_exp_s3_tmp;
 
-            if (pack_unbiased_exp_s3_tmp > FP32_EXP_MAX) begin
+            if (pack_unbiased_exp_s3_tmp > FP32_EXP_MAX_PACK) begin
                 s3_d.pack_overflow  = 1'b1;
                 s3_d.pack_exp_field = 8'hff;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_NORMAL) begin
+            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_NORMAL_PACK) begin
                 s3_d.pack_normal    = 1'b1;
-                s3_d.pack_exp_field = pack_unbiased_exp_s3_tmp + FP32_EXP_BIAS;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_SUB) begin
+                s3_d.pack_exp_field = pack_biased_exp_s3_tmp[7:0];
+            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_SUB_PACK) begin
                 s3_d.pack_subnormal = 1'b1;
             end
         end

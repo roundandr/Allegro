@@ -12,3 +12,5 @@ src/test/cocotb/coverage*.dat
 src/test/cocotb/coverage_annotated*/
 src/test/cocotb/coverage_final*/
 
+reports/yosys_proxy/
+reports/cocotb_large/

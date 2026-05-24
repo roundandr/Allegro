@@ -245,6 +245,13 @@ async def nvfp4_dot_matches_mmasim(dut):
             unpack_u8_bits(0x15291c6c),
             0x3FFC536B,
         ),
+        (
+            unpack_fp4_bits(0x0c44180f0b748df3c543fc522dcc4d53d12ed70b5115aa5d9da34f1214fcc2d1),
+            unpack_fp4_bits(0xbf0b494da0d506502126b37ce987a987722d0dba5902c7303578ec99fabea7f8),
+            unpack_u8_bits(0x2d420f76),
+            unpack_u8_bits(0x1c292200),
+            0xBE3B6F41,
+        ),
     ]
 
     for index, case in enumerate(directed_cases):

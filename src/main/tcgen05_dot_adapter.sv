@@ -86,7 +86,11 @@ module tcgen05_dot_adapter (
     logic [2:0] f4f6f8_a_type;
     logic [2:0] f4f6f8_b_type;
     logic       f4f6f8_mx_en;
+    logic       int8_a_unsigned;
+    logic       int8_b_unsigned;
     logic [1:0] fp4_mode;
+    logic       b_type_e2m1_sel;
+    logic       b_type_fp6_sel;
 
     logic [255:0] b_mid_fp_core;
     logic [255:0] b_tf32_core;
@@ -95,6 +99,7 @@ module tcgen05_dot_adapter (
     logic [255:0] b_6b_core;
     logic [255:0] b_4b_core;
     logic [255:0] b_fp4_core;
+    logic [255:0] f4f6f8_b_core;
 
     logic [31:0] c_core;
 
@@ -533,6 +538,13 @@ module tcgen05_dot_adapter (
     assign b_6b_core     = sparse_req ? select_b_2to4_6(b_vec_i, sparse_meta_i)  : b_vec_i[255:0];
     assign b_4b_core     = sparse_req ? select_b_2to4_4(b_vec_i, sparse_meta_i)  : b_vec_i[255:0];
     assign b_fp4_core    = sparse_req ? select_b_4to8_4(b_vec_i, sparse_meta_i) : b_vec_i[255:0];
+    assign int8_a_unsigned = (a_type_i == TCGEN05_TYPE_U8);
+    assign int8_b_unsigned = (b_type_i == TCGEN05_TYPE_U8);
+    assign b_type_e2m1_sel = (b_type_i == TCGEN05_TYPE_E2M1);
+    assign b_type_fp6_sel  = (b_type_i == TCGEN05_TYPE_E2M3) ||
+                             (b_type_i == TCGEN05_TYPE_E3M2);
+    assign f4f6f8_b_core   = b_type_e2m1_sel ? b_4b_core :
+                             (b_type_fp6_sel ? b_6b_core : b_8b_core);
 
     assign mid_fp_a_mode = (kind_i == TCGEN05_KIND_TF32) ? MID_FP_MODE_TF32 :
                            ((a_type_i == TCGEN05_TYPE_BF16) ? MID_FP_MODE_BF16 :
@@ -610,9 +622,7 @@ module tcgen05_dot_adapter (
         .in_vld_i    (f4f6f8_in_vld),
         .in_rdy_o    (f4f6f8_in_rdy),
         .a_vec_i     (a_vec_i),
-        .b_vec_i     ((b_type_i == TCGEN05_TYPE_E2M1) ? b_4b_core :
-                      (((b_type_i == TCGEN05_TYPE_E2M3) ||
-                        (b_type_i == TCGEN05_TYPE_E3M2)) ? b_6b_core : b_8b_core)),
+        .b_vec_i     (f4f6f8_b_core),
         .c_i         (c_core),
         .a_type_i    (f4f6f8_a_type),
         .b_type_i    (f4f6f8_b_type),
@@ -632,8 +642,8 @@ module tcgen05_dot_adapter (
         .a_vec_i     (a_vec_i),
         .b_vec_i     (b_8b_core),
         .c_i         (c_core),
-        .a_unsigned_i(a_type_i == TCGEN05_TYPE_U8),
-        .b_unsigned_i(b_type_i == TCGEN05_TYPE_U8),
+        .a_unsigned_i(int8_a_unsigned),
+        .b_unsigned_i(int8_b_unsigned),
         .sat_en_i    (1'b0),
         .out_vld_o   (int8_out_vld),
         .out_rdy_i   (int8_out_rdy),
