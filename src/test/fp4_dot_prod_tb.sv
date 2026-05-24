@@ -173,7 +173,7 @@ module tb_fp4_dot_prod;
             set_elem(a_fp4_i, i, fp4_code(1'b1, 3'd7));
             set_elem(b_fp4_i, i, fp4_code(1'b0, 3'd7));
         end
-        c_fp32_i = 32'h3080_0000;
+        c_fp32_i = 32'h2d80_0000;
         send_and_check(a_fp4_i, b_fp4_i, a_sf_i, b_sf_i, c_fp32_i,
                        32'h0000_0000, "large_cancel_truncates_tiny_c");
 

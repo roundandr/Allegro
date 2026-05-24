@@ -2,15 +2,20 @@ SIM ?= icarus
 TOPLEVEL_LANG ?= verilog
 TOPLEVEL ?= fp4_dot_prod
 COCOTB_TEST_MODULES ?= test_nvfp4_dot
-COCOTB_BIN ?= /Users/liuyuxuan/Library/Python/3.13/bin
-COCOTB_CONFIG ?= $(COCOTB_BIN)/cocotb-config
-PYTHON_BIN ?= /opt/homebrew/opt/python@3.13/bin/python3.13
+MODULE ?= $(COCOTB_TEST_MODULES)
+PYTHON_BIN = python3
+COCOTB_CONFIG ?= $(PYTHON_BIN) -m cocotb_tools.config
 
-export PATH := $(COCOTB_BIN):$(PATH)
-override PYTHON_BIN := $(PYTHON_BIN)
+export PATH := $(PATH):/opt/homebrew/bin:/usr/local/bin
+ifneq ($(wildcard /opt/homebrew/bin/iverilog),)
+ICARUS_BIN_DIR ?= /opt/homebrew/bin
+else ifneq ($(wildcard /usr/local/bin/iverilog),)
+ICARUS_BIN_DIR ?= /usr/local/bin
+endif
 
 export PYTHONPATH := $(PWD):$(PWD)/../../../MMA-Sim:$(PYTHONPATH)
 export NUM_CASES ?= 20000
+export RANDOM_SEED ?= 20260422
 export COCOTB_RANDOM_SEED ?= 20260422
 
 ifeq ($(TOPLEVEL),tcgen05_dot_adapter)
