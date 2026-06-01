@@ -32,17 +32,15 @@ module mid_fp_dot_prod (
     localparam logic [1:0] MID_FP_MODE_TF32 = 2'd0;
     localparam logic [1:0] MID_FP_MODE_BF16 = 2'd1;
     localparam logic [1:0] MID_FP_MODE_FP16 = 2'd2;
+    localparam logic [1:0] MID_FP_MODE_RSVD = MID_FP_MODE_FP16 + 2'd1;
+    localparam logic [1:0] SPECIAL_NONE     = 2'd0;
+    localparam logic [1:0] SPECIAL_NAN      = 2'd1;
+    localparam logic [1:0] SPECIAL_POS_INF  = 2'd2;
+    localparam logic [1:0] SPECIAL_NEG_INF  = 2'd3;
 
     localparam int FP16_W               = 16;
     localparam int FP32_W               = 32;
     localparam int NUM_ELEMS            = 16;
-    localparam int SUM_TERM_N           = NUM_ELEMS + 1;
-    localparam int SUM_CSA_L0_N         = ((SUM_TERM_N / 3) * 2) + (SUM_TERM_N % 3);
-    localparam int SUM_CSA_L1_N         = ((SUM_CSA_L0_N / 3) * 2) + (SUM_CSA_L0_N % 3);
-    localparam int SUM_CSA_L2_N         = ((SUM_CSA_L1_N / 3) * 2) + (SUM_CSA_L1_N % 3);
-    localparam int SUM_CSA_L3_N         = ((SUM_CSA_L2_N / 3) * 2) + (SUM_CSA_L2_N % 3);
-    localparam int SUM_CSA_L4_N         = ((SUM_CSA_L3_N / 3) * 2) + (SUM_CSA_L3_N % 3);
-    localparam int SUM_CSA_L5_N         = ((SUM_CSA_L4_N / 3) * 2) + (SUM_CSA_L4_N % 3);
     localparam int TF32_NUM_ELEMS       = 8;
     localparam int SIG_W                = 11;
     localparam int FP16_EXP_W           = 5;
@@ -54,27 +52,29 @@ module mid_fp_dot_prod (
     localparam int FP32_SIG_W           = 24;
     localparam int FP32_EXP_W           = 8;
     localparam int FP32_FRAC_W          = 23;
-    localparam int EXP_W                = 10;
+    localparam int EXP_W                = 9;
     localparam int PROD_SIG_W           = 22;
     localparam int PROD_SIG_FRAC_BITS   = 20;
     localparam int ALIGN_FRAC_BITS      = 25;
     localparam int ALIGN_INT_BITS       = 7;
     localparam int ALIGN_MAG_W          = ALIGN_INT_BITS + ALIGN_FRAC_BITS;
-    localparam int ALIGN_SHIFT_W        = $clog2(ALIGN_MAG_W);
     localparam int ALIGN_TERM_W         = ALIGN_MAG_W + 1;
     localparam int SUM_W                = ALIGN_TERM_W;
-    localparam int PACK_FRAC_W          = 23;
-    localparam int PACK_MSB_IDX_W       = $clog2(SUM_W);
-    localparam int PACK_LOD_GRP_W       = 7;
-    localparam int PACK_LOD_GRP_N       = (SUM_W + PACK_LOD_GRP_W - 1) / PACK_LOD_GRP_W;
     localparam int PROD_ALIGN_PAD_W     = ALIGN_FRAC_BITS - PROD_SIG_FRAC_BITS;
     localparam int C_ALIGN_PAD_W        = ALIGN_FRAC_BITS - FP32_FRAC_W;
-    localparam int FP32_EXP_BIAS        = 127;
-    localparam int FP32_EXP_MAX         = 127;
-    localparam int FP32_EXP_MIN_NORMAL  = -126;
-    localparam int FP32_EXP_MIN_SUB     = -149;
-    localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = 10'sd25;
-    localparam logic signed [EXP_W:0]   ALIGN_MAG_W_EXP     = 11'sd32;
+    localparam int ACC_L0_TERMS         = NUM_ELEMS + 1;
+    localparam int ACC_L1_TERMS         = (ACC_L0_TERMS + 1) / 2;
+    localparam int ACC_L2_TERMS         = (ACC_L1_TERMS + 1) / 2;
+    localparam int ACC_L3_TERMS         = (ACC_L2_TERMS + 1) / 2;
+    localparam int ACC_L4_TERMS         = (ACC_L3_TERMS + 1) / 2;
+    localparam int EMAX_L0_TERMS        = NUM_ELEMS + 1;
+    localparam int EMAX_L1_TERMS        = (EMAX_L0_TERMS + 1) / 2;
+    localparam int EMAX_L2_TERMS        = (EMAX_L1_TERMS + 1) / 2;
+    localparam int EMAX_L3_TERMS        = (EMAX_L2_TERMS + 1) / 2;
+    localparam int EMAX_L4_TERMS        = (EMAX_L3_TERMS + 1) / 2;
+    localparam logic signed [EXP_W-1:0] ALIGN_FRAC_BITS_EXP = 9'sd25;
+    localparam logic signed [EXP_W:0]   ALIGN_MAG_W_EXP     = 10'sd32;
+    localparam logic signed [EXP_W-1:0] EMAX_MIN_EXP        = {1'b1, {(EXP_W-1){1'b0}}};
 
     typedef struct packed {
         logic                    valid;
@@ -96,24 +96,20 @@ module mid_fp_dot_prod (
     } fp32_dec_t;
 
     typedef struct packed {
-        logic                            special_vld;
-        logic [31:0]                     special_result;
+        logic [1:0]                      special_code;
         logic [NUM_ELEMS-1:0]            prod_sign_flat;
-        logic [NUM_ELEMS*SIG_W-1:0]      a_sig_flat;
-        logic [NUM_ELEMS*SIG_W-1:0]      b_sig_flat;
+        logic [NUM_ELEMS*PROD_SIG_W-1:0] prod_sig_flat;
         logic [NUM_ELEMS*EXP_W-1:0]      prod_exp_flat;
         logic [NUM_ELEMS-1:0]            prod_zero_flat;
+        logic [EMAX_L2_TERMS*EXP_W-1:0]  emax_l2_exp_flat;
         logic                            c_sign;
         logic [FP32_SIG_W-1:0]           c_sig;
         logic signed [EXP_W-1:0]         c_exp;
         logic                            c_zero;
-        logic signed [EXP_W-1:0]         emax;
-        logic                            emax_vld;
     } stage0_data_t;
 
     typedef struct packed {
-        logic                             special_vld;
-        logic [31:0]                      special_result;
+        logic [1:0]                       special_code;
         logic [NUM_ELEMS-1:0]             prod_sign_flat;
         logic [NUM_ELEMS*PROD_SIG_W-1:0]  prod_sig_flat;
         logic [NUM_ELEMS*EXP_W-1:0]       prod_exp_flat;
@@ -123,29 +119,19 @@ module mid_fp_dot_prod (
         logic signed [EXP_W-1:0]          c_exp;
         logic                             c_zero;
         logic signed [EXP_W-1:0]          emax;
-        logic                             emax_vld;
     } stage1_data_t;
 
     typedef struct packed {
-        logic                              special_vld;
-        logic [31:0]                       special_result;
+        logic [1:0]                        special_code;
         logic [NUM_ELEMS*ALIGN_TERM_W-1:0] aligned_prod_flat;
         logic signed [ALIGN_TERM_W-1:0]    c_aligned;
         logic signed [EXP_W-1:0]           base_exp;
     } stage2_data_t;
 
     typedef struct packed {
-        logic                         special_vld;
-        logic [31:0]                  special_result;
-        logic                         sum_nonzero;
+        logic [1:0]                   special_code;
         logic                         sum_sign;
         logic [SUM_W-1:0]             sum_abs;
-        logic [PACK_MSB_IDX_W-1:0]    pack_msb_idx;
-        logic [7:0]                   pack_exp_field;
-        logic                         pack_overflow;
-        logic                         pack_normal;
-        logic                         pack_subnormal;
-        logic signed [EXP_W:0]        pack_sub_lsb_idx;
         logic signed [EXP_W-1:0]      base_exp;
     } stage3_data_t;
 
@@ -177,19 +163,16 @@ module mid_fp_dot_prod (
     logic s4_rdy;
 
     logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_tmp;
-    logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_tmp;
-    logic [NUM_ELEMS*SIG_W-1:0]       s0_b_sig_flat_tmp;
+    logic [NUM_ELEMS*PROD_SIG_W-1:0]  s0_prod_sig_flat_tmp;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_prod_exp_flat_tmp;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_tmp;
+    logic [EMAX_L2_TERMS*EXP_W-1:0]   s0_emax_l2_exp_flat_tmp;
 
-    logic [NUM_ELEMS-1:0]             s0_prod_sign_flat_hold;
-    logic [NUM_ELEMS*SIG_W-1:0]       s0_a_sig_flat_hold;
-    logic [NUM_ELEMS*SIG_W-1:0]       s0_b_sig_flat_hold;
     logic [NUM_ELEMS*EXP_W-1:0]       s0_prod_exp_flat_hold;
     logic [NUM_ELEMS-1:0]             s0_prod_zero_flat_hold;
+    logic [EMAX_L2_TERMS*EXP_W-1:0]   s0_emax_l2_exp_flat_hold;
 
-    logic [NUM_ELEMS-1:0]             s1_prod_sign_flat_tmp;
-    logic [NUM_ELEMS*PROD_SIG_W-1:0]  s1_prod_sig_flat_tmp;
+    logic [NUM_ELEMS*EXP_W-1:0]       s1_prod_exp_flat_tmp;
 
     logic [NUM_ELEMS-1:0]             s1_prod_sign_flat_hold;
     logic [NUM_ELEMS*PROD_SIG_W-1:0]  s1_prod_sig_flat_hold;
@@ -199,11 +182,15 @@ module mid_fp_dot_prod (
     logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_flat_tmp;
     logic [NUM_ELEMS*ALIGN_TERM_W-1:0] s2_aligned_prod_flat_hold;
 
-    assign s0_prod_sign_flat_hold    = s0_q.prod_sign_flat;
-    assign s0_a_sig_flat_hold        = s0_q.a_sig_flat;
-    assign s0_b_sig_flat_hold        = s0_q.b_sig_flat;
+    logic signed [EXP_W-1:0]      emax_l0_exp_tmp [0:EMAX_L0_TERMS-1];
+    logic signed [EXP_W-1:0]      emax_l1_exp_tmp [0:EMAX_L1_TERMS-1];
+    logic signed [EXP_W-1:0]      emax_l2_exp_tmp [0:EMAX_L2_TERMS-1];
+    logic signed [EXP_W-1:0]      emax_l3_exp_tmp [0:EMAX_L3_TERMS-1];
+    logic signed [EXP_W-1:0]      emax_l4_exp_tmp [0:EMAX_L4_TERMS-1];
+
     assign s0_prod_exp_flat_hold     = s0_q.prod_exp_flat;
     assign s0_prod_zero_flat_hold    = s0_q.prod_zero_flat;
+    assign s0_emax_l2_exp_flat_hold  = s0_q.emax_l2_exp_flat;
     assign s1_prod_sign_flat_hold    = s1_q.prod_sign_flat;
     assign s1_prod_sig_flat_hold     = s1_q.prod_sig_flat;
     assign s1_prod_exp_flat_hold     = s1_q.prod_exp_flat;
@@ -217,25 +204,6 @@ module mid_fp_dot_prod (
             dec.valid   = 1'b0;
             dec.is_zero = 1'b1;
             return dec;
-        end
-    endfunction
-
-    function automatic logic [FP32_W-1:0] pick_tf32_lane(
-        input logic [255:0] vec_i,
-        input integer       lane_idx_i
-    );
-        begin
-            case (lane_idx_i)
-                0: pick_tf32_lane = vec_i[0*FP32_W +: FP32_W];
-                1: pick_tf32_lane = vec_i[1*FP32_W +: FP32_W];
-                2: pick_tf32_lane = vec_i[2*FP32_W +: FP32_W];
-                3: pick_tf32_lane = vec_i[3*FP32_W +: FP32_W];
-                4: pick_tf32_lane = vec_i[4*FP32_W +: FP32_W];
-                5: pick_tf32_lane = vec_i[5*FP32_W +: FP32_W];
-                6: pick_tf32_lane = vec_i[6*FP32_W +: FP32_W];
-                7: pick_tf32_lane = vec_i[7*FP32_W +: FP32_W];
-                default: pick_tf32_lane = '0;
-            endcase
         end
     endfunction
 
@@ -267,13 +235,13 @@ module mid_fp_dot_prod (
                     dec.exp = '0;
                 end else if (dec.is_zero) begin
                     dec.sig = '0;
-                    dec.exp = -10'sd126;
+                    dec.exp = -9'sd126;
                 end else if (exp_raw == 8'h00) begin
                     dec.sig = {1'b0, tf32_frac};
-                    dec.exp = -10'sd126;
+                    dec.exp = -9'sd126;
                 end else begin
                     dec.sig = {1'b1, tf32_frac};
-                    dec.exp = $signed({2'd0, exp_raw}) - 10'sd127;
+                    dec.exp = $signed({1'd0, exp_raw}) - 9'sd127;
                 end
             end
 
@@ -309,13 +277,13 @@ module mid_fp_dot_prod (
                     dec.exp = '0;
                 end else if (dec.is_zero) begin
                     dec.sig = '0;
-                    dec.exp = -10'sd126;
+                    dec.exp = -9'sd126;
                 end else if (bf16_exp_raw == 8'h00) begin
                     dec.sig = {1'b0, bf16_frac_raw, {BF16_SIG_PAD_W{1'b0}}};
-                    dec.exp = -10'sd126;
+                    dec.exp = -9'sd126;
                 end else begin
                     dec.sig = {1'b1, bf16_frac_raw, {BF16_SIG_PAD_W{1'b0}}};
-                    dec.exp = $signed({2'd0, bf16_exp_raw}) - 10'sd127;
+                    dec.exp = $signed({1'd0, bf16_exp_raw}) - 9'sd127;
                 end
             end else begin
                 dec.is_zero = (exp_raw == 5'h00) && (frac_raw == 10'h000);
@@ -327,13 +295,13 @@ module mid_fp_dot_prod (
                     dec.exp = '0;
                 end else if (dec.is_zero) begin
                     dec.sig = '0;
-                    dec.exp = -10'sd126;
+                    dec.exp = -9'sd126;
                 end else if (exp_raw == 5'h00) begin
                     dec.sig = {1'b0, frac_raw};
-                    dec.exp = -10'sd14;
+                    dec.exp = -9'sd14;
                 end else begin
                     dec.sig = {1'b1, frac_raw};
-                    dec.exp = $signed({5'd0, exp_raw}) - 10'sd15;
+                    dec.exp = $signed({4'd0, exp_raw}) - 9'sd15;
                 end
             end
 
@@ -360,13 +328,13 @@ module mid_fp_dot_prod (
                 dec.exp = '0;
             end else if (dec.is_zero) begin
                 dec.sig = '0;
-                dec.exp = -10'sd126;
+                dec.exp = -9'sd126;
             end else if (exp_raw == 8'h00) begin
                 dec.sig = {1'b0, frac_raw};
-                dec.exp = -10'sd126;
+                dec.exp = -9'sd126;
             end else begin
                 dec.sig = {1'b1, frac_raw};
-                dec.exp = $signed({2'd0, exp_raw}) - 10'sd127;
+                dec.exp = $signed({1'd0, exp_raw}) - 9'sd127;
             end
 
             return dec;
@@ -383,7 +351,7 @@ module mid_fp_dot_prod (
         logic [FP32_SIG_W-1:0]   sig24;
         integer                  new_exp;
         integer                  sub_shift;
-        logic [FP32_SIG_W-1:0]   sub_sig;
+        logic [FP32_FRAC_W-1:0]  sub_frac;
         begin
             sign      = value_i[31];
             exp_raw   = value_i[30:23];
@@ -391,7 +359,7 @@ module mid_fp_dot_prod (
             sig24     = {1'b1, frac_raw};
             new_exp   = int'(exp_raw) - int'(shift_i);
             sub_shift = 0;
-            sub_sig   = '0;
+            sub_frac  = '0;
             scale_fp32_pow2_rz = value_i;
 
             if ((shift_i == 4'd0) || (exp_raw == 8'hff) || (value_i[30:0] == 31'd0)) begin
@@ -403,11 +371,11 @@ module mid_fp_dot_prod (
             end else begin
                 sub_shift = int'(shift_i) + 1 - int'(exp_raw);
                 if (sub_shift >= FP32_SIG_W) begin
-                    sub_sig = '0;
+                    sub_frac = '0;
                 end else begin
-                    sub_sig = sig24 >> sub_shift;
+                    sub_frac = FP32_FRAC_W'(sig24 >> sub_shift);
                 end
-                scale_fp32_pow2_rz = {sign, 8'h00, sub_sig[FP32_FRAC_W-1:0]};
+                scale_fp32_pow2_rz = {sign, 8'h00, sub_frac};
             end
         end
     endfunction
@@ -421,13 +389,13 @@ module mid_fp_dot_prod (
         logic [ALIGN_MAG_W-1:0]         term_mag_shift;
         logic signed [ALIGN_TERM_W-1:0] aligned_val;
         logic signed [EXP_W:0]          align_shift;
-        logic [ALIGN_SHIFT_W-1:0]       shift_amt;
+        integer                         shift_i;
         begin
             align_fixed_rz = '0;
             term_mag_shift = '0;
             aligned_val    = '0;
             align_shift    = '0;
-            shift_amt      = '0;
+            shift_i        = 0;
 
             if (term_mag_i != '0) begin
                 align_shift = $signed({emax_i[EXP_W-1], emax_i})
@@ -437,8 +405,8 @@ module mid_fp_dot_prod (
                 end else if (align_shift >= ALIGN_MAG_W_EXP) begin
                     term_mag_shift = '0;
                 end else begin
-                    shift_amt = align_shift[ALIGN_SHIFT_W-1:0];
-                    term_mag_shift = term_mag_i >> shift_amt;
+                    shift_i = int'(align_shift);
+                    term_mag_shift = term_mag_i >> shift_i;
                 end
 
                 aligned_val = $signed({1'b0, term_mag_shift});
@@ -447,161 +415,95 @@ module mid_fp_dot_prod (
         end
     endfunction
 
-    function automatic logic emax_pick_vld(
-        input logic a_vld_i,
-        input logic b_vld_i
-    );
-        begin
-            emax_pick_vld = a_vld_i | b_vld_i;
-        end
-    endfunction
-
-    function automatic logic signed [EXP_W-1:0] emax_pick_exp(
-        input logic                    a_vld_i,
+    function automatic logic signed [EXP_W-1:0] emax_max_exp(
         input logic signed [EXP_W-1:0] a_exp_i,
-        input logic                    b_vld_i,
         input logic signed [EXP_W-1:0] b_exp_i
     );
         begin
-            if (!a_vld_i) begin
-                emax_pick_exp = b_exp_i;
-            end else if (!b_vld_i) begin
-                emax_pick_exp = a_exp_i;
-            end else if (b_exp_i > a_exp_i) begin
-                emax_pick_exp = b_exp_i;
+            if (b_exp_i > a_exp_i) begin
+                emax_max_exp = b_exp_i;
             end else begin
-                emax_pick_exp = a_exp_i;
-            end
-        end
-    endfunction
-
-    function automatic logic signed [SUM_W-1:0] csa_sum3(
-        input logic signed [SUM_W-1:0] a_i,
-        input logic signed [SUM_W-1:0] b_i,
-        input logic signed [SUM_W-1:0] z_i
-    );
-        begin
-            csa_sum3 = $signed(a_i ^ b_i ^ z_i);
-        end
-    endfunction
-
-    function automatic logic signed [SUM_W-1:0] csa_carry3(
-        input logic signed [SUM_W-1:0] a_i,
-        input logic signed [SUM_W-1:0] b_i,
-        input logic signed [SUM_W-1:0] z_i
-    );
-        logic [SUM_W-1:0] carry_bits;
-        begin
-            carry_bits = (a_i & b_i) | (a_i & z_i) | (b_i & z_i);
-            csa_carry3 = $signed({carry_bits[SUM_W-2:0], 1'b0});
-        end
-    endfunction
-
-    function automatic integer pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
-        integer grp_idx;
-        integer bit_idx;
-        integer sum_idx;
-        integer grp_msb_idx;
-        logic   grp_vld;
-        begin
-            pack_msb_idx = 0;
-
-            for (grp_idx = 0; grp_idx < PACK_LOD_GRP_N; grp_idx = grp_idx + 1) begin
-                grp_vld     = 1'b0;
-                grp_msb_idx = 0;
-
-                for (bit_idx = 0; bit_idx < PACK_LOD_GRP_W; bit_idx = bit_idx + 1) begin
-                    sum_idx = grp_idx * PACK_LOD_GRP_W + bit_idx;
-                    if (sum_idx < SUM_W) begin
-                        if (abs_sum_i[sum_idx]) begin
-                            grp_vld     = 1'b1;
-                            grp_msb_idx = bit_idx;
-                        end
-                    end
-                end
-
-                if (grp_vld) begin
-                    pack_msb_idx = grp_idx * PACK_LOD_GRP_W + grp_msb_idx;
-                end
-            end
-        end
-    endfunction
-
-    function automatic logic [PACK_FRAC_W-1:0] pack_normal_frac_from_abs(
-        input logic [SUM_W-1:0] abs_sum_i,
-        input integer           msb_idx_i
-    );
-        integer frac_idx;
-        integer sum_idx;
-        begin
-            pack_normal_frac_from_abs = '0;
-
-            for (frac_idx = 0; frac_idx < PACK_FRAC_W; frac_idx = frac_idx + 1) begin
-                sum_idx = msb_idx_i - (PACK_FRAC_W - frac_idx);
-                if ((sum_idx >= 0) && (sum_idx < SUM_W)) begin
-                    pack_normal_frac_from_abs[frac_idx] = abs_sum_i[sum_idx];
-                end
-            end
-        end
-    endfunction
-
-    function automatic logic [PACK_FRAC_W-1:0] pack_subnormal_frac_from_abs(
-        input logic [SUM_W-1:0] abs_sum_i,
-        input logic signed [EXP_W:0] sub_lsb_idx_i
-    );
-        integer frac_idx;
-        integer sum_idx;
-        begin
-            pack_subnormal_frac_from_abs = '0;
-
-            for (frac_idx = 0; frac_idx < PACK_FRAC_W; frac_idx = frac_idx + 1) begin
-                sum_idx = frac_idx + sub_lsb_idx_i;
-                if ((sum_idx >= 0) && (sum_idx < SUM_W)) begin
-                    pack_subnormal_frac_from_abs[frac_idx] = abs_sum_i[sum_idx];
-                end
+                emax_max_exp = a_exp_i;
             end
         end
     endfunction
 
     function automatic logic [31:0] pack_fp32_rz(
-        input logic                    sum_nonzero_i,
-        input logic                    sign_i,
-        input logic [SUM_W-1:0]        abs_sum_i,
-        input logic [PACK_MSB_IDX_W-1:0] msb_idx_i,
-        input logic [7:0]              exp_field_i,
-        input logic                    overflow_i,
-        input logic                    normal_i,
-        input logic                    subnormal_i,
-        input logic signed [EXP_W:0]   sub_lsb_idx_i
+        input logic                    sum_sign_i,
+        input logic [SUM_W-1:0]        sum_abs_i,
+        input logic signed [EXP_W-1:0] base_exp_i
     );
-        logic             sign_bit;
-        logic [SUM_W-1:0] abs_sum;
+        logic [SUM_W-1:0] norm_sum;
+        logic [23:0]      sig24;
         logic [22:0]      frac_field;
         logic [7:0]       exp_field;
+        integer           msb_idx;
+        integer           norm_lshift;
+        integer           unbiased_exp;
+        integer           shift_sub;
+        integer           idx;
         begin
             pack_fp32_rz = 32'h0000_0000;
-            sign_bit     = sign_i;
-            abs_sum      = abs_sum_i;
+            norm_sum     = '0;
+            sig24        = '0;
             frac_field   = '0;
             exp_field    = '0;
+            msb_idx      = 0;
+            norm_lshift  = 0;
+            unbiased_exp = 0;
+            shift_sub    = 0;
 
-            if (sum_nonzero_i) begin
-                if (overflow_i) begin
-                    exp_field  = 8'hff;
-                    frac_field = 23'h0;
-                end else if (normal_i) begin
-                    exp_field  = exp_field_i;
-                    frac_field = pack_normal_frac_from_abs(abs_sum, msb_idx_i);
-                end else if (subnormal_i) begin
-                    exp_field  = 8'h00;
-                    frac_field = pack_subnormal_frac_from_abs(abs_sum, sub_lsb_idx_i);
-                end else begin
-                    exp_field  = 8'h00;
-                    frac_field = 23'h0;
+            if (sum_abs_i != '0) begin
+                for (idx = 0; idx < SUM_W; idx = idx + 1) begin
+                    if (sum_abs_i[idx]) begin
+                        msb_idx = idx;
+                    end
                 end
 
-                pack_fp32_rz = {sign_bit, exp_field, frac_field};
+                unbiased_exp = $signed({{(32-EXP_W){base_exp_i[EXP_W-1]}}, base_exp_i}) + msb_idx;
+                norm_lshift  = (SUM_W - 1) - msb_idx;
+                norm_sum     = sum_abs_i << norm_lshift;
+                sig24        = norm_sum[SUM_W-1 -: 24];
+
+                if (unbiased_exp > 127) begin
+                    exp_field  = 8'hff;
+                    frac_field = 23'h0;
+                end else if (unbiased_exp >= -126) begin
+                    exp_field  = 8'(unbiased_exp + 127);
+                    frac_field = sig24[22:0];
+                end else if (unbiased_exp < -149) begin
+                    exp_field  = 8'h00;
+                    frac_field = 23'h0;
+                end else begin
+                    shift_sub  = -126 - unbiased_exp;
+                    sig24      = sig24 >> shift_sub;
+                    exp_field  = 8'h00;
+                    frac_field = sig24[22:0];
+                end
+
+                pack_fp32_rz = {sum_sign_i, exp_field, frac_field};
             end
+        end
+    endfunction
+
+    function automatic logic [31:0] pack_special_fp32(
+        input logic [1:0] special_code_i
+    );
+        begin
+            case (special_code_i)
+                SPECIAL_NAN: begin
+                    pack_special_fp32 = 32'h7fff_ffff;
+                end
+                SPECIAL_POS_INF: begin
+                    pack_special_fp32 = 32'h7f80_0000;
+                end
+                SPECIAL_NEG_INF: begin
+                    pack_special_fp32 = 32'hff80_0000;
+                end
+                default: begin
+                    pack_special_fp32 = 32'h0000_0000;
+                end
+            endcase
         end
     endfunction
 
@@ -615,35 +517,26 @@ module mid_fp_dot_prod (
     logic has_neg_inf_tmp;
     logic has_zero_mul_inf_tmp;
     logic lane_prod_sign_tmp;
-    logic lane_prod_zero_tmp;
-    logic lane_prod_emax_vld_tmp;
-    logic signed [EXP_W-1:0] prod_exp_s0_tmp;
     logic reserved_mode_tmp;
-    logic                         emax_s0_l0_vld_tmp [0:16];
-    logic signed [EXP_W-1:0]      emax_s0_l0_exp_tmp [0:16];
-    logic                         emax_s0_l1_vld_tmp [0:8];
-    logic signed [EXP_W-1:0]      emax_s0_l1_exp_tmp [0:8];
-    logic                         emax_s0_l2_vld_tmp [0:4];
-    logic signed [EXP_W-1:0]      emax_s0_l2_exp_tmp [0:4];
-    logic                         emax_s0_l3_vld_tmp [0:2];
-    logic signed [EXP_W-1:0]      emax_s0_l3_exp_tmp [0:2];
-    logic                         emax_s0_l4_vld_tmp [0:1];
-    logic signed [EXP_W-1:0]      emax_s0_l4_exp_tmp [0:1];
     always_comb begin
         logic lane_has_inf_tmp;
         logic lane_valid_tmp;
+        logic lane_prod_zero_tmp;
+        logic lane_prod_emax_vld_tmp;
+        logic [PROD_SIG_W-1:0] lane_prod_sig_tmp;
+        logic signed [EXP_W-1:0] lane_prod_exp_tmp;
 
         s0_d = '0;
         s0_prod_sign_flat_tmp = '0;
-        s0_a_sig_flat_tmp     = '0;
-        s0_b_sig_flat_tmp     = '0;
+        s0_prod_sig_flat_tmp  = '0;
         s0_prod_exp_flat_tmp  = '0;
         s0_prod_zero_flat_tmp = '0;
+        s0_emax_l2_exp_flat_tmp = '0;
 
         c_preprocessed_tmp   = scale_fp32_pow2_rz(c_i, scale_input_d_i);
         c_dec_tmp            = decode_fp32(c_preprocessed_tmp);
-        reserved_mode_tmp    = (a_mode_i == 2'd3) ||
-                                (b_mode_i == 2'd3) ||
+        reserved_mode_tmp    = (a_mode_i == MID_FP_MODE_RSVD) ||
+                                (b_mode_i == MID_FP_MODE_RSVD) ||
                                 ((a_mode_i == MID_FP_MODE_TF32) !=
                                  (b_mode_i == MID_FP_MODE_TF32));
         any_nan_tmp          = c_dec_tmp.is_nan || reserved_mode_tmp;
@@ -655,7 +548,18 @@ module mid_fp_dot_prod (
         lane_prod_sign_tmp   = 1'b0;
         lane_prod_zero_tmp   = 1'b0;
         lane_prod_emax_vld_tmp = 1'b0;
-        prod_exp_s0_tmp      = '0;
+        lane_prod_sig_tmp    = '0;
+        lane_prod_exp_tmp    = '0;
+
+        for (idx0 = 0; idx0 < EMAX_L0_TERMS; idx0 = idx0 + 1) begin
+            emax_l0_exp_tmp[idx0] = EMAX_MIN_EXP;
+        end
+        for (idx0 = 0; idx0 < EMAX_L1_TERMS; idx0 = idx0 + 1) begin
+            emax_l1_exp_tmp[idx0] = EMAX_MIN_EXP;
+        end
+        for (idx0 = 0; idx0 < EMAX_L2_TERMS; idx0 = idx0 + 1) begin
+            emax_l2_exp_tmp[idx0] = EMAX_MIN_EXP;
+        end
 
         s0_d.c_sign = c_dec_tmp.sign;
         s0_d.c_sig  = c_dec_tmp.sig;
@@ -666,14 +570,18 @@ module mid_fp_dot_prod (
             a_dec_tmp = decode_disabled_lane();
             b_dec_tmp = decode_disabled_lane();
             lane_valid_tmp = 1'b0;
+            lane_prod_zero_tmp = 1'b0;
+            lane_prod_emax_vld_tmp = 1'b0;
+            lane_prod_sig_tmp = '0;
+            lane_prod_exp_tmp = '0;
 
             if (!reserved_mode_tmp &&
                 (a_mode_i == MID_FP_MODE_TF32) &&
                 (b_mode_i == MID_FP_MODE_TF32)) begin
                 lane_valid_tmp = (idx0 < TF32_NUM_ELEMS);
                 if (lane_valid_tmp) begin
-                    a_dec_tmp = decode_tf32_from_fp32(1'b1, pick_tf32_lane(a_vec_i, idx0));
-                    b_dec_tmp = decode_tf32_from_fp32(1'b1, pick_tf32_lane(b_vec_i, idx0));
+                    a_dec_tmp = decode_tf32_from_fp32(1'b1, a_vec_i[idx0*FP32_W +: FP32_W]);
+                    b_dec_tmp = decode_tf32_from_fp32(1'b1, b_vec_i[idx0*FP32_W +: FP32_W]);
                 end
             end else if (!reserved_mode_tmp) begin
                 a_dec_tmp = decode_fp16_bf16(a_mode_i == MID_FP_MODE_BF16,
@@ -683,14 +591,15 @@ module mid_fp_dot_prod (
             end
 
             lane_prod_sign_tmp = a_dec_tmp.sign ^ b_dec_tmp.sign;
-            prod_exp_s0_tmp    = a_dec_tmp.exp + b_dec_tmp.exp;
+            lane_prod_sig_tmp  = a_dec_tmp.sig * b_dec_tmp.sig;
+            lane_prod_exp_tmp  = a_dec_tmp.exp + b_dec_tmp.exp;
             lane_has_inf_tmp   = a_dec_tmp.valid && b_dec_tmp.valid &&
                                   ((a_dec_tmp.is_inf && !b_dec_tmp.is_zero && !b_dec_tmp.is_nan) ||
                                    (b_dec_tmp.is_inf && !a_dec_tmp.is_zero && !a_dec_tmp.is_nan));
             lane_prod_zero_tmp = (!a_dec_tmp.valid) || (!b_dec_tmp.valid) ||
-                                  a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
-                                  a_dec_tmp.is_inf  || b_dec_tmp.is_inf  ||
-                                  a_dec_tmp.is_nan  || b_dec_tmp.is_nan;
+                                 a_dec_tmp.is_zero || b_dec_tmp.is_zero ||
+                                 a_dec_tmp.is_inf  || b_dec_tmp.is_inf  ||
+                                 a_dec_tmp.is_nan  || b_dec_tmp.is_nan;
             lane_prod_emax_vld_tmp = a_dec_tmp.valid && b_dec_tmp.valid &&
                                       !a_dec_tmp.is_inf && !b_dec_tmp.is_inf &&
                                       !a_dec_tmp.is_nan && !b_dec_tmp.is_nan;
@@ -706,121 +615,79 @@ module mid_fp_dot_prod (
             has_pos_inf_tmp = has_pos_inf_tmp || (lane_has_inf_tmp && !lane_prod_sign_tmp);
 
             s0_prod_sign_flat_tmp[idx0] = lane_prod_sign_tmp;
-            s0_a_sig_flat_tmp[idx0*SIG_W +: SIG_W] = a_dec_tmp.sig;
-            s0_b_sig_flat_tmp[idx0*SIG_W +: SIG_W] = b_dec_tmp.sig;
-            s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = lane_prod_zero_tmp ? '0 : prod_exp_s0_tmp;
+            s0_prod_sig_flat_tmp[idx0*PROD_SIG_W +: PROD_SIG_W] = lane_prod_sig_tmp;
+            s0_prod_exp_flat_tmp[idx0*EXP_W +: EXP_W] = lane_prod_exp_tmp;
             s0_prod_zero_flat_tmp[idx0] = lane_prod_zero_tmp;
-            emax_s0_l0_vld_tmp[idx0] = lane_prod_emax_vld_tmp;
-            emax_s0_l0_exp_tmp[idx0] = prod_exp_s0_tmp;
+            emax_l0_exp_tmp[idx0] = lane_prod_emax_vld_tmp ? lane_prod_exp_tmp
+                                                            : EMAX_MIN_EXP;
         end
-        emax_s0_l0_vld_tmp[16] = 1'b1;
-        emax_s0_l0_exp_tmp[16] = c_dec_tmp.exp;
+        emax_l0_exp_tmp[NUM_ELEMS] = c_dec_tmp.exp;
 
-        for (int idx0_l1 = 0; idx0_l1 < 8; idx0_l1 = idx0_l1 + 1) begin
-            emax_s0_l1_vld_tmp[idx0_l1] =
-                emax_pick_vld(emax_s0_l0_vld_tmp[idx0_l1*2],
-                              emax_s0_l0_vld_tmp[idx0_l1*2+1]);
-            emax_s0_l1_exp_tmp[idx0_l1] =
-                emax_pick_exp(emax_s0_l0_vld_tmp[idx0_l1*2],
-                              emax_s0_l0_exp_tmp[idx0_l1*2],
-                              emax_s0_l0_vld_tmp[idx0_l1*2+1],
-                              emax_s0_l0_exp_tmp[idx0_l1*2+1]);
+        for (idx0 = 0; idx0 < (EMAX_L1_TERMS-1); idx0 = idx0 + 1) begin
+            emax_l1_exp_tmp[idx0] = emax_max_exp(emax_l0_exp_tmp[idx0*2],
+                                                 emax_l0_exp_tmp[idx0*2+1]);
         end
-        emax_s0_l1_vld_tmp[8] = emax_s0_l0_vld_tmp[16];
-        emax_s0_l1_exp_tmp[8] = emax_s0_l0_exp_tmp[16];
+        emax_l1_exp_tmp[EMAX_L1_TERMS-1] = emax_l0_exp_tmp[EMAX_L0_TERMS-1];
 
-        for (int idx0_l2 = 0; idx0_l2 < 4; idx0_l2 = idx0_l2 + 1) begin
-            emax_s0_l2_vld_tmp[idx0_l2] =
-                emax_pick_vld(emax_s0_l1_vld_tmp[idx0_l2*2],
-                              emax_s0_l1_vld_tmp[idx0_l2*2+1]);
-            emax_s0_l2_exp_tmp[idx0_l2] =
-                emax_pick_exp(emax_s0_l1_vld_tmp[idx0_l2*2],
-                              emax_s0_l1_exp_tmp[idx0_l2*2],
-                              emax_s0_l1_vld_tmp[idx0_l2*2+1],
-                              emax_s0_l1_exp_tmp[idx0_l2*2+1]);
+        for (idx0 = 0; idx0 < (EMAX_L2_TERMS-1); idx0 = idx0 + 1) begin
+            emax_l2_exp_tmp[idx0] = emax_max_exp(emax_l1_exp_tmp[idx0*2],
+                                                 emax_l1_exp_tmp[idx0*2+1]);
         end
-        emax_s0_l2_vld_tmp[4] = emax_s0_l1_vld_tmp[8];
-        emax_s0_l2_exp_tmp[4] = emax_s0_l1_exp_tmp[8];
+        emax_l2_exp_tmp[EMAX_L2_TERMS-1] = emax_l1_exp_tmp[EMAX_L1_TERMS-1];
 
-        for (int idx0_l3 = 0; idx0_l3 < 2; idx0_l3 = idx0_l3 + 1) begin
-            emax_s0_l3_vld_tmp[idx0_l3] =
-                emax_pick_vld(emax_s0_l2_vld_tmp[idx0_l3*2],
-                              emax_s0_l2_vld_tmp[idx0_l3*2+1]);
-            emax_s0_l3_exp_tmp[idx0_l3] =
-                emax_pick_exp(emax_s0_l2_vld_tmp[idx0_l3*2],
-                              emax_s0_l2_exp_tmp[idx0_l3*2],
-                              emax_s0_l2_vld_tmp[idx0_l3*2+1],
-                              emax_s0_l2_exp_tmp[idx0_l3*2+1]);
+        for (idx0 = 0; idx0 < EMAX_L2_TERMS; idx0 = idx0 + 1) begin
+            s0_emax_l2_exp_flat_tmp[idx0*EXP_W +: EXP_W] = emax_l2_exp_tmp[idx0];
         end
-        emax_s0_l3_vld_tmp[2] = emax_s0_l2_vld_tmp[4];
-        emax_s0_l3_exp_tmp[2] = emax_s0_l2_exp_tmp[4];
-
-        emax_s0_l4_vld_tmp[0] = emax_pick_vld(emax_s0_l3_vld_tmp[0],
-                                              emax_s0_l3_vld_tmp[1]);
-        emax_s0_l4_exp_tmp[0] = emax_pick_exp(emax_s0_l3_vld_tmp[0],
-                                              emax_s0_l3_exp_tmp[0],
-                                              emax_s0_l3_vld_tmp[1],
-                                              emax_s0_l3_exp_tmp[1]);
-        emax_s0_l4_vld_tmp[1] = emax_s0_l3_vld_tmp[2];
-        emax_s0_l4_exp_tmp[1] = emax_s0_l3_exp_tmp[2];
 
         s0_d.prod_sign_flat = s0_prod_sign_flat_tmp;
-        s0_d.a_sig_flat     = s0_a_sig_flat_tmp;
-        s0_d.b_sig_flat     = s0_b_sig_flat_tmp;
+        s0_d.prod_sig_flat  = s0_prod_sig_flat_tmp;
         s0_d.prod_exp_flat  = s0_prod_exp_flat_tmp;
         s0_d.prod_zero_flat = s0_prod_zero_flat_tmp;
-        s0_d.emax_vld       = emax_pick_vld(emax_s0_l4_vld_tmp[0],
-                                            emax_s0_l4_vld_tmp[1]);
-        s0_d.emax           = emax_pick_exp(emax_s0_l4_vld_tmp[0],
-                                           emax_s0_l4_exp_tmp[0],
-                                           emax_s0_l4_vld_tmp[1],
-                                           emax_s0_l4_exp_tmp[1]);
+        s0_d.emax_l2_exp_flat = s0_emax_l2_exp_flat_tmp;
 
         if (any_nan_tmp || has_zero_mul_inf_tmp || (has_pos_inf_tmp && has_neg_inf_tmp)) begin
-            s0_d.special_vld    = 1'b1;
-            s0_d.special_result = 32'h7fff_ffff;
+            s0_d.special_code = SPECIAL_NAN;
         end else if (has_pos_inf_tmp) begin
-            s0_d.special_vld    = 1'b1;
-            s0_d.special_result = 32'h7f80_0000;
+            s0_d.special_code = SPECIAL_POS_INF;
         end else if (has_neg_inf_tmp) begin
-            s0_d.special_vld    = 1'b1;
-            s0_d.special_result = 32'hff80_0000;
+            s0_d.special_code = SPECIAL_NEG_INF;
         end else begin
-            s0_d.special_vld    = 1'b0;
-            s0_d.special_result = 32'h0000_0000;
+            s0_d.special_code = SPECIAL_NONE;
         end
     end
 
-    logic [SIG_W-1:0]             a_sig_s1_tmp;
-    logic [SIG_W-1:0]             b_sig_s1_tmp;
-    logic [PROD_SIG_W-1:0]        prod_sig_s1_tmp;
     always_comb begin
         s1_d = '0;
-        s1_prod_sign_flat_tmp = '0;
-        s1_prod_sig_flat_tmp  = '0;
+        s1_prod_exp_flat_tmp = '0;
 
-        s1_d.special_vld    = s0_q.special_vld;
-        s1_d.special_result = s0_q.special_result;
+        s1_d.special_code   = s0_q.special_code;
+        s1_d.prod_sign_flat = s0_q.prod_sign_flat;
+        s1_d.prod_sig_flat  = s0_q.prod_sig_flat;
         s1_d.prod_zero_flat = s0_q.prod_zero_flat;
         s1_d.c_sign         = s0_q.c_sign;
         s1_d.c_sig          = s0_q.c_sig;
         s1_d.c_exp          = s0_q.c_exp;
         s1_d.c_zero         = s0_q.c_zero;
-        s1_d.prod_exp_flat  = s0_prod_exp_flat_hold;
-        s1_d.emax_vld       = s0_q.emax_vld;
-        s1_d.emax           = s0_q.emax;
 
         for (int idx1 = 0; idx1 < NUM_ELEMS; idx1 = idx1 + 1) begin
-            a_sig_s1_tmp = s0_a_sig_flat_hold[idx1*SIG_W +: SIG_W];
-            b_sig_s1_tmp = s0_b_sig_flat_hold[idx1*SIG_W +: SIG_W];
-            prod_sig_s1_tmp = a_sig_s1_tmp * b_sig_s1_tmp;
-
-            s1_prod_sign_flat_tmp[idx1] = s0_prod_sign_flat_hold[idx1];
-            s1_prod_sig_flat_tmp[idx1*PROD_SIG_W +: PROD_SIG_W] = prod_sig_s1_tmp;
+            s1_prod_exp_flat_tmp[idx1*EXP_W +: EXP_W] =
+                s0_prod_zero_flat_hold[idx1] ? '0 :
+                s0_prod_exp_flat_hold[idx1*EXP_W +: EXP_W];
         end
 
-        s1_d.prod_sign_flat = s1_prod_sign_flat_tmp;
-        s1_d.prod_sig_flat  = s1_prod_sig_flat_tmp;
+        for (int idx1 = 0; idx1 < (EMAX_L3_TERMS-1); idx1 = idx1 + 1) begin
+            emax_l3_exp_tmp[idx1] =
+                emax_max_exp($signed(s0_emax_l2_exp_flat_hold[(idx1*2)*EXP_W +: EXP_W]),
+                             $signed(s0_emax_l2_exp_flat_hold[(idx1*2+1)*EXP_W +: EXP_W]));
+        end
+        emax_l3_exp_tmp[EMAX_L3_TERMS-1] =
+            $signed(s0_emax_l2_exp_flat_hold[(EMAX_L2_TERMS-1)*EXP_W +: EXP_W]);
+
+        emax_l4_exp_tmp[0] = emax_max_exp(emax_l3_exp_tmp[0], emax_l3_exp_tmp[1]);
+        emax_l4_exp_tmp[1] = emax_l3_exp_tmp[EMAX_L3_TERMS-1];
+
+        s1_d.prod_exp_flat  = s1_prod_exp_flat_tmp;
+        s1_d.emax           = emax_max_exp(emax_l4_exp_tmp[0], emax_l4_exp_tmp[1]);
     end
     logic signed [EXP_W-1:0] prod_exp_s2_tmp;
     logic [PROD_SIG_W-1:0]   prod_sig_s2_tmp;
@@ -834,217 +701,101 @@ module mid_fp_dot_prod (
         prod_mag_s2_tmp = '0;
         c_mag_s2_tmp    = '0;
 
-        s2_d.special_vld    = s1_q.special_vld;
-        s2_d.special_result = s1_q.special_result;
+        s2_d.special_code = s1_q.special_code;
 
-        if (s1_q.emax_vld) begin
-            s2_d.base_exp = s1_q.emax - ALIGN_FRAC_BITS_EXP;
+        s2_d.base_exp = s1_q.emax - ALIGN_FRAC_BITS_EXP;
 
-            for (int idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
-                if (!s1_prod_zero_flat_hold[idx2]) begin
-                    prod_sig_s2_tmp = s1_prod_sig_flat_hold[idx2*PROD_SIG_W +: PROD_SIG_W];
-                    prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
-                    prod_mag_s2_tmp = {{(ALIGN_MAG_W-PROD_SIG_W-PROD_ALIGN_PAD_W){1'b0}},
-                                       prod_sig_s2_tmp,
-                                       {PROD_ALIGN_PAD_W{1'b0}}};
-                    s2_aligned_prod_flat_tmp[idx2*ALIGN_TERM_W +: ALIGN_TERM_W] =
-                        align_fixed_rz(s1_prod_sign_flat_hold[idx2],
-                                       prod_mag_s2_tmp,
-                                       prod_exp_s2_tmp,
-                                       s1_q.emax);
-                end
+        for (int idx2 = 0; idx2 < NUM_ELEMS; idx2 = idx2 + 1) begin
+            if (!s1_prod_zero_flat_hold[idx2]) begin
+                prod_sig_s2_tmp = s1_prod_sig_flat_hold[idx2*PROD_SIG_W +: PROD_SIG_W];
+                prod_exp_s2_tmp = $signed(s1_prod_exp_flat_hold[idx2*EXP_W +: EXP_W]);
+                prod_mag_s2_tmp = {{(ALIGN_MAG_W-PROD_SIG_W-PROD_ALIGN_PAD_W){1'b0}},
+                                   prod_sig_s2_tmp,
+                                   {PROD_ALIGN_PAD_W{1'b0}}};
+                s2_aligned_prod_flat_tmp[idx2*ALIGN_TERM_W +: ALIGN_TERM_W] =
+                    align_fixed_rz(s1_prod_sign_flat_hold[idx2],
+                                   prod_mag_s2_tmp,
+                                   prod_exp_s2_tmp,
+                                   s1_q.emax);
             end
+        end
 
-            if (!s1_q.c_zero) begin
-                c_mag_s2_tmp = {{(ALIGN_MAG_W-FP32_SIG_W-C_ALIGN_PAD_W){1'b0}},
-                                s1_q.c_sig,
-                                {C_ALIGN_PAD_W{1'b0}}};
-                s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_mag_s2_tmp, s1_q.c_exp, s1_q.emax);
-            end
+        if (!s1_q.c_zero) begin
+            c_mag_s2_tmp = {{(ALIGN_MAG_W-FP32_SIG_W-C_ALIGN_PAD_W){1'b0}},
+                            s1_q.c_sig,
+                            {C_ALIGN_PAD_W{1'b0}}};
+            s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_mag_s2_tmp, s1_q.c_exp, s1_q.emax);
         end
 
         s2_d.aligned_prod_flat = s2_aligned_prod_flat_tmp;
     end
 
     integer idx3;
-    logic signed [SUM_W-1:0] sum_acc_tmp;
-    logic signed [SUM_W-1:0] sum_term_s3_tmp [0:SUM_TERM_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l0_s3_tmp [0:SUM_CSA_L0_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l1_s3_tmp [0:SUM_CSA_L1_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l2_s3_tmp [0:SUM_CSA_L2_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l3_s3_tmp [0:SUM_CSA_L3_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l4_s3_tmp [0:SUM_CSA_L4_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l5_s3_tmp [0:SUM_CSA_L5_N-1];
-    logic [SUM_W-1:0]        sum_abs_s3_tmp;
-    logic [PACK_MSB_IDX_W-1:0] pack_msb_idx_s3_tmp;
-    integer                    pack_msb_idx_int_s3_tmp;
-    integer                    pack_base_exp_int_s3_tmp;
-    integer                    pack_unbiased_exp_s3_tmp;
+    logic signed [SUM_W-1:0] sum_l0_tmp [0:ACC_L0_TERMS-1];
+    logic signed [SUM_W-1:0] sum_l1_tmp [0:ACC_L1_TERMS-1];
+    logic signed [SUM_W-1:0] sum_l2_tmp [0:ACC_L2_TERMS-1];
+    logic signed [SUM_W-1:0] sum_l3_tmp [0:ACC_L3_TERMS-1];
+    logic signed [SUM_W-1:0] sum_l4_tmp [0:ACC_L4_TERMS-1];
+    logic signed [SUM_W-1:0] sum_final_tmp;
 
     always_comb begin
         s3_d = '0;
-        s3_d.special_vld    = s2_q.special_vld;
-        s3_d.special_result = s2_q.special_result;
-        s3_d.base_exp       = s2_q.base_exp;
-        sum_abs_s3_tmp      = '0;
-        pack_msb_idx_s3_tmp      = '0;
-        pack_msb_idx_int_s3_tmp  = 0;
-        pack_base_exp_int_s3_tmp = 0;
-        pack_unbiased_exp_s3_tmp = 0;
+        sum_final_tmp = '0;
+        s3_d.special_code = s2_q.special_code;
+        s3_d.base_exp     = s2_q.base_exp;
 
-        sum_term_s3_tmp[0] = s2_q.c_aligned;
+        for (idx3 = 0; idx3 < ACC_L0_TERMS; idx3 = idx3 + 1) begin
+            sum_l0_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < ACC_L1_TERMS; idx3 = idx3 + 1) begin
+            sum_l1_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < ACC_L2_TERMS; idx3 = idx3 + 1) begin
+            sum_l2_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < ACC_L3_TERMS; idx3 = idx3 + 1) begin
+            sum_l3_tmp[idx3] = '0;
+        end
+        for (idx3 = 0; idx3 < ACC_L4_TERMS; idx3 = idx3 + 1) begin
+            sum_l4_tmp[idx3] = '0;
+        end
+
+        sum_l0_tmp[0] = s2_q.c_aligned;
         for (idx3 = 0; idx3 < NUM_ELEMS; idx3 = idx3 + 1) begin
-            sum_term_s3_tmp[idx3+1] =
+            sum_l0_tmp[idx3+1] =
                 $signed(s2_aligned_prod_flat_hold[idx3*ALIGN_TERM_W +: ALIGN_TERM_W]);
         end
 
-        for (idx3 = 0; idx3 < SUM_CSA_L0_N; idx3 = idx3 + 1) begin
-            sum_csa_l0_s3_tmp[idx3] = '0;
+        for (idx3 = 0; idx3 < (ACC_L1_TERMS-1); idx3 = idx3 + 1) begin
+            sum_l1_tmp[idx3] = sum_l0_tmp[idx3*2] + sum_l0_tmp[idx3*2+1];
         end
-        for (idx3 = 0; idx3 < (SUM_TERM_N / 3); idx3 = idx3 + 1) begin
-            sum_csa_l0_s3_tmp[idx3*2] =
-                csa_sum3(sum_term_s3_tmp[idx3*3],
-                         sum_term_s3_tmp[idx3*3 + 1],
-                         sum_term_s3_tmp[idx3*3 + 2]);
-            sum_csa_l0_s3_tmp[idx3*2 + 1] =
-                csa_carry3(sum_term_s3_tmp[idx3*3],
-                           sum_term_s3_tmp[idx3*3 + 1],
-                           sum_term_s3_tmp[idx3*3 + 2]);
-        end
-        if ((SUM_TERM_N % 3) == 1) begin
-            sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1] = sum_term_s3_tmp[SUM_TERM_N-1];
-        end else if ((SUM_TERM_N % 3) == 2) begin
-            sum_csa_l0_s3_tmp[SUM_CSA_L0_N-2] = sum_term_s3_tmp[SUM_TERM_N-2];
-            sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1] = sum_term_s3_tmp[SUM_TERM_N-1];
-        end
+        sum_l1_tmp[ACC_L1_TERMS-1] = sum_l0_tmp[ACC_L0_TERMS-1];
 
-        for (idx3 = 0; idx3 < SUM_CSA_L1_N; idx3 = idx3 + 1) begin
-            sum_csa_l1_s3_tmp[idx3] = '0;
+        for (idx3 = 0; idx3 < (ACC_L2_TERMS-1); idx3 = idx3 + 1) begin
+            sum_l2_tmp[idx3] = sum_l1_tmp[idx3*2] + sum_l1_tmp[idx3*2+1];
         end
-        for (idx3 = 0; idx3 < (SUM_CSA_L0_N / 3); idx3 = idx3 + 1) begin
-            sum_csa_l1_s3_tmp[idx3*2] =
-                csa_sum3(sum_csa_l0_s3_tmp[idx3*3],
-                         sum_csa_l0_s3_tmp[idx3*3 + 1],
-                         sum_csa_l0_s3_tmp[idx3*3 + 2]);
-            sum_csa_l1_s3_tmp[idx3*2 + 1] =
-                csa_carry3(sum_csa_l0_s3_tmp[idx3*3],
-                           sum_csa_l0_s3_tmp[idx3*3 + 1],
-                           sum_csa_l0_s3_tmp[idx3*3 + 2]);
-        end
-        if ((SUM_CSA_L0_N % 3) == 1) begin
-            sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1] = sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1];
-        end else if ((SUM_CSA_L0_N % 3) == 2) begin
-            sum_csa_l1_s3_tmp[SUM_CSA_L1_N-2] = sum_csa_l0_s3_tmp[SUM_CSA_L0_N-2];
-            sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1] = sum_csa_l0_s3_tmp[SUM_CSA_L0_N-1];
-        end
+        sum_l2_tmp[ACC_L2_TERMS-1] = sum_l1_tmp[ACC_L1_TERMS-1];
 
-        for (idx3 = 0; idx3 < SUM_CSA_L2_N; idx3 = idx3 + 1) begin
-            sum_csa_l2_s3_tmp[idx3] = '0;
+        for (idx3 = 0; idx3 < (ACC_L3_TERMS-1); idx3 = idx3 + 1) begin
+            sum_l3_tmp[idx3] = sum_l2_tmp[idx3*2] + sum_l2_tmp[idx3*2+1];
         end
-        for (idx3 = 0; idx3 < (SUM_CSA_L1_N / 3); idx3 = idx3 + 1) begin
-            sum_csa_l2_s3_tmp[idx3*2] =
-                csa_sum3(sum_csa_l1_s3_tmp[idx3*3],
-                         sum_csa_l1_s3_tmp[idx3*3 + 1],
-                         sum_csa_l1_s3_tmp[idx3*3 + 2]);
-            sum_csa_l2_s3_tmp[idx3*2 + 1] =
-                csa_carry3(sum_csa_l1_s3_tmp[idx3*3],
-                           sum_csa_l1_s3_tmp[idx3*3 + 1],
-                           sum_csa_l1_s3_tmp[idx3*3 + 2]);
-        end
-        if ((SUM_CSA_L1_N % 3) == 1) begin
-            sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1] = sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1];
-        end else if ((SUM_CSA_L1_N % 3) == 2) begin
-            sum_csa_l2_s3_tmp[SUM_CSA_L2_N-2] = sum_csa_l1_s3_tmp[SUM_CSA_L1_N-2];
-            sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1] = sum_csa_l1_s3_tmp[SUM_CSA_L1_N-1];
-        end
+        sum_l3_tmp[ACC_L3_TERMS-1] = sum_l2_tmp[ACC_L2_TERMS-1];
 
-        for (idx3 = 0; idx3 < SUM_CSA_L3_N; idx3 = idx3 + 1) begin
-            sum_csa_l3_s3_tmp[idx3] = '0;
-        end
-        for (idx3 = 0; idx3 < (SUM_CSA_L2_N / 3); idx3 = idx3 + 1) begin
-            sum_csa_l3_s3_tmp[idx3*2] =
-                csa_sum3(sum_csa_l2_s3_tmp[idx3*3],
-                         sum_csa_l2_s3_tmp[idx3*3 + 1],
-                         sum_csa_l2_s3_tmp[idx3*3 + 2]);
-            sum_csa_l3_s3_tmp[idx3*2 + 1] =
-                csa_carry3(sum_csa_l2_s3_tmp[idx3*3],
-                           sum_csa_l2_s3_tmp[idx3*3 + 1],
-                           sum_csa_l2_s3_tmp[idx3*3 + 2]);
-        end
-        if ((SUM_CSA_L2_N % 3) == 1) begin
-            sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1] = sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1];
-        end else if ((SUM_CSA_L2_N % 3) == 2) begin
-            sum_csa_l3_s3_tmp[SUM_CSA_L3_N-2] = sum_csa_l2_s3_tmp[SUM_CSA_L2_N-2];
-            sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1] = sum_csa_l2_s3_tmp[SUM_CSA_L2_N-1];
-        end
+        sum_l4_tmp[0] = sum_l3_tmp[0] + sum_l3_tmp[1];
+        sum_l4_tmp[1] = sum_l3_tmp[2];
 
-        for (idx3 = 0; idx3 < SUM_CSA_L4_N; idx3 = idx3 + 1) begin
-            sum_csa_l4_s3_tmp[idx3] = '0;
-        end
-        for (idx3 = 0; idx3 < (SUM_CSA_L3_N / 3); idx3 = idx3 + 1) begin
-            sum_csa_l4_s3_tmp[idx3*2] =
-                csa_sum3(sum_csa_l3_s3_tmp[idx3*3],
-                         sum_csa_l3_s3_tmp[idx3*3 + 1],
-                         sum_csa_l3_s3_tmp[idx3*3 + 2]);
-            sum_csa_l4_s3_tmp[idx3*2 + 1] =
-                csa_carry3(sum_csa_l3_s3_tmp[idx3*3],
-                           sum_csa_l3_s3_tmp[idx3*3 + 1],
-                           sum_csa_l3_s3_tmp[idx3*3 + 2]);
-        end
-        if ((SUM_CSA_L3_N % 3) == 1) begin
-            sum_csa_l4_s3_tmp[SUM_CSA_L4_N-1] = sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1];
-        end else if ((SUM_CSA_L3_N % 3) == 2) begin
-            sum_csa_l4_s3_tmp[SUM_CSA_L4_N-2] = sum_csa_l3_s3_tmp[SUM_CSA_L3_N-2];
-            sum_csa_l4_s3_tmp[SUM_CSA_L4_N-1] = sum_csa_l3_s3_tmp[SUM_CSA_L3_N-1];
-        end
-
-        sum_csa_l5_s3_tmp[0] = csa_sum3(sum_csa_l4_s3_tmp[0],
-                                        sum_csa_l4_s3_tmp[1],
-                                        sum_csa_l4_s3_tmp[2]);
-        sum_csa_l5_s3_tmp[1] = csa_carry3(sum_csa_l4_s3_tmp[0],
-                                          sum_csa_l4_s3_tmp[1],
-                                          sum_csa_l4_s3_tmp[2]);
-        sum_acc_tmp = sum_csa_l5_s3_tmp[0] + sum_csa_l5_s3_tmp[1];
-
-        s3_d.sum_nonzero = (sum_acc_tmp != '0);
-        s3_d.sum_sign    = sum_acc_tmp[SUM_W-1];
-        if (sum_acc_tmp[SUM_W-1]) begin
-            sum_abs_s3_tmp = -sum_acc_tmp;
-        end else begin
-            sum_abs_s3_tmp = sum_acc_tmp;
-        end
-        s3_d.sum_abs = sum_abs_s3_tmp;
-
-        if (sum_acc_tmp != '0) begin
-            pack_msb_idx_int_s3_tmp  = pack_msb_idx(sum_abs_s3_tmp);
-            pack_msb_idx_s3_tmp      = pack_msb_idx_int_s3_tmp[PACK_MSB_IDX_W-1:0];
-            pack_base_exp_int_s3_tmp = $signed({{(32-EXP_W){s3_d.base_exp[EXP_W-1]}}, s3_d.base_exp});
-            pack_unbiased_exp_s3_tmp = pack_base_exp_int_s3_tmp + pack_msb_idx_int_s3_tmp;
-            s3_d.pack_msb_idx        = pack_msb_idx_s3_tmp;
-            s3_d.pack_sub_lsb_idx    = FP32_EXP_MIN_SUB - pack_base_exp_int_s3_tmp;
-
-            if (pack_unbiased_exp_s3_tmp > FP32_EXP_MAX) begin
-                s3_d.pack_overflow  = 1'b1;
-                s3_d.pack_exp_field = 8'hff;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_NORMAL) begin
-                s3_d.pack_normal    = 1'b1;
-                s3_d.pack_exp_field = pack_unbiased_exp_s3_tmp + FP32_EXP_BIAS;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_SUB) begin
-                s3_d.pack_subnormal = 1'b1;
-            end
-        end
+        sum_final_tmp = sum_l4_tmp[0] + sum_l4_tmp[1];
+        s3_d.sum_sign = sum_final_tmp[SUM_W-1];
+        s3_d.sum_abs  = sum_final_tmp[SUM_W-1] ? $unsigned(-sum_final_tmp)
+                                               : $unsigned(sum_final_tmp);
     end
 
     always_comb begin
         s4_d = '0;
-        s4_d.result = s3_q.special_vld ? s3_q.special_result
-                                       : pack_fp32_rz(s3_q.sum_nonzero, s3_q.sum_sign,
-                                                      s3_q.sum_abs, s3_q.pack_msb_idx,
-                                                      s3_q.pack_exp_field,
-                                                      s3_q.pack_overflow,
-                                                      s3_q.pack_normal,
-                                                      s3_q.pack_subnormal,
-                                                      s3_q.pack_sub_lsb_idx);
+        s4_d.result = (s3_q.special_code != SPECIAL_NONE) ? pack_special_fp32(s3_q.special_code)
+                                                          : pack_fp32_rz(s3_q.sum_sign,
+                                                                        s3_q.sum_abs,
+                                                                        s3_q.base_exp);
     end
 
     pipeline_reg #(

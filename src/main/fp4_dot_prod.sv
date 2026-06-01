@@ -34,10 +34,6 @@ module fp4_dot_prod (
     localparam int NUM_ELEMS      = 64;
     localparam int BLOCK_SIZE     = 16;
     localparam int NUM_BLOCKS     = 4;
-    localparam int SUM_TERM_N     = NUM_BLOCKS + 1;
-    localparam int SUM_TREE_L0_N  = (SUM_TERM_N + 1) / 2;
-    localparam int SUM_TREE_L1_N  = (SUM_TREE_L0_N + 1) / 2;
-    localparam int SUM_TREE_L2_N  = (SUM_TREE_L1_N + 1) / 2;
     localparam logic [1:0] FP4_MODE_NVFP4     = 2'd0;
     localparam logic [1:0] FP4_MODE_MXFP4     = 2'd1;
     localparam logic [1:0] FP4_MODE_FP4       = 2'd2;
@@ -60,24 +56,12 @@ module fp4_dot_prod (
     localparam int ALIGN_TERM_W   = ALIGN_MAG_W + 1;
     localparam int ALIGN_SHIFT_W  = $clog2(ALIGN_MAG_W + 1);
     localparam int SUM_W          = ALIGN_TERM_W + 3;
-    localparam int PACK_SIG_W     = 24;
-    localparam int PACK_FRAC_W    = 23;
-    localparam int PACK_MSB_IDX_W = $clog2(SUM_W);
-    localparam int PACK_LOD_GRP_W = 10;
-    localparam int PACK_LOD_GRP_N = (SUM_W + PACK_LOD_GRP_W - 1) / PACK_LOD_GRP_W;
-    localparam int PACK_EXP_CLASS_W = C_EXP_W + 1;
-    localparam int FP32_EXP_BIAS       = 127;
-    localparam int FP32_EXP_MAX        = 127;
-    localparam int FP32_EXP_MIN_NORMAL = -126;
-    localparam int FP32_EXP_MIN_SUB    = -149;
-    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_BIAS_PACK       = FP32_EXP_BIAS;
-    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MAX_PACK        = FP32_EXP_MAX;
-    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MIN_NORMAL_PACK = FP32_EXP_MIN_NORMAL;
-    localparam logic signed [PACK_EXP_CLASS_W-1:0] FP32_EXP_MIN_SUB_PACK    = FP32_EXP_MIN_SUB;
     localparam logic signed [C_EXP_W-1:0] FP4_DOT_EXP = -10'sd2;
     localparam logic signed [C_EXP_W-1:0] ALIGN_FRAC_EXP = ALIGN_FRAC_W;
     localparam logic signed [C_EXP_W-1:0] GAMMA_NORM_EXP = 10'sd8;
+    localparam logic signed [C_EXP_W-1:0] EMAX_REL_BIAS_EXP = FP4_DOT_EXP + GAMMA_NORM_EXP;
     localparam logic signed [C_EXP_W-1:0] C_NORM_EXP     = 10'sd23;
+    localparam logic signed [C_EXP_W-1:0] C_REL_NORM_EXP = C_NORM_EXP - EMAX_REL_BIAS_EXP;
     localparam int GAMMA_ALIGN_LSHIFT_W = ALIGN_FRAC_W - GAMMA_NORM_EXP;
     localparam int C_ALIGN_LSHIFT_W     = ALIGN_FRAC_W - C_NORM_EXP;
     localparam int C_ALIGN_PAD_W        = ALIGN_MAG_W - C_SIG_W - C_ALIGN_LSHIFT_W;
@@ -87,10 +71,10 @@ module fp4_dot_prod (
         logic [31:0]             special_result;
         logic [NUM_BLOCKS*SIGMA_W-1:0]   sigma_flat;
         logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] sf_sig_prod_flat;
-        logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  sf_exp_sum_flat;
+        logic [NUM_BLOCKS*C_EXP_W-1:0]   gamma_rel_exp_flat;
         logic                    c_sign;
         logic [C_SIG_W-1:0]      c_sig;
-        logic signed [C_EXP_W-1:0] c_exp;
+        logic signed [C_EXP_W-1:0] c_rel_exp;
     } stage0_data_t;
 
     typedef struct packed {
@@ -98,10 +82,10 @@ module fp4_dot_prod (
         logic [31:0]             special_result;
         logic [NUM_BLOCKS-1:0]              gamma_sign_flat;
         logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  gamma_mag_flat;
-        logic [NUM_BLOCKS*C_EXP_W-1:0]      gamma_exp_flat;
+        logic [NUM_BLOCKS*C_EXP_W-1:0]      gamma_rel_exp_flat;
         logic                    c_sign;
         logic [C_SIG_W-1:0]      c_mag;
-        logic signed [C_EXP_W-1:0] c_exp;
+        logic signed [C_EXP_W-1:0] c_rel_exp;
         logic signed [C_EXP_W-1:0] emax;
     } stage1_data_t;
 
@@ -110,21 +94,14 @@ module fp4_dot_prod (
         logic [31:0]             special_result;
         logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] gamma_aligned_flat;
         logic signed [ALIGN_TERM_W-1:0] c_aligned;
-        logic signed [C_EXP_W-1:0] emax;
+        logic signed [C_EXP_W-1:0] base_exp;
     } stage2_data_t;
 
     typedef struct packed {
         logic                    special_valid;
         logic [31:0]             special_result;
-        logic                    sum_nonzero;
         logic                    sum_sign;
-        logic [SUM_W-1:0]        sum_abs;
-        logic [PACK_MSB_IDX_W-1:0] pack_msb_idx;
-        logic [7:0]              pack_exp_field;
-        logic                    pack_overflow;
-        logic                    pack_normal;
-        logic                    pack_subnormal;
-        logic signed [C_EXP_W:0] pack_sub_lsb_idx;
+        logic [SUM_W-1:0]        abs_sum;
         logic signed [C_EXP_W-1:0] base_exp;
     } stage3_data_t;
 
@@ -157,29 +134,29 @@ module fp4_dot_prod (
 
     logic [NUM_BLOCKS*SIGMA_W-1:0]   s0_sigma_flat_tmp;
     logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] s0_sf_sig_prod_flat_tmp;
-    logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  s0_sf_exp_sum_flat_tmp;
+    logic [NUM_BLOCKS*C_EXP_W-1:0]   s0_gamma_rel_exp_flat_tmp;
 
     logic [NUM_BLOCKS*SIGMA_W-1:0]   s0_sigma_flat_hold;
     logic [NUM_BLOCKS*SF_SIG_PROD_W-1:0] s0_sf_sig_prod_flat_hold;
-    logic [NUM_BLOCKS*SF_EXP_SUM_W-1:0]  s0_sf_exp_sum_flat_hold;
+    logic [NUM_BLOCKS*C_EXP_W-1:0]   s0_gamma_rel_exp_flat_hold;
 
     logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_tmp;
     logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  s1_gamma_mag_flat_tmp;
-    logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_exp_flat_tmp;
+    logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_rel_exp_flat_tmp;
 
     logic [NUM_BLOCKS-1:0]              s1_gamma_sign_flat_hold;
     logic [NUM_BLOCKS*GAMMA_SIG_W-1:0]  s1_gamma_mag_flat_hold;
-    logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_exp_flat_hold;
+    logic [NUM_BLOCKS*C_EXP_W-1:0]      s1_gamma_rel_exp_flat_hold;
 
     logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_tmp;
     logic [NUM_BLOCKS*ALIGN_TERM_W-1:0] s2_gamma_aligned_flat_hold;
 
     assign s0_sigma_flat_hold    = s0_q.sigma_flat;
     assign s0_sf_sig_prod_flat_hold = s0_q.sf_sig_prod_flat;
-    assign s0_sf_exp_sum_flat_hold  = s0_q.sf_exp_sum_flat;
+    assign s0_gamma_rel_exp_flat_hold = s0_q.gamma_rel_exp_flat;
     assign s1_gamma_sign_flat_hold = s1_q.gamma_sign_flat;
     assign s1_gamma_mag_flat_hold  = s1_q.gamma_mag_flat;
-    assign s1_gamma_exp_flat_hold  = s1_q.gamma_exp_flat;
+    assign s1_gamma_rel_exp_flat_hold  = s1_q.gamma_rel_exp_flat;
     assign s2_gamma_aligned_flat_hold = s2_q.gamma_aligned_flat;
 
     function automatic logic [3:0] fp4_mag2(input logic [2:0] code_i);
@@ -216,39 +193,6 @@ module fp4_dot_prod (
         end
     endfunction
 
-    function automatic logic signed [SIGMA_W-1:0] fp4_block_sigma(
-        input logic [BLOCK_SIZE*FP4_W-1:0] a_blk_i,
-        input logic [BLOCK_SIZE*FP4_W-1:0] b_blk_i
-    );
-        logic signed [FP4_PROD_W-1:0] prod_tmp;
-        logic signed [SIGMA_W-1:0]    sigma_l0 [0:15];
-        logic signed [SIGMA_W-1:0]    sigma_l1 [0:7];
-        logic signed [SIGMA_W-1:0]    sigma_l2 [0:3];
-        logic signed [SIGMA_W-1:0]    sigma_l3 [0:1];
-        integer idx;
-        begin
-            prod_tmp = '0;
-            for (idx = 0; idx < BLOCK_SIZE; idx = idx + 1) begin
-                prod_tmp = fp4_product(a_blk_i[idx*FP4_W +: FP4_W],
-                                       b_blk_i[idx*FP4_W +: FP4_W]);
-                sigma_l0[idx] = $signed({{(SIGMA_W-FP4_PROD_W){prod_tmp[FP4_PROD_W-1]}},
-                                         prod_tmp});
-            end
-
-            for (idx = 0; idx < 8; idx = idx + 1) begin
-                sigma_l1[idx] = sigma_l0[idx*2] + sigma_l0[idx*2+1];
-            end
-            for (idx = 0; idx < 4; idx = idx + 1) begin
-                sigma_l2[idx] = sigma_l1[idx*2] + sigma_l1[idx*2+1];
-            end
-            for (idx = 0; idx < 2; idx = idx + 1) begin
-                sigma_l3[idx] = sigma_l2[idx*2] + sigma_l2[idx*2+1];
-            end
-
-            fp4_block_sigma = sigma_l3[0] + sigma_l3[1];
-        end
-    endfunction
-
     function automatic logic [SF_EXP_W+4:0] decode_ue4m3_scale(input logic [SCALE_W-1:0] scale_i);
         logic [7:0] scale_eff;
         logic [3:0] exp_raw;
@@ -267,7 +211,7 @@ module fp4_dot_prod (
 
             if (is_zero) begin
                 sig = 4'd0;
-                exp = -9'sd129;
+                exp = '0;
             end else if (exp_raw == 4'b0000) begin
                 sig = {1'b0, mant_raw};
                 exp = -9'sd9;
@@ -372,189 +316,57 @@ module fp4_dot_prod (
         end
     endfunction
 
-    function automatic logic emax_pick_vld(
-        input logic a_vld_i,
-        input logic b_vld_i
-    );
-        begin
-            emax_pick_vld = a_vld_i | b_vld_i;
-        end
-    endfunction
-
-    function automatic logic signed [C_EXP_W-1:0] emax_pick_exp(
-        input logic                      a_vld_i,
-        input logic signed [C_EXP_W-1:0] a_exp_i,
-        input logic                      b_vld_i,
-        input logic signed [C_EXP_W-1:0] b_exp_i
-    );
-        begin
-            if (!a_vld_i) begin
-                emax_pick_exp = b_exp_i;
-            end else if (!b_vld_i) begin
-                emax_pick_exp = a_exp_i;
-            end else if (b_exp_i > a_exp_i) begin
-                emax_pick_exp = b_exp_i;
-            end else begin
-                emax_pick_exp = a_exp_i;
-            end
-        end
-    endfunction
-
-    function automatic logic signed [SUM_W-1:0] csa_sum3(
-        input logic signed [SUM_W-1:0] a_i,
-        input logic signed [SUM_W-1:0] b_i,
-        input logic signed [SUM_W-1:0] z_i
-    );
-        begin
-            csa_sum3 = $signed(a_i ^ b_i ^ z_i);
-        end
-    endfunction
-
-    function automatic logic signed [SUM_W-1:0] csa_carry3(
-        input logic signed [SUM_W-1:0] a_i,
-        input logic signed [SUM_W-1:0] b_i,
-        input logic signed [SUM_W-1:0] z_i
-    );
-        logic [SUM_W-1:0] carry_bits;
-        begin
-            carry_bits = (a_i & b_i) | (a_i & z_i) | (b_i & z_i);
-            csa_carry3 = $signed({carry_bits[SUM_W-2:0], 1'b0});
-        end
-    endfunction
-
-    function automatic logic [PACK_MSB_IDX_W-1:0] pack_lod_group_idx(
-        input logic [PACK_LOD_GRP_W-1:0] grp_bits_i
-    );
-        begin
-            casez (grp_bits_i)
-                10'b1?????????: pack_lod_group_idx = PACK_MSB_IDX_W'(9);
-                10'b01????????: pack_lod_group_idx = PACK_MSB_IDX_W'(8);
-                10'b001???????: pack_lod_group_idx = PACK_MSB_IDX_W'(7);
-                10'b0001??????: pack_lod_group_idx = PACK_MSB_IDX_W'(6);
-                10'b00001?????: pack_lod_group_idx = PACK_MSB_IDX_W'(5);
-                10'b000001????: pack_lod_group_idx = PACK_MSB_IDX_W'(4);
-                10'b0000001???: pack_lod_group_idx = PACK_MSB_IDX_W'(3);
-                10'b00000001??: pack_lod_group_idx = PACK_MSB_IDX_W'(2);
-                10'b000000001?: pack_lod_group_idx = PACK_MSB_IDX_W'(1);
-                default:        pack_lod_group_idx = '0;
-            endcase
-        end
-    endfunction
-
-    function automatic logic [PACK_MSB_IDX_W-1:0] pack_msb_idx(input logic [SUM_W-1:0] abs_sum_i);
-        integer grp_idx;
-        integer bit_idx;
-        integer sum_idx;
-        logic [PACK_LOD_GRP_W-1:0]     grp_bits [0:PACK_LOD_GRP_N-1];
-        logic [PACK_LOD_GRP_N-1:0]     grp_vld;
-        logic [PACK_MSB_IDX_W-1:0]     grp_msb_idx [0:PACK_LOD_GRP_N-1];
-        begin
-            pack_msb_idx = 0;
-
-            for (grp_idx = 0; grp_idx < PACK_LOD_GRP_N; grp_idx = grp_idx + 1) begin
-                grp_bits[grp_idx]    = '0;
-                grp_vld[grp_idx]     = 1'b0;
-                grp_msb_idx[grp_idx] = '0;
-
-                for (bit_idx = 0; bit_idx < PACK_LOD_GRP_W; bit_idx = bit_idx + 1) begin
-                    sum_idx = grp_idx * PACK_LOD_GRP_W + bit_idx;
-                    if (sum_idx < SUM_W) begin
-                        grp_bits[grp_idx][bit_idx] = abs_sum_i[sum_idx];
-                    end
-                end
-
-                grp_vld[grp_idx]     = |grp_bits[grp_idx];
-                grp_msb_idx[grp_idx] = pack_lod_group_idx(grp_bits[grp_idx]);
-            end
-
-            casez (grp_vld)
-                5'b1????: pack_msb_idx = PACK_MSB_IDX_W'(4*PACK_LOD_GRP_W) + grp_msb_idx[4];
-                5'b01???: pack_msb_idx = PACK_MSB_IDX_W'(3*PACK_LOD_GRP_W) + grp_msb_idx[3];
-                5'b001??: pack_msb_idx = PACK_MSB_IDX_W'(2*PACK_LOD_GRP_W) + grp_msb_idx[2];
-                5'b0001?: pack_msb_idx = PACK_MSB_IDX_W'(1*PACK_LOD_GRP_W) + grp_msb_idx[1];
-                5'b00001: pack_msb_idx = grp_msb_idx[0];
-                default:  pack_msb_idx = '0;
-            endcase
-        end
-    endfunction
-
-    function automatic logic [PACK_SIG_W-1:0] pack_sig24_from_abs(
-        input logic [SUM_W-1:0] abs_sum_i,
-        input logic [PACK_MSB_IDX_W-1:0] msb_idx_i
-    );
-        integer sig_idx;
-        integer sum_idx;
-        begin
-            pack_sig24_from_abs = '0;
-
-            for (sig_idx = 0; sig_idx < PACK_SIG_W; sig_idx = sig_idx + 1) begin
-                sum_idx = msb_idx_i - (PACK_SIG_W - 1 - sig_idx);
-                if (sum_idx >= 0) begin
-                    pack_sig24_from_abs[sig_idx] = abs_sum_i[sum_idx];
-                end
-            end
-        end
-    endfunction
-
-    function automatic logic [PACK_FRAC_W-1:0] pack_subnormal_frac_from_abs(
-        input logic [SUM_W-1:0] abs_sum_i,
-        input logic signed [C_EXP_W:0] sub_lsb_idx_i
-    );
-        integer frac_idx;
-        integer sum_idx;
-        begin
-            pack_subnormal_frac_from_abs = '0;
-
-            for (frac_idx = 0; frac_idx < PACK_FRAC_W; frac_idx = frac_idx + 1) begin
-                sum_idx = frac_idx + sub_lsb_idx_i;
-                if ((sum_idx >= 0) && (sum_idx < SUM_W)) begin
-                    pack_subnormal_frac_from_abs[frac_idx] = abs_sum_i[sum_idx];
-                end
-            end
-        end
-    endfunction
-
     function automatic logic [31:0] pack_fp32_rz(
-        input logic                    sum_nonzero_i,
-        input logic                    sign_i,
+        input logic                    sum_sign_i,
         input logic [SUM_W-1:0]        abs_sum_i,
-        input logic [PACK_MSB_IDX_W-1:0] msb_idx_i,
-        input logic [7:0]              exp_field_i,
-        input logic                    overflow_i,
-        input logic                    normal_i,
-        input logic                    subnormal_i,
-        input logic signed [C_EXP_W:0] sub_lsb_idx_i
+        input logic signed [C_EXP_W-1:0] base_exp_i
     );
-        logic             sign_bit;
-        logic [SUM_W-1:0] abs_sum;
+        logic [SUM_W-1:0] norm_sum;
         logic [23:0]      sig24;
         logic [22:0]      frac_field;
         logic [7:0]       exp_field;
+        integer           msb_idx;
+        integer           norm_lshift;
+        integer           unbiased_exp;
+        integer           shift_sub;
+        integer           i;
         begin
-            pack_fp32_rz = 32'h0000_0000;
-            sign_bit     = sign_i;
-            abs_sum      = abs_sum_i;
-            sig24        = '0;
-            frac_field   = '0;
-            exp_field    = '0;
-
-            if (sum_nonzero_i) begin
-                if (overflow_i) begin
-                    exp_field   = 8'hff;
-                    frac_field  = 23'h0;
-                end else if (normal_i) begin
-                    sig24       = pack_sig24_from_abs(abs_sum, msb_idx_i);
-                    exp_field   = exp_field_i;
-                    frac_field  = sig24[22:0];
-                end else if (subnormal_i) begin
-                    exp_field   = 8'h00;
-                    frac_field  = pack_subnormal_frac_from_abs(abs_sum, sub_lsb_idx_i);
-                end else begin
-                    exp_field   = 8'h00;
-                    frac_field  = 23'h0;
+            if (abs_sum_i == '0) begin
+                pack_fp32_rz = 32'h0000_0000;
+            end else begin
+                msb_idx = 0;
+                for (i = 0; i < SUM_W; i = i + 1) begin
+                    if (abs_sum_i[i]) begin
+                        msb_idx = i;
+                    end
                 end
 
-                pack_fp32_rz = {sign_bit, exp_field, frac_field};
+                unbiased_exp = base_exp_i + msb_idx;
+                norm_lshift  = (SUM_W - 1) - msb_idx;
+                norm_sum     = abs_sum_i << norm_lshift;
+                sig24        = norm_sum[SUM_W-1 -: 24];
+
+                if (unbiased_exp > 127) begin
+                    exp_field   = 8'hff;
+                    frac_field  = 23'h0;
+                end else if (unbiased_exp >= -126) begin
+                    exp_field   = unbiased_exp + 127;
+                    frac_field  = sig24[22:0];
+                end else if (unbiased_exp < -149) begin
+                    exp_field   = 8'h00;
+                    frac_field  = 23'h0;
+                end else begin
+                    shift_sub   = -126 - unbiased_exp;
+                    sig24       = sig24 >> shift_sub;
+                    exp_field   = 8'h00;
+                    frac_field  = sig24[22:0];
+                end
+
+                if ((exp_field == 8'h00) && (frac_field == 23'h0)) begin
+                    pack_fp32_rz = 32'h0000_0000;
+                end else begin
+                    pack_fp32_rz = {sum_sign_i, exp_field, frac_field};
+                end
             end
         end
     endfunction
@@ -563,30 +375,46 @@ module fp4_dot_prod (
     integer g1;
     integer g3;
     integer g4;
+    integer k0;
     logic [SF_EXP_W+4:0] scale_dec_a;
     logic [SF_EXP_W+4:0] scale_dec_b;
-    logic [SF_SIG_W-1:0] scale_sig_a_tmp;
-    logic [SF_SIG_W-1:0] scale_sig_b_tmp;
-    logic signed [SF_EXP_W-1:0] scale_exp_a_tmp;
-    logic signed [SF_EXP_W-1:0] scale_exp_b_tmp;
     logic [37:0]         c_dec;
     logic        any_scale_nan;
+    logic signed [SIGMA_W-1:0]    sigma_acc_s0;
+    logic signed [FP4_PROD_W-1:0] fp4_prod_tmp_s0;
+    logic signed [SF_EXP_W-1:0]   a_sf_exp_tmp_s0;
+    logic signed [SF_EXP_W-1:0]   b_sf_exp_tmp_s0;
+    logic signed [SF_EXP_SUM_W-1:0] sf_exp_sum_tmp_s0;
+    logic signed [C_EXP_W-1:0]    gamma_rel_exp_tmp_s0;
+    logic signed [C_EXP_W-1:0]    c_rel_exp_s0_tmp;
+    logic                         c_emax_vld_s0;
 
     always_comb begin
         s0_d = '0;
         any_scale_nan = 1'b0;
         s0_sigma_flat_tmp    = '0;
         s0_sf_sig_prod_flat_tmp = '0;
-        s0_sf_exp_sum_flat_tmp  = '0;
-        scale_sig_a_tmp = '0;
-        scale_sig_b_tmp = '0;
-        scale_exp_a_tmp = '0;
-        scale_exp_b_tmp = '0;
+        s0_gamma_rel_exp_flat_tmp = '0;
+        sigma_acc_s0         = '0;
+        fp4_prod_tmp_s0      = '0;
+        a_sf_exp_tmp_s0      = '0;
+        b_sf_exp_tmp_s0      = '0;
+        sf_exp_sum_tmp_s0    = '0;
+        gamma_rel_exp_tmp_s0 = '0;
+        c_rel_exp_s0_tmp     = '0;
+        c_emax_vld_s0        = 1'b0;
 
         for (g0 = 0; g0 < NUM_BLOCKS; g0 = g0 + 1) begin
-            s0_sigma_flat_tmp[g0*SIGMA_W +: SIGMA_W] =
-                fp4_block_sigma(a_fp4_i[g0*BLOCK_SIZE*FP4_W +: BLOCK_SIZE*FP4_W],
-                                b_fp4_i[g0*BLOCK_SIZE*FP4_W +: BLOCK_SIZE*FP4_W]);
+            sigma_acc_s0 = '0;
+            for (k0 = 0; k0 < BLOCK_SIZE; k0 = k0 + 1) begin
+                fp4_prod_tmp_s0 =
+                    fp4_product(a_fp4_i[(g0*BLOCK_SIZE+k0)*FP4_W +: FP4_W],
+                                b_fp4_i[(g0*BLOCK_SIZE+k0)*FP4_W +: FP4_W]);
+                sigma_acc_s0 = sigma_acc_s0
+                              + $signed({{(SIGMA_W-FP4_PROD_W){fp4_prod_tmp_s0[FP4_PROD_W-1]}},
+                                         fp4_prod_tmp_s0});
+            end
+            s0_sigma_flat_tmp[g0*SIGMA_W +: SIGMA_W] = sigma_acc_s0;
 
             case (fp4_mode_i)
                 FP4_MODE_MXFP4: begin
@@ -606,25 +434,29 @@ module fp4_dot_prod (
                     scale_dec_b = decode_ue4m3_scale(b_sf_i[g0*SCALE_W +: SCALE_W]);
                 end
             endcase
-            scale_sig_a_tmp = scale_dec_a[SF_EXP_W+3:SF_EXP_W];
-            scale_sig_b_tmp = scale_dec_b[SF_EXP_W+3:SF_EXP_W];
-            scale_exp_a_tmp = $signed(scale_dec_a[SF_EXP_W-1:0]);
-            scale_exp_b_tmp = $signed(scale_dec_b[SF_EXP_W-1:0]);
             s0_sf_sig_prod_flat_tmp[g0*SF_SIG_PROD_W +: SF_SIG_PROD_W] =
-                scale_sig_a_tmp * scale_sig_b_tmp;
-            s0_sf_exp_sum_flat_tmp[g0*SF_EXP_SUM_W +: SF_EXP_SUM_W] =
-                scale_exp_a_tmp + scale_exp_b_tmp;
+                scale_dec_a[SF_EXP_W+3:SF_EXP_W] * scale_dec_b[SF_EXP_W+3:SF_EXP_W];
+            a_sf_exp_tmp_s0 = $signed(scale_dec_a[SF_EXP_W-1:0]);
+            b_sf_exp_tmp_s0 = $signed(scale_dec_b[SF_EXP_W-1:0]);
+            sf_exp_sum_tmp_s0 = a_sf_exp_tmp_s0 + b_sf_exp_tmp_s0;
+            gamma_rel_exp_tmp_s0 = $signed(sf_exp_sum_tmp_s0);
+            s0_gamma_rel_exp_flat_tmp[g0*C_EXP_W +: C_EXP_W] = gamma_rel_exp_tmp_s0;
             any_scale_nan = any_scale_nan | scale_dec_a[SF_EXP_W+4] | scale_dec_b[SF_EXP_W+4];
         end
 
-        s0_d.sigma_flat       = s0_sigma_flat_tmp;
-        s0_d.sf_sig_prod_flat = s0_sf_sig_prod_flat_tmp;
-        s0_d.sf_exp_sum_flat  = s0_sf_exp_sum_flat_tmp;
+        c_dec = decode_c(c_fp32_i);
+        c_emax_vld_s0 = (c_dec[33:10] != '0);
+        if (c_emax_vld_s0) begin
+            c_rel_exp_s0_tmp = $signed(c_dec[9:0]) + C_REL_NORM_EXP;
+        end
 
-        c_dec         = decode_c(c_fp32_i);
+        s0_d.sigma_flat    = s0_sigma_flat_tmp;
+        s0_d.sf_sig_prod_flat = s0_sf_sig_prod_flat_tmp;
+        s0_d.gamma_rel_exp_flat = s0_gamma_rel_exp_flat_tmp;
+
         s0_d.c_sign   = c_dec[37];
         s0_d.c_sig    = c_dec[33:10];
-        s0_d.c_exp    = $signed(c_dec[9:0]);
+        s0_d.c_rel_exp = c_rel_exp_s0_tmp;
 
         if (any_scale_nan || c_dec[35]) begin
             s0_d.special_valid  = 1'b1;
@@ -640,109 +472,81 @@ module fp4_dot_prod (
 
     logic signed [SIGMA_W-1:0]      sigma_tmp;
     logic [SF_SIG_PROD_W-1:0]       sf_sig_prod_tmp;
-    logic signed [SF_EXP_SUM_W-1:0] sf_exp_sum_tmp_s1;
     logic signed [GAMMA_SIG_W-1:0]  gamma_sig_tmp_s1;
-    logic signed [C_EXP_W-1:0]      gamma_exp_tmp_s1;
-    logic signed [C_EXP_W-1:0]      gamma_norm_exp_s1_tmp;
-    logic signed [C_EXP_W-1:0]      c_norm_exp_s1_tmp;
+    logic signed [C_EXP_W-1:0]      gamma_rel_exp_tmp_s1;
     logic                           gamma_sign_tmp_s1;
     logic [GAMMA_SIG_W-1:0]         gamma_abs_tmp_s1;
     logic [GAMMA_SIG_W-1:0]         gamma_mag_tmp_s1;
-    logic                           emax_l0_vld_tmp [0:4];
-    logic signed [C_EXP_W-1:0]      emax_l0_exp_tmp [0:4];
-    logic                           emax_l1_vld_tmp [0:2];
-    logic signed [C_EXP_W-1:0]      emax_l1_exp_tmp [0:2];
-    logic                           emax_l2_vld_tmp [0:1];
-    logic signed [C_EXP_W-1:0]      emax_l2_exp_tmp [0:1];
+    logic signed [C_EXP_W-1:0]      gamma_emax_l0_exp_s1 [0:3];
+    logic signed [C_EXP_W-1:0]      gamma_emax_l1_exp_s1 [0:1];
+    logic signed [C_EXP_W-1:0]      gamma_emax_s1;
+    logic                           c_emax_vld_s1;
 
     always_comb begin
         s1_d = '0;
         s1_gamma_sign_flat_tmp = '0;
         s1_gamma_mag_flat_tmp  = '0;
-        s1_gamma_exp_flat_tmp  = '0;
+        s1_gamma_rel_exp_flat_tmp  = '0;
         s1_d.special_valid  = s0_q.special_valid;
         s1_d.special_result = s0_q.special_result;
         s1_d.c_sign         = s0_q.c_sign;
+        s1_d.c_mag          = s0_q.c_sig;
+        s1_d.c_rel_exp      = s0_q.c_rel_exp;
         sigma_tmp           = '0;
         sf_sig_prod_tmp     = '0;
-        sf_exp_sum_tmp_s1   = '0;
         gamma_sig_tmp_s1    = '0;
-        gamma_exp_tmp_s1    = '0;
-        gamma_norm_exp_s1_tmp = '0;
-        c_norm_exp_s1_tmp   = '0;
+        gamma_rel_exp_tmp_s1 = '0;
         gamma_sign_tmp_s1   = 1'b0;
         gamma_abs_tmp_s1    = '0;
         gamma_mag_tmp_s1    = '0;
-        if (s0_q.c_sig == '0) begin
-            s1_d.c_exp = '0;
-            s1_d.c_mag = '0;
-        end else begin
-            s1_d.c_exp       = s0_q.c_exp;
-            s1_d.c_mag       = s0_q.c_sig;
-        end
-
+        gamma_emax_l0_exp_s1[0] = '0;
+        gamma_emax_l0_exp_s1[1] = '0;
+        gamma_emax_l0_exp_s1[2] = '0;
+        gamma_emax_l0_exp_s1[3] = '0;
+        gamma_emax_l1_exp_s1[0] = '0;
+        gamma_emax_l1_exp_s1[1] = '0;
+        gamma_emax_s1           = '0;
+        c_emax_vld_s1           = 1'b0;
         for (g1 = 0; g1 < NUM_BLOCKS; g1 = g1 + 1) begin
             sigma_tmp = $signed(s0_sigma_flat_hold[g1*SIGMA_W +: SIGMA_W]);
-            sf_sig_prod_tmp = s0_sf_sig_prod_flat_hold[g1*SF_SIG_PROD_W +: SF_SIG_PROD_W];
-            sf_exp_sum_tmp_s1 =
-                $signed(s0_sf_exp_sum_flat_hold[g1*SF_EXP_SUM_W +: SF_EXP_SUM_W]);
+            sf_sig_prod_tmp =
+                s0_sf_sig_prod_flat_hold[g1*SF_SIG_PROD_W +: SF_SIG_PROD_W];
 
             gamma_sig_tmp_s1 = sigma_tmp * $signed({1'b0, sf_sig_prod_tmp});
-            gamma_exp_tmp_s1 = $signed(sf_exp_sum_tmp_s1) + FP4_DOT_EXP;
-            gamma_norm_exp_s1_tmp = gamma_exp_tmp_s1 + GAMMA_NORM_EXP;
+            gamma_rel_exp_tmp_s1 = $signed(s0_gamma_rel_exp_flat_hold[g1*C_EXP_W +: C_EXP_W]);
             gamma_sign_tmp_s1 = gamma_sig_tmp_s1[GAMMA_SIG_W-1];
-            if (gamma_sig_tmp_s1 == '0) begin
-                gamma_mag_tmp_s1 = '0;
+            if (gamma_sign_tmp_s1) begin
+                gamma_abs_tmp_s1 = -gamma_sig_tmp_s1;
             end else begin
-                if (gamma_sign_tmp_s1) begin
-                    gamma_abs_tmp_s1 = -gamma_sig_tmp_s1;
-                end else begin
-                    gamma_abs_tmp_s1 = gamma_sig_tmp_s1;
-                end
-                gamma_mag_tmp_s1 = gamma_abs_tmp_s1;
+                gamma_abs_tmp_s1 = gamma_sig_tmp_s1;
             end
+            gamma_mag_tmp_s1 = gamma_abs_tmp_s1;
 
             s1_gamma_sign_flat_tmp[g1] = gamma_sign_tmp_s1;
             s1_gamma_mag_flat_tmp[g1*GAMMA_SIG_W +: GAMMA_SIG_W] = gamma_mag_tmp_s1;
-            s1_gamma_exp_flat_tmp[g1*C_EXP_W +: C_EXP_W] = gamma_exp_tmp_s1;
-            emax_l0_vld_tmp[g1] = 1'b1;
-            emax_l0_exp_tmp[g1] = gamma_norm_exp_s1_tmp;
+            s1_gamma_rel_exp_flat_tmp[g1*C_EXP_W +: C_EXP_W] = gamma_rel_exp_tmp_s1;
+            gamma_emax_l0_exp_s1[g1] = gamma_rel_exp_tmp_s1;
         end
 
-        if (s0_q.c_sig == '0) begin
-            emax_l0_vld_tmp[4] = 1'b0;
-            emax_l0_exp_tmp[4] = '0;
-        end else begin
-            c_norm_exp_s1_tmp = s0_q.c_exp + C_NORM_EXP;
-            emax_l0_vld_tmp[4] = 1'b1;
-            emax_l0_exp_tmp[4] = c_norm_exp_s1_tmp;
-        end
-
-        for (g1 = 0; g1 < 2; g1 = g1 + 1) begin
-            emax_l1_vld_tmp[g1] = emax_pick_vld(emax_l0_vld_tmp[g1*2],
-                                                emax_l0_vld_tmp[g1*2+1]);
-            emax_l1_exp_tmp[g1] = emax_pick_exp(emax_l0_vld_tmp[g1*2],
-                                                emax_l0_exp_tmp[g1*2],
-                                                emax_l0_vld_tmp[g1*2+1],
-                                                emax_l0_exp_tmp[g1*2+1]);
-        end
-        emax_l1_vld_tmp[2] = emax_l0_vld_tmp[4];
-        emax_l1_exp_tmp[2] = emax_l0_exp_tmp[4];
-
-        emax_l2_vld_tmp[0] = emax_pick_vld(emax_l1_vld_tmp[0], emax_l1_vld_tmp[1]);
-        emax_l2_exp_tmp[0] = emax_pick_exp(emax_l1_vld_tmp[0], emax_l1_exp_tmp[0],
-                                           emax_l1_vld_tmp[1], emax_l1_exp_tmp[1]);
-        emax_l2_vld_tmp[1] = emax_l1_vld_tmp[2];
-        emax_l2_exp_tmp[1] = emax_l1_exp_tmp[2];
+        gamma_emax_l1_exp_s1[0] =
+            (gamma_emax_l0_exp_s1[1] > gamma_emax_l0_exp_s1[0])
+          ? gamma_emax_l0_exp_s1[1] : gamma_emax_l0_exp_s1[0];
+        gamma_emax_l1_exp_s1[1] =
+            (gamma_emax_l0_exp_s1[3] > gamma_emax_l0_exp_s1[2])
+          ? gamma_emax_l0_exp_s1[3] : gamma_emax_l0_exp_s1[2];
+        gamma_emax_s1 =
+            (gamma_emax_l1_exp_s1[1] > gamma_emax_l1_exp_s1[0])
+          ? gamma_emax_l1_exp_s1[1] : gamma_emax_l1_exp_s1[0];
+        c_emax_vld_s1 = (s0_q.c_sig != '0);
+        s1_d.emax = (c_emax_vld_s1 && (s0_q.c_rel_exp > gamma_emax_s1))
+                  ? s0_q.c_rel_exp : gamma_emax_s1;
 
         s1_d.gamma_sign_flat = s1_gamma_sign_flat_tmp;
         s1_d.gamma_mag_flat  = s1_gamma_mag_flat_tmp;
-        s1_d.gamma_exp_flat  = s1_gamma_exp_flat_tmp;
-        s1_d.emax = emax_pick_exp(emax_l2_vld_tmp[0], emax_l2_exp_tmp[0],
-                                  emax_l2_vld_tmp[1], emax_l2_exp_tmp[1]);
+        s1_d.gamma_rel_exp_flat  = s1_gamma_rel_exp_flat_tmp;
     end
 
-    logic signed [C_EXP_W-1:0] gamma_exp_ext;
+    logic signed [C_EXP_W-1:0] gamma_rel_exp_ext;
     logic [ALIGN_MAG_W-1:0]    gamma_align_mag_tmp;
     logic [ALIGN_MAG_W-1:0]    c_align_mag_tmp;
 
@@ -751,108 +555,53 @@ module fp4_dot_prod (
         s2_gamma_aligned_flat_tmp = '0;
         s2_d.special_valid  = s1_q.special_valid;
         s2_d.special_result = s1_q.special_result;
-        gamma_exp_ext       = '0;
+        gamma_rel_exp_ext   = '0;
         gamma_align_mag_tmp = '0;
         c_align_mag_tmp     = '0;
 
-        // GDFS Step 5 alignment uses the normalized emax registered in S1.
-        s2_d.emax = s1_q.emax;
+        // GDFS Step 5 alignment uses the gamma-relative emax registered in S1.
+        s2_d.base_exp = s1_q.emax + EMAX_REL_BIAS_EXP - ALIGN_FRAC_EXP;
 
         for (g3 = 0; g3 < NUM_BLOCKS; g3 = g3 + 1) begin
-            gamma_exp_ext = $signed(s1_gamma_exp_flat_hold[g3*C_EXP_W +: C_EXP_W]);
+            gamma_rel_exp_ext = $signed(s1_gamma_rel_exp_flat_hold[g3*C_EXP_W +: C_EXP_W]);
             gamma_align_mag_tmp =
                 {s1_gamma_mag_flat_hold[g3*GAMMA_SIG_W +: (GAMMA_SIG_W-1)],
                  {GAMMA_ALIGN_LSHIFT_W{1'b0}}};
             s2_gamma_aligned_flat_tmp[g3*ALIGN_TERM_W +: ALIGN_TERM_W] =
                 align_fixed_rz(s1_gamma_sign_flat_hold[g3],
                                gamma_align_mag_tmp,
-                               gamma_exp_ext + GAMMA_NORM_EXP,
+                               gamma_rel_exp_ext,
                                s1_q.emax);
         end
         s2_d.gamma_aligned_flat = s2_gamma_aligned_flat_tmp;
 
         c_align_mag_tmp = {{C_ALIGN_PAD_W{1'b0}}, s1_q.c_mag, {C_ALIGN_LSHIFT_W{1'b0}}};
-        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_align_mag_tmp, s1_q.c_exp + C_NORM_EXP, s1_q.emax);
+        s2_d.c_aligned = align_fixed_rz(s1_q.c_sign, c_align_mag_tmp, s1_q.c_rel_exp, s1_q.emax);
     end
 
     logic signed [SUM_W-1:0] sum_acc;
-    logic signed [SUM_W-1:0] sum_term_s3_tmp [0:SUM_TERM_N-1];
-    logic signed [SUM_W-1:0] sum_csa_l0_s3_tmp [0:3];
-    logic signed [SUM_W-1:0] sum_csa_l1_s3_tmp [0:2];
-    logic signed [SUM_W-1:0] sum_csa_l2_s3_tmp [0:1];
     logic [SUM_W-1:0]        sum_abs_s3_tmp;
-    logic [PACK_MSB_IDX_W-1:0] pack_msb_idx_s3_tmp;
-    logic signed [PACK_EXP_CLASS_W-1:0] pack_base_exp_s3_tmp;
-    logic signed [PACK_EXP_CLASS_W-1:0] pack_msb_idx_ext_s3_tmp;
-    logic signed [PACK_EXP_CLASS_W-1:0] pack_unbiased_exp_s3_tmp;
-    logic signed [PACK_EXP_CLASS_W-1:0] pack_biased_exp_s3_tmp;
 
     always_comb begin
         s3_d = '0;
         s3_d.special_valid  = s2_q.special_valid;
         s3_d.special_result = s2_q.special_result;
-        s3_d.base_exp       = s2_q.emax - ALIGN_FRAC_EXP;
+        s3_d.base_exp       = s2_q.base_exp;
         sum_abs_s3_tmp      = '0;
-        pack_msb_idx_s3_tmp = '0;
-        pack_base_exp_s3_tmp = '0;
-        pack_msb_idx_ext_s3_tmp = '0;
-        pack_unbiased_exp_s3_tmp = '0;
-        pack_biased_exp_s3_tmp = '0;
 
-        sum_term_s3_tmp[0] =
-            $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}},
-                     s2_q.c_aligned});
+        sum_acc = $signed({{(SUM_W-ALIGN_TERM_W){s2_q.c_aligned[ALIGN_TERM_W-1]}}, s2_q.c_aligned});
         for (g4 = 0; g4 < NUM_BLOCKS; g4 = g4 + 1) begin
-            sum_term_s3_tmp[g4+1] =
-                $signed({{(SUM_W-ALIGN_TERM_W){s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
-                         s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W +: ALIGN_TERM_W]});
+            sum_acc = sum_acc
+                    + $signed({{(SUM_W-ALIGN_TERM_W){s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W + ALIGN_TERM_W-1]}},
+                               s2_gamma_aligned_flat_hold[g4*ALIGN_TERM_W +: ALIGN_TERM_W]});
         end
-        sum_csa_l0_s3_tmp[0] = csa_sum3(sum_term_s3_tmp[0], sum_term_s3_tmp[1],
-                                        sum_term_s3_tmp[2]);
-        sum_csa_l0_s3_tmp[1] = csa_carry3(sum_term_s3_tmp[0], sum_term_s3_tmp[1],
-                                          sum_term_s3_tmp[2]);
-        sum_csa_l0_s3_tmp[2] = sum_term_s3_tmp[3];
-        sum_csa_l0_s3_tmp[3] = sum_term_s3_tmp[4];
-        sum_csa_l1_s3_tmp[0] = csa_sum3(sum_csa_l0_s3_tmp[0], sum_csa_l0_s3_tmp[1],
-                                        sum_csa_l0_s3_tmp[2]);
-        sum_csa_l1_s3_tmp[1] = csa_carry3(sum_csa_l0_s3_tmp[0], sum_csa_l0_s3_tmp[1],
-                                          sum_csa_l0_s3_tmp[2]);
-        sum_csa_l1_s3_tmp[2] = sum_csa_l0_s3_tmp[3];
-        sum_csa_l2_s3_tmp[0] = csa_sum3(sum_csa_l1_s3_tmp[0], sum_csa_l1_s3_tmp[1],
-                                        sum_csa_l1_s3_tmp[2]);
-        sum_csa_l2_s3_tmp[1] = csa_carry3(sum_csa_l1_s3_tmp[0], sum_csa_l1_s3_tmp[1],
-                                          sum_csa_l1_s3_tmp[2]);
-        sum_acc = sum_csa_l2_s3_tmp[0] + sum_csa_l2_s3_tmp[1];
-
-        s3_d.sum_nonzero = (sum_acc != '0);
-        s3_d.sum_sign    = sum_acc[SUM_W-1];
         if (sum_acc[SUM_W-1]) begin
-            sum_abs_s3_tmp = -sum_acc;
+            sum_abs_s3_tmp = $unsigned(-sum_acc);
         end else begin
-            sum_abs_s3_tmp = sum_acc;
+            sum_abs_s3_tmp = $unsigned(sum_acc);
         end
-        s3_d.sum_abs = sum_abs_s3_tmp;
-
-        if (sum_acc != '0) begin
-            pack_msb_idx_s3_tmp      = pack_msb_idx(sum_abs_s3_tmp);
-            pack_base_exp_s3_tmp     = $signed({s3_d.base_exp[C_EXP_W-1], s3_d.base_exp});
-            pack_msb_idx_ext_s3_tmp  =
-                $signed({{(PACK_EXP_CLASS_W-PACK_MSB_IDX_W){1'b0}}, pack_msb_idx_s3_tmp});
-            pack_unbiased_exp_s3_tmp = pack_base_exp_s3_tmp + pack_msb_idx_ext_s3_tmp;
-            pack_biased_exp_s3_tmp   = pack_unbiased_exp_s3_tmp + FP32_EXP_BIAS_PACK;
-            s3_d.pack_msb_idx         = pack_msb_idx_s3_tmp;
-            s3_d.pack_sub_lsb_idx     = FP32_EXP_MIN_SUB_PACK - pack_base_exp_s3_tmp;
-
-            if (pack_unbiased_exp_s3_tmp > FP32_EXP_MAX_PACK) begin
-                s3_d.pack_overflow  = 1'b1;
-                s3_d.pack_exp_field = 8'hff;
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_NORMAL_PACK) begin
-                s3_d.pack_normal    = 1'b1;
-                s3_d.pack_exp_field = pack_biased_exp_s3_tmp[7:0];
-            end else if (pack_unbiased_exp_s3_tmp >= FP32_EXP_MIN_SUB_PACK) begin
-                s3_d.pack_subnormal = 1'b1;
-            end
-        end
+        s3_d.sum_sign = sum_acc[SUM_W-1];
+        s3_d.abs_sum  = sum_abs_s3_tmp;
     end
 
     always_comb begin
@@ -860,11 +609,7 @@ module fp4_dot_prod (
         if (s3_q.special_valid) begin
             s4_d.result = s3_q.special_result;
         end else begin
-            s4_d.result = pack_fp32_rz(s3_q.sum_nonzero, s3_q.sum_sign,
-                                       s3_q.sum_abs, s3_q.pack_msb_idx,
-                                       s3_q.pack_exp_field, s3_q.pack_overflow,
-                                       s3_q.pack_normal, s3_q.pack_subnormal,
-                                       s3_q.pack_sub_lsb_idx);
+            s4_d.result = pack_fp32_rz(s3_q.sum_sign, s3_q.abs_sum, s3_q.base_exp);
         end
     end
 
