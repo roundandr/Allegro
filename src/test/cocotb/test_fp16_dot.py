@@ -29,7 +29,7 @@ def fmt_name(fmt_is_bf16: int) -> str:
     return "BF16" if fmt_is_bf16 else "FP16"
 
 
-def mode_code(fmt_is_bf16: int) -> int:
+def dtype_code(fmt_is_bf16: int) -> int:
     return 1 if fmt_is_bf16 else 2
 
 
@@ -54,8 +54,8 @@ def case_dump(
 async def reset_dut(dut) -> None:
     dut.in_vld_i.value = 0
     dut.out_rdy_i.value = 1
-    dut.a_mode_i.value = 2
-    dut.b_mode_i.value = 2
+    dut.a_dtype_i.value = 2
+    dut.b_dtype_i.value = 2
     dut.a_vec_i.value = 0
     dut.b_vec_i.value = 0
     dut.c_i.value = 0
@@ -85,8 +85,8 @@ async def run_case(
     dut.b_vec_i.value = b_bits
     dut.c_i.value = c_bits
     dut.scale_input_d_i.value = scale_input_d
-    dut.a_mode_i.value = mode_code(a_fmt_is_bf16)
-    dut.b_mode_i.value = mode_code(b_fmt_is_bf16)
+    dut.a_dtype_i.value = dtype_code(a_fmt_is_bf16)
+    dut.b_dtype_i.value = dtype_code(b_fmt_is_bf16)
     dut.in_vld_i.value = 1
     await RisingEdge(dut.clk)
     dut.in_vld_i.value = 0
@@ -122,8 +122,8 @@ async def fp16_bf16_dot_matches_mmasim(dut):
         "rst_n",
         "in_vld_i",
         "in_rdy_o",
-        "a_mode_i",
-        "b_mode_i",
+        "a_dtype_i",
+        "b_dtype_i",
         "a_vec_i",
         "b_vec_i",
         "c_i",

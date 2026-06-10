@@ -423,7 +423,7 @@ $$
 | ----------------- | --: | ----------------------- |
 | `prod_sign[k]`    |   1 | 第 k 个乘积符号               |
 | `prod_sig[k]`     | 参数化 | 第 k 个非归一化乘积 significand |
-| `prod_exp[k]`     |  10 | 第 k 个乘积指数               |
+| `prod_exp[k]`     |   6 | 第 k 个未加 scale 的 product-domain 乘积指数 |
 | `prod_is_zero[k]` |   1 | 第 k 个乘积是否为 0            |
 
 对于 E4M3：
@@ -446,26 +446,31 @@ $$
 
 为了统一硬件路径，可以统一扩展为 8-bit product significand。
 
-MXFP8 模式下 product exponent 需要覆盖 FP8 product exponent 加两路 E8M0 scale exponent，因此内部 signed exponent 宽度至少为 10 bit。当前 RTL 统一采用：
+RTL 将 exponent 分为三档，避免 32 路 product 路径被 MX scale 放大：
 
 ```text
-EXP_W = 10
+LANE_EXP_W = 5
+PROD_EXP_W = 6
+FULL_EXP_W = 10
 ```
+
+其中 `LANE_EXP_W` 覆盖 F4/F6/F8 operand 的非零有限 unbiased exponent，`PROD_EXP_W` 覆盖未加 scale 的 `e_a + e_b`。两路 E8M0 scale exponent 作为公共 offset 单独传递，只在 C 比较、C 对齐和最终 `base_exp` 计算处进入 `FULL_EXP_W` 路径。
 
 ---
 
 ## 5.3 Step 3：Max Exponent Search and Alignment
 
-该阶段寻找：
+该阶段在 product-domain 寻找：
 
 $$
-e_{\max} = \max { e_c, e_0, e_1, \dots, e_{31} }
+e_{\max,p} = \max { e_c - e_s, e_0, e_1, \dots, e_{31} }
 $$
 
 其中：
 
 * `e_c` 来自 FP32 输入 C 的原始 signed exponent
-* `e_k` 来自第 k 个 FP8 乘积的 signed exponent；MXFP8 模式下该 exponent 已包含 A/B scale exponent
+* `e_s = e_{sa} + e_{sb}` 是两路 E8M0 scale exponent 之和；非 MX 模式下为 0
+* `e_k` 来自第 k 个乘积的未加 scale product-domain signed exponent
 
 ---
 
@@ -499,30 +504,39 @@ $$
 
 ### 5.3.2 Max Exponent Search
 
-输入比较项数量为 33 个：
+输入比较项数量最多为 33 个：
 
-* 32 个 product exponent
-* 1 个 C exponent
+* 32 个非零 product exponent
+* 1 个非零 C exponent，经 `e_c - e_s` 转换到 product-domain
 
-当前 RTL 使用同级平衡比较树实现，避免 32 路串行比较链：
+当前 RTL 将比较树拆在 S0/S1 两级流水边界上实现，避免 S1 承担完整 33 项树：
 
 ```text
-Level 0: 32 个 product exponent + 1 个 C exponent
-Level 1: pairwise max
-Level 2: pairwise max
-Level 3: pairwise max
-Level 4: pairwise max
-Level 5: final max
+S0 product pre-reduce:
+  Level 0: 32 个 product exponent
+  Level 1: pairwise max, 32 -> 16
+  Level 2: pairwise max, 16 -> 8
+
+S1 final emax:
+  Level 0: 8 个 product partial max + 1 个 product-domain C exponent
+  Level 1: pairwise max, 9 -> 5
+  Level 2: pairwise max, 5 -> 3
+  Level 3: pairwise max, 3 -> 2
+  Level 4: final max, 2 -> 1
 ```
 
 输出：
 
 | 接口名称         | 位宽 | 说明                  |
 | ------------ | -: | ------------------- |
-| `emax_o`     | 10 | products 和 C 中的最大原始 exponent |
+| `emax_o`     | 10 | product-domain 下 products 和 C 的最大 exponent |
 | `emax_vld_o` |  1 | emax 有效             |
 
-普通 FP8 模式下 FP8 product exponent 与 FP32 C exponent 可由 9-bit signed exponent 覆盖。MXFP8 模式下，E8M0 scale exponent 范围扩大 product exponent，统一使用 signed 10-bit exponent。
+product emax pre-reduce 只比较 6-bit product exponent sign-extend 后的值；C 在 S1 进入最终比较前用 `e_c - e_s` 转换到 10-bit product-domain。最终输出打包使用的 base exponent 为：
+
+$$
+e_{base} = e_{\max,p} + e_s - 25
+$$
 
 零项不参与 `emax` 搜索。若 32 个 product 和 `C` 全为零，则：
 
@@ -537,7 +551,7 @@ Level 5: final max
 每个乘积和 C 均对齐到 `F=25` 的 fixed-point 域。公共基准指数为：
 
 $$
-base\_exp = e_{\max} - 25
+base\_exp = e_{\max,p} + e_s - 25
 $$
 
 在当前 RTL 中，product 和 C 会先被编码到固定 `F=25` fractional-bit 域，然后再进入对齐级。
@@ -545,7 +559,11 @@ $$
 因此对齐级本身只需要：
 
 $$
-\text{shift} = e_{\max} - e
+\text{shift}_{prod} = e_{\max,p} - e_k
+$$
+
+$$
+\text{shift}_{C} = e_{\max,p} - (e_c - e_s)
 $$
 
 $$
@@ -554,9 +572,10 @@ $$
 
 其行为为：
 
-* `emax` 搜索只比较原始 exponent；
+* product 对齐使用 product-domain exponent，不在 32 路 product 对齐前端加入 scale；
+* C 对齐先转换到 product-domain，等价于 scaled-domain 的 `e_{\max} - e_c`；
 * 对齐级本身不再执行左移；
-* magnitude 只按 `emax - e` 右移，并直接丢弃 shifted-out bits；
+* magnitude 只按对应 product-domain shift 右移，并直接丢弃 shifted-out bits；
 * 右移始终执行 `round-to-zero`；
 * 若右移量大于等于操作数位宽，则输出 0。
 
@@ -619,7 +638,7 @@ $$
 由于所有项均已对齐到同一个基准指数：
 
 $$
-base\_exp = e_{\max} - 25
+base\_exp = e_{\max,p} + e_s - 25
 $$
 
 因此加法只需要 fixed-point integer addition。
@@ -628,16 +647,16 @@ $$
 
 ### 5.4.1 累加器位宽
 
-单个 product aligned significand 最大幅值小于：
+单个 product aligned significand 最大幅值为：
 
 $$
-4
+\left(\frac{15}{8}\right)^2 = \frac{225}{64} = 3.515625
 $$
 
-32 个乘积的最大幅值小于：
+32 个乘积的最大幅值为：
 
 $$
-32 \times 3.0625 = 98
+32 \times \frac{225}{64} = 112.5
 $$
 
 再加上 C，C 最大 aligned significand 小于：
@@ -649,13 +668,13 @@ $$
 因此总和最大幅值小于：
 
 $$
-100
+114.5
 $$
 
 为了覆盖：
 
 $$
-[-100, +100]
+[-114.5, +114.5]
 $$
 
 整数 magnitude 至少需要 7 bit，因为：
@@ -680,29 +699,34 @@ $$
 1 + 7 + 25 = 33 \text{ bits}
 $$
 
-当前 RTL 额外保留 guard bits，采用：
+当前 RTL 采用该最小安全位宽：
 
 ```text
-SUM_W = 35
+SUM_W = 33
 ```
 
 ---
 
 ### 5.4.2 加法树结构
 
-推荐使用平衡加法树：
+当前 RTL 将 33 项累加树拆成两级流水，并按固定 `8+8+8+8+1` 分组：
 
 ```text
 33 inputs:
-  32 product terms
-  1 C term
+  term[0]     = C term
+  term[1:32]  = 32 product terms
 
-Stage A: 33 -> 17
-Stage B: 17 -> 9
-Stage C: 9 -> 5
-Stage D: 5 -> 3
-Stage E: 3 -> 2
-Stage F: 2 -> 1
+S3 partial reduce:
+  partial[0] = balanced_sum8(term[0:7])
+  partial[1] = balanced_sum8(term[8:15])
+  partial[2] = balanced_sum8(term[16:23])
+  partial[3] = balanced_sum8(term[24:31])
+  partial[4] = term[32]
+
+S4 final reduce:
+  sum01 = partial[0] + partial[1]
+  sum23 = partial[2] + partial[3]
+  sum   = (sum01 + sum23) + partial[4]
 ```
 
 由于 Step 3 已经完成截断，Step 4 只做 fixed-point exact addition，因此：
@@ -827,11 +851,14 @@ $$
 
 | Stage | 名称                                      | 主要功能                                     |
 | --- | --- | --- |
-| S0    | Input Register / Decode / Product Generation | 输入寄存、FP8 解码、E8M0 scale decode、FP32 C 解码、特殊值检查、32 路 FP8 significand 精确乘法并生成非归一化 product |
-| S1    | Max Exponent Search                     | 用平衡比较树搜索 32 个 product 与 C 的 exponent 最大值；MXFP8 product exponent 已包含 scale exponent |
-| S2    | Alignment                               | 计算 shift amount，对齐到 `S2.25`，并输出 `base_exp = emax - 25` |
-| S3    | Fixed-Point Accumulation                | 33 输入 fixed-point 加法树，得到 `S7.25` 累加结果 |
-| S4    | FP32 Normalize / RZ Round               | 归一化、溢出处理、subnormal 处理、RZ 输出 FP32         |
+| S0    | Input Register / Decode / Product Generation | 输入寄存、FP8 解码、E8M0 scale decode、FP32 C 解码、特殊值检查、32 路 FP8 significand 精确乘法，并将非零 product exponent 预归约为 8 个 partial max |
+| S1    | Max Exponent Search                     | 用平衡比较树在 8 个 product partial max 与 product-domain C 之间搜索 exponent 最大值；MX scale 作为公共 offset 单独传递 |
+| S2    | Alignment                               | 计算 product-domain shift amount，对齐到 `S2.25`，并输出 `base_exp = emax_p + scale_sum - 25` |
+| S3    | Fixed-Point Partial Reduce              | 33 输入按 `8+8+8+8+1` 分组成 5 个 partial sum |
+| S4    | Fixed-Point Final Reduce                | 5 个 partial sum 平衡相加，得到 `S7.25` 累加结果 |
+| S5    | FP32 Normalize / RZ Round               | 归一化、溢出处理、subnormal 处理、RZ 输出 FP32         |
+
+当前 F4F6F8 core latency 为 6 stage；外层需要将 response metadata 延迟同样设置为 6 stage。
 
 
 
@@ -855,7 +882,7 @@ $$
 | `fp8_format_i`   |  1 | 0: E4M3，1: E5M2    |
 | `sign_o`         |  1 | 符号位                |
 | `sig_o`          |  4 | 统一扩展后的 significand |
-| `exp_o`          | 10 | signed exponent    |
+| `exp_o`          |  5 | 非零有限 operand 的 signed unbiased exponent |
 | `is_zero_o`      |  1 | 是否为 zero           |
 | `is_subnormal_o` |  1 | 是否为 subnormal      |
 | `is_inf_o`       |  1 | 是否为 Inf            |
@@ -866,6 +893,7 @@ $$
 * 当 `fp8_format_i = 0`（E4M3）时，`is_inf_o` 恒为 `1'b0`；
 * 当 `fp8_format_i = 0`（E4M3）且 `exp = 4'b1111 && mant = 3'b111` 时，`is_nan_o = 1'b1`；
 * 当 `fp8_format_i = 1`（E5M2）时，按 E5M2 的 Inf / NaN 编码规则生成 `is_inf_o` 与 `is_nan_o`。
+* zero / special operand 的 `exp_o` 置 0，后级通过 `is_zero_o` / `is_inf_o` / `is_nan_o` 屏蔽。
 
 ---
 
@@ -887,13 +915,13 @@ $$
 | ------------- | -: | ------------------------- |
 | `a_sign_i`    |  1 | A 符号                      |
 | `a_sig_i`     |  4 | A significand             |
-| `a_exp_i`     | 10 | A exponent                |
+| `a_exp_i`     |  5 | A operand exponent        |
 | `b_sign_i`    |  1 | B 符号                      |
 | `b_sig_i`     |  4 | B significand             |
-| `b_exp_i`     | 10 | B exponent                |
+| `b_exp_i`     |  5 | B operand exponent        |
 | `prod_sign_o` |  1 | product 符号                |
 | `prod_sig_o`  |  8 | exact product significand |
-| `prod_exp_o`  | 10 | product exponent          |
+| `prod_exp_o`  |  6 | 未加 scale 的 product exponent |
 | `prod_zero_o` |  1 | product 是否为 0             |
 
 ### 内部逻辑
@@ -998,23 +1026,25 @@ $$
 
 ### 功能
 
-搜索 33 个有效项中的最大原始 exponent。当前实现保持 5 级流水，在 S1 内使用平衡比较树完成 `emax` 搜索。
+搜索最多 33 个有效项中的 product-domain 最大 exponent。当前 core 为 6 级流水：S0 对 32 个 product exponent 做 `32 -> 16 -> 8` pre-reduce，S1 对 8 个 product partial max 和 C 做最终 `emax` 搜索。
 
 ### 接口定义
 
 | 接口名称               |     位宽 | 说明                    |
 | ------------------ | -----: | --------------------- |
-| `prod_exp_i[31:0]`     | 32 × 10 | 32 个 product exponent |
+| `prod_exp_i[31:0]`     | 32 × 6 | 32 个未加 scale 的 product exponent |
 | `prod_is_zero_i[31:0]` |     32 | 32 个 product 是否为 0 |
 | `c_exp_i`              |     10 | C exponent            |
+| `mx_scale_exp_sum_i`   |     10 | 两路 E8M0 scale exponent 之和 |
 | `c_is_zero_i`          |      1 | C 是否为 0            |
-| `emax_o`               |     10 | 最大原始 exponent |
+| `emax_o`               |     10 | product-domain 最大 exponent |
 | `emax_vld_o`           |      1 | 最大指数有效                |
 
 实现要点：
 
 * 仅对 `prod_is_zero_i[k] = 0` 的 product 参与比较，比较值为 `prod_exp_i[k]`；
-* 仅当 `c_is_zero_i = 0` 时，C 才参与比较，比较值为 `c_exp_i`；
+* S0 只处理 product-only emax pre-reduce，不加入 MX scale，也不比较 C；
+* 仅当 `c_is_zero_i = 0` 时，C 才参与比较，比较值为 `c_exp_i - mx_scale_exp_sum_i`；
 * 若所有输入项都为零，则 `emax_vld_o = 0`，后级按全零数据路径处理。
 
 ---
@@ -1031,19 +1061,20 @@ $$
 | ---------------------- | ------: | -------------------------------- |
 | `prod_sign_i[31:0]`    |      32 | product sign                     |
 | `prod_mag_i[31:0]`     | 32 × 27 | 已编码到 `F=25` fixed-point 域的 product magnitude |
-| `prod_exp_i[31:0]`     | 32 × 10 | product exponent                 |
+| `prod_exp_i[31:0]`     | 32 × 6 | 未加 scale 的 product exponent |
 | `c_sign_i`             |       1 | C sign                           |
 | `c_mag_i`              |      27 | 已编码到 `F=25` fixed-point 域的 C magnitude |
 | `c_exp_i`              |      10 | C exponent                       |
-| `emax_i`               |      10 | 最大原始 exponent                |
+| `mx_scale_exp_sum_i`   |      10 | 两路 E8M0 scale exponent 之和 |
+| `emax_i`               |      10 | product-domain 最大 exponent |
 | `aligned_prod_o[31:0]` | 32 × 28 | 对齐后的 product fixed-point 值，S2.25 |
 | `aligned_c_o`          |      28 | 对齐后的 C fixed-point 值，S2.25       |
-| `base_exp_o`           |      10 | 公共基准指数，`base_exp_o = emax_i - 25` |
+| `base_exp_o`           |      10 | 公共基准指数，`base_exp_o = emax_i + mx_scale_exp_sum_i - 25` |
 
 实现要点：
 
 * product 的移位量为 `emax_i - prod_exp_i[k]`；
-* C 的移位量为 `emax_i - c_exp_i`；
+* C 的移位量为 `emax_i - (c_exp_i - mx_scale_exp_sum_i)`；
 * 对齐级只按 magnitude 右移并执行 `RZ`；
 * 若 `emax_vld = 0`，则 `aligned_prod_o`、`aligned_c_o` 和 `base_exp_o` 全部输出 0。
 
@@ -1065,8 +1096,10 @@ $$
 | ---------------------- | ------: | ----------------------------------------- |
 | `aligned_prod_i[31:0]` | 32 × 28 | 32 个对齐后的 product                          |
 | `aligned_c_i`          |      28 | 对齐后的 C                                    |
-| `sum_o`                |      35 | fixed-point 累加结果，至少覆盖 `S7.25`，当前 RTL 保留 guard bits |
+| `sum_o`                |      33 | fixed-point 累加结果，覆盖 `S7.25` |
 | `sum_zero_o`           |       1 | 累加结果是否为 0                                 |
+
+实现上该单元拆成两级流水：第一拍输出 5 个 33-bit partial sum，第二拍输出最终 33-bit sum。
 
 ---
 
@@ -1080,7 +1113,7 @@ $$
 
 | 接口名称          | 位宽 | 说明                     |
 | ------------- | -: | ---------------------- |
-| `sum_i`       | 35 | fixed-point 累加结果       |
+| `sum_i`       | 33 | fixed-point 累加结果       |
 | `base_exp_i`  | 10 | 对齐使用的公共基准指数         |
 | `d_o`         | 32 | FP32 输出                |
 | `overflow_o`  |  1 | 输出是否 overflow 到 Inf    |

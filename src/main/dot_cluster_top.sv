@@ -2,7 +2,7 @@
 // File Name   : dot_cluster_top.sv
 // Author      : LIU YUXUAN
 // Date        : 2026-04-29
-// Description : Multi-precision dot-product cluster wrapper with A-side
+// Description : Multi-precision dot-product cluster wrapper with B-side
 //               structured sparse operand selection and dtype dispatch.
 //
 // Revision History:
@@ -44,6 +44,8 @@ module dot_cluster_top #(
     output logic [TAG_W-1:0]  out_tag_o
 );
 
+    import dot_prod_pkg::*;
+
     localparam logic [3:0] DTYPE_TF32    = 4'd0;
     localparam logic [3:0] DTYPE_BF16    = 4'd1;
     localparam logic [3:0] DTYPE_FP16    = 4'd2;
@@ -55,20 +57,12 @@ module dot_cluster_top #(
     localparam logic [3:0] DTYPE_FP6_E2M3 = 4'd8;
 
     // Share groups represent physical arithmetic datapath ownership.
-    // TF32/BF16/FP16 share the MID-FP 16-lane 11x11 datapath.
+    // TF32/BF16/FP16 share the F16TF32 16-lane 11x11 datapath.
     localparam logic [2:0] SHARE_GROUP_NONE  = 3'd0;
-    localparam logic [2:0] SHARE_GROUP_MIDFP = 3'd1;
+    localparam logic [2:0] SHARE_GROUP_F16TF32 = 3'd1;
     localparam logic [2:0] SHARE_GROUP_F4F6F8  = 3'd2;
     localparam logic [2:0] SHARE_GROUP_INT8  = 3'd3;
     localparam logic [2:0] SHARE_GROUP_FP4   = 3'd4;
-
-    localparam logic [1:0] MID_FP_MODE_TF32 = 2'd0;
-    localparam logic [1:0] MID_FP_MODE_BF16 = 2'd1;
-    localparam logic [1:0] MID_FP_MODE_FP16 = 2'd2;
-    localparam logic [2:0] F4F6F8_TYPE_E4M3 = 3'd0;
-    localparam logic [2:0] F4F6F8_TYPE_E5M2 = 3'd1;
-    localparam logic [2:0] F4F6F8_TYPE_E2M3 = 3'd2;
-    localparam logic [2:0] F4F6F8_TYPE_E3M2 = 3'd3;
 
     localparam logic [7:0] STATUS_OK                  = 8'h00;
     localparam logic [7:0] STATUS_INVALID_SPARSE_META = 8'h01;
@@ -76,10 +70,6 @@ module dot_cluster_top #(
     localparam logic [7:0] STATUS_INT_OVERFLOW        = 8'h04;
 
     localparam int RSP_META_W = TAG_W + 8;
-    localparam int SPARSE_2TO4_GROUPS = 16;
-    localparam int SPARSE_4TO8_GROUPS = 16;
-    localparam int SPARSE_2TO4_SEL_W  = 2;
-    localparam int SPARSE_4TO8_SEL_W  = 3;
 
     function automatic logic [3:0] popcount4(input logic [3:0] value_i);
         integer bit_idx;
@@ -150,7 +140,7 @@ module dot_cluster_top #(
             case (dtype_i)
                 DTYPE_TF32,
                 DTYPE_BF16,
-                DTYPE_FP16: dtype_share_group = SHARE_GROUP_MIDFP;
+                DTYPE_FP16: dtype_share_group = SHARE_GROUP_F16TF32;
                 DTYPE_FP8_E4M3,
                 DTYPE_FP8_E5M2,
                 DTYPE_FP6_E3M2,
@@ -302,105 +292,125 @@ module dot_cluster_top #(
         end
     endfunction
 
-    logic        req_supported;
-    logic        req_meta_valid;
-    logic        invalid_sparse_meta;
-    logic        unsupported_dtype;
-    logic        err_path;
-    logic [2:0]  req_share_group;
+    typedef struct packed {
+        logic [3:0]        dtype;
+        logic              sparse_en;
+        logic [255:0]      a_packed;
+        logic [511:0]      b_packed;
+        logic [127:0]      meta;
+        logic [31:0]       c;
+        logic [TAG_W-1:0]  tag;
+        logic              mxfp8_en;
+        logic [7:0]        a_mx_scale;
+        logic [7:0]        b_mx_scale;
+        logic              a_unsigned;
+        logic              b_unsigned;
+        logic              int_sat_en;
+        logic [1:0]        fp4_mode;
+        logic [31:0]       a_sf;
+        logic [31:0]       b_sf;
+    } ingress_payload_t;
+
+    typedef struct packed {
+        logic              err_path;
+        logic [7:0]        status;
+        logic [2:0]        share_group;
+        logic              f16tf32_sel;
+        logic              f4f6f8_sel;
+        logic              int8_sel;
+        logic              fp4_sel;
+        logic [1:0]        f16tf32_dtype;
+        logic [2:0]        f4f6f8_dtype;
+        logic [255:0]      a_vec;
+        logic [255:0]      b_vec;
+        logic [31:0]       c;
+        logic [TAG_W-1:0]  tag;
+        logic              mxfp8_en;
+        logic [7:0]        a_mx_scale;
+        logic [7:0]        b_mx_scale;
+        logic              a_unsigned;
+        logic              b_unsigned;
+        logic              int_sat_en;
+        logic [1:0]        fp4_mode;
+        logic [31:0]       a_sf;
+        logic [31:0]       b_sf;
+    } issue_payload_t;
+
+    ingress_payload_t ingress_payload_q;
+    issue_payload_t   issue_payload_q;
+    issue_payload_t   issue_payload_d;
+
+    logic        ingress_vld_q;
+    logic        ingress_rdy;
+    logic        ingress_fire;
+    logic        ingress_to_issue_fire;
+    logic        issue_vld_q;
+    logic        issue_in_rdy;
+    logic        issue_load_fire;
+    logic        issue_out_rdy;
+    logic        issue_out_fire;
+
+    logic        ingress_req_supported;
+    logic        ingress_req_meta_valid;
+    logic        ingress_invalid_sparse_meta;
+    logic        ingress_unsupported_dtype;
+    logic        ingress_err_path;
+    logic [2:0]  ingress_req_share_group;
     logic [2:0]  active_share_group_q;
     logic [7:0]  outstanding_q;
     logic        share_group_allow;
 
-    logic        bf16_sel;
-    logic        fp16_dtype_sel;
-    logic        fp8_e4m3_sel;
-    logic        fp8_e5m2_sel;
-    logic        fp6_e3m2_sel;
-    logic        fp6_e2m3_sel;
+    logic [255:0] ingress_b_tf32_core;
+    logic [255:0] ingress_b_fp16_core;
+    logic [255:0] ingress_b_f16tf32_core;
+    logic [255:0] ingress_b_8b_lane_core;
+    logic [255:0] ingress_b_fp6_core;
+    logic [255:0] ingress_b_fp4_core;
 
-    logic [SPARSE_2TO4_GROUPS-1:0] sparse_2to4_valid_flat;
-    logic [SPARSE_4TO8_GROUPS-1:0] sparse_4to8_valid_flat;
-    logic [SPARSE_2TO4_GROUPS*SPARSE_2TO4_SEL_W-1:0] sparse_2to4_sel0_flat;
-    logic [SPARSE_2TO4_GROUPS*SPARSE_2TO4_SEL_W-1:0] sparse_2to4_sel1_flat;
-    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel0_flat;
-    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel1_flat;
-    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel2_flat;
-    logic [SPARSE_4TO8_GROUPS*SPARSE_4TO8_SEL_W-1:0] sparse_4to8_sel3_flat;
-    logic meta_2to4_valid_4;
-    logic meta_2to4_valid_8;
-    logic meta_2to4_valid_16;
-    logic meta_4to8_valid_16;
+    logic ingress_tf32_sel;
+    logic ingress_fp16_sel;
+    logic ingress_f16tf32_sel;
+    logic ingress_f4f6f8_sel;
+    logic ingress_fp6_sel;
+    logic ingress_int8_sel;
+    logic ingress_fp4_sel;
+    logic [1:0] ingress_f16tf32_dtype;
+    logic [2:0] ingress_f4f6f8_dtype;
 
-    logic [255:0] b_tf32_sparse;
-    logic [255:0] b_fp16_sparse;
-    logic [255:0] b_8b_lane_sparse;
-    logic [255:0] b_fp6_sparse;
-    logic [255:0] b_fp4_sparse;
-    logic [255:0] b_tf32_core;
-    logic [255:0] b_fp16_core;
-    logic [255:0] b_mid_fp_core;
-    logic [255:0] b_8b_lane_core;
-    logic [255:0] b_fp6_core;
-    logic [255:0] b_fp4_core;
-
-    logic tf32_sel;
-    logic fp16_sel;
-    logic mid_fp_sel;
-    logic f4f6f8_sel;
-    logic fp6_sel;
-    logic int8_sel;
-    logic fp4_sel;
-    logic [1:0] mid_fp_mode;
-    logic [2:0] f4f6f8_type;
-
-    logic mid_fp_in_rdy;
-    logic f4f6f8_in_rdy;
+    logic shared_fp_in_rdy;
     logic int8_in_rdy;
     logic fp4_in_rdy;
 
-    logic mid_fp_meta_in_rdy;
-    logic f4f6f8_meta_in_rdy;
     logic int8_meta_in_rdy;
     logic fp4_meta_in_rdy;
 
-    logic mid_fp_req_rdy;
-    logic f4f6f8_req_rdy;
-    logic int8_req_rdy;
-    logic fp4_req_rdy;
     logic selected_core_rdy;
     logic core_req_fire;
     logic err_can_accept;
     logic err_out_rdy;
     logic err_out_fire;
 
-    logic mid_fp_in_vld;
-    logic f4f6f8_in_vld;
+    logic shared_fp_in_vld;
+    logic shared_fp_mode;
     logic int8_in_vld;
     logic fp4_in_vld;
 
-    logic mid_fp_out_vld;
-    logic f4f6f8_out_vld;
+    logic shared_fp_out_vld;
     logic int8_out_vld;
     logic fp4_out_vld;
 
-    logic mid_fp_out_rdy;
-    logic f4f6f8_out_rdy;
+    logic shared_fp_out_rdy;
     logic int8_out_rdy;
     logic fp4_out_rdy;
 
-    logic [31:0] mid_fp_d;
-    logic [31:0] f4f6f8_d;
+    logic [31:0] shared_fp_d;
     logic [31:0] int8_d;
     logic [31:0] fp4_d;
     logic        int8_overflow;
 
-    logic mid_fp_meta_vld;
-    logic f4f6f8_meta_vld;
     logic int8_meta_vld;
     logic fp4_meta_vld;
-    logic [RSP_META_W-1:0] mid_fp_meta;
-    logic [RSP_META_W-1:0] f4f6f8_meta;
+    logic [RSP_META_W-1:0] shared_fp_meta;
     logic [RSP_META_W-1:0] int8_meta;
     logic [RSP_META_W-1:0] fp4_meta;
     logic [RSP_META_W-1:0] req_rsp_meta;
@@ -411,218 +421,209 @@ module dot_cluster_top #(
     logic [TAG_W-1:0] err_tag_q;
 
     logic arb_err_sel;
-    logic arb_mid_fp_sel;
-    logic arb_f4f6f8_sel;
+    logic arb_shared_fp_sel;
     logic arb_int8_sel;
     logic arb_fp4_sel;
 
     logic [7:0] outstanding_nxt;
     logic core_rsp_fire;
-    logic [7:0] int8_status;
 
-    integer meta_grp;
-    integer meta_lane;
-    integer sparse_grp;
-    integer sparse_count_tmp;
+    assign ingress_fire          = in_vld_i && in_rdy_o;
+    assign ingress_to_issue_fire = ingress_vld_q && issue_in_rdy;
+    assign issue_load_fire       = ingress_to_issue_fire;
+    assign issue_in_rdy          = !issue_vld_q || issue_out_fire;
+    assign issue_out_fire        = issue_vld_q && issue_out_rdy;
+    assign ingress_rdy           = !ingress_vld_q || ingress_to_issue_fire;
+    assign in_rdy_o              = ingress_rdy;
+
+    assign ingress_req_supported       = supported_dtype(ingress_payload_q.dtype);
+    assign ingress_req_meta_valid      = (!ingress_payload_q.sparse_en) ||
+                                         meta_valid_by_dtype(ingress_payload_q.dtype,
+                                                             ingress_payload_q.meta);
+    assign ingress_invalid_sparse_meta = ingress_payload_q.sparse_en &&
+                                         ingress_req_supported &&
+                                         !ingress_req_meta_valid;
+    assign ingress_unsupported_dtype   = !ingress_req_supported;
+    assign ingress_err_path            = ingress_unsupported_dtype ||
+                                         ingress_invalid_sparse_meta;
+    assign ingress_req_share_group     = dtype_share_group(ingress_payload_q.dtype);
+
+    assign ingress_b_tf32_core    = ingress_payload_q.sparse_en ?
+                                    select_b_2to4_32(ingress_payload_q.b_packed,
+                                                     ingress_payload_q.meta) :
+                                    ingress_payload_q.b_packed[255:0];
+    assign ingress_b_fp16_core    = ingress_payload_q.sparse_en ?
+                                    select_b_2to4_16(ingress_payload_q.b_packed,
+                                                     ingress_payload_q.meta) :
+                                    ingress_payload_q.b_packed[255:0];
+    assign ingress_b_f16tf32_core  = ingress_tf32_sel ? ingress_b_tf32_core :
+                                                       ingress_b_fp16_core;
+    assign ingress_b_8b_lane_core = ingress_payload_q.sparse_en ?
+                                    select_b_2to4_8(ingress_payload_q.b_packed,
+                                                    ingress_payload_q.meta) :
+                                    ingress_payload_q.b_packed[255:0];
+    assign ingress_b_fp6_core     = ingress_payload_q.sparse_en ?
+                                    select_b_2to4_6(ingress_payload_q.b_packed,
+                                                    ingress_payload_q.meta) :
+                                    ingress_payload_q.b_packed[255:0];
+    assign ingress_b_fp4_core     = ingress_payload_q.sparse_en ?
+                                    select_b_4to8_4(ingress_payload_q.b_packed,
+                                                    ingress_payload_q.meta) :
+                                    ingress_payload_q.b_packed[255:0];
+
+    assign ingress_tf32_sel     = (ingress_payload_q.dtype == DTYPE_TF32);
+    assign ingress_fp16_sel     = (ingress_payload_q.dtype == DTYPE_FP16) ||
+                                  (ingress_payload_q.dtype == DTYPE_BF16);
+    assign ingress_f16tf32_sel   = ingress_tf32_sel || ingress_fp16_sel;
+    assign ingress_fp6_sel      = (ingress_payload_q.dtype == DTYPE_FP6_E3M2) ||
+                                  (ingress_payload_q.dtype == DTYPE_FP6_E2M3);
+    assign ingress_f4f6f8_sel   = (ingress_payload_q.dtype == DTYPE_FP8_E4M3) ||
+                                  (ingress_payload_q.dtype == DTYPE_FP8_E5M2) ||
+                                  ingress_fp6_sel;
+    assign ingress_int8_sel     = (ingress_payload_q.dtype == DTYPE_INT8);
+    assign ingress_fp4_sel      = (ingress_payload_q.dtype == DTYPE_FP4);
+    assign ingress_f16tf32_dtype = ingress_tf32_sel ? DOT_F16TF32_DTYPE_TF32 :
+                                  ((ingress_payload_q.dtype == DTYPE_BF16) ?
+                                   DOT_F16TF32_DTYPE_BF16 : DOT_F16TF32_DTYPE_FP16);
+    assign ingress_f4f6f8_dtype = (ingress_payload_q.dtype == DTYPE_FP8_E5M2) ?
+                                  DOT_F4F6F8_DTYPE_E5M2 :
+                                  (ingress_payload_q.dtype == DTYPE_FP6_E2M3) ?
+                                  DOT_F4F6F8_DTYPE_E2M3 :
+                                  (ingress_payload_q.dtype == DTYPE_FP6_E3M2) ?
+                                  DOT_F4F6F8_DTYPE_E3M2 :
+                                  DOT_F4F6F8_DTYPE_E4M3;
 
     always_comb begin
-        sparse_2to4_valid_flat = '0;
-        sparse_4to8_valid_flat = '0;
-        sparse_2to4_sel0_flat  = '0;
-        sparse_2to4_sel1_flat  = '0;
-        sparse_4to8_sel0_flat  = '0;
-        sparse_4to8_sel1_flat  = '0;
-        sparse_4to8_sel2_flat  = '0;
-        sparse_4to8_sel3_flat  = '0;
+        issue_payload_d = '0;
 
-        for (meta_grp = 0; meta_grp < SPARSE_2TO4_GROUPS; meta_grp = meta_grp + 1) begin
-            sparse_count_tmp = 0;
-            for (meta_lane = 0; meta_lane < 4; meta_lane = meta_lane + 1) begin
-                if (req_meta_i[meta_grp*4 + meta_lane]) begin
-                    if (sparse_count_tmp == 0) begin
-                        sparse_2to4_sel0_flat[meta_grp*SPARSE_2TO4_SEL_W +: SPARSE_2TO4_SEL_W] =
-                            meta_lane[SPARSE_2TO4_SEL_W-1:0];
-                    end else if (sparse_count_tmp == 1) begin
-                        sparse_2to4_sel1_flat[meta_grp*SPARSE_2TO4_SEL_W +: SPARSE_2TO4_SEL_W] =
-                            meta_lane[SPARSE_2TO4_SEL_W-1:0];
-                    end
-                    sparse_count_tmp = sparse_count_tmp + 1;
-                end
-            end
-            sparse_2to4_valid_flat[meta_grp] = (sparse_count_tmp == 2);
-        end
+        issue_payload_d.err_path      = ingress_err_path;
+        issue_payload_d.status        = ingress_unsupported_dtype ? STATUS_UNSUPPORTED_DTYPE :
+                                        (ingress_invalid_sparse_meta ?
+                                         STATUS_INVALID_SPARSE_META : STATUS_OK);
+        issue_payload_d.share_group   = ingress_req_share_group;
+        issue_payload_d.f16tf32_sel    = ingress_f16tf32_sel && !ingress_err_path;
+        issue_payload_d.f4f6f8_sel    = ingress_f4f6f8_sel && !ingress_err_path;
+        issue_payload_d.int8_sel      = ingress_int8_sel && !ingress_err_path;
+        issue_payload_d.fp4_sel       = ingress_fp4_sel && !ingress_err_path;
+        issue_payload_d.f16tf32_dtype  = ingress_f16tf32_dtype;
+        issue_payload_d.f4f6f8_dtype  = ingress_f4f6f8_dtype;
+        issue_payload_d.a_vec         = ingress_payload_q.a_packed;
+        issue_payload_d.c             = ingress_payload_q.c;
+        issue_payload_d.tag           = ingress_payload_q.tag;
+        issue_payload_d.mxfp8_en      = ingress_payload_q.mxfp8_en;
+        issue_payload_d.a_mx_scale    = ingress_payload_q.a_mx_scale;
+        issue_payload_d.b_mx_scale    = ingress_payload_q.b_mx_scale;
+        issue_payload_d.a_unsigned    = ingress_payload_q.a_unsigned;
+        issue_payload_d.b_unsigned    = ingress_payload_q.b_unsigned;
+        issue_payload_d.int_sat_en    = ingress_payload_q.int_sat_en;
+        issue_payload_d.fp4_mode      = ingress_payload_q.fp4_mode;
+        issue_payload_d.a_sf          = ingress_payload_q.a_sf;
+        issue_payload_d.b_sf          = ingress_payload_q.b_sf;
 
-        for (meta_grp = 0; meta_grp < SPARSE_4TO8_GROUPS; meta_grp = meta_grp + 1) begin
-            sparse_count_tmp = 0;
-            for (meta_lane = 0; meta_lane < 8; meta_lane = meta_lane + 1) begin
-                if (req_meta_i[meta_grp*8 + meta_lane]) begin
-                    if (sparse_count_tmp == 0) begin
-                        sparse_4to8_sel0_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
-                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
-                    end else if (sparse_count_tmp == 1) begin
-                        sparse_4to8_sel1_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
-                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
-                    end else if (sparse_count_tmp == 2) begin
-                        sparse_4to8_sel2_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
-                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
-                    end else if (sparse_count_tmp == 3) begin
-                        sparse_4to8_sel3_flat[meta_grp*SPARSE_4TO8_SEL_W +: SPARSE_4TO8_SEL_W] =
-                            meta_lane[SPARSE_4TO8_SEL_W-1:0];
-                    end
-                    sparse_count_tmp = sparse_count_tmp + 1;
-                end
-            end
-            sparse_4to8_valid_flat[meta_grp] = (sparse_count_tmp == 4);
+        if (ingress_f16tf32_sel) begin
+            issue_payload_d.b_vec = ingress_b_f16tf32_core;
+        end else if (ingress_f4f6f8_sel) begin
+            issue_payload_d.b_vec = ingress_fp6_sel ? ingress_b_fp6_core :
+                                                     ingress_b_8b_lane_core;
+        end else if (ingress_int8_sel) begin
+            issue_payload_d.b_vec = ingress_b_8b_lane_core;
+        end else if (ingress_fp4_sel) begin
+            issue_payload_d.b_vec = ingress_b_fp4_core;
         end
     end
 
-    assign meta_2to4_valid_4  = &sparse_2to4_valid_flat[3:0];
-    assign meta_2to4_valid_8  = &sparse_2to4_valid_flat[7:0];
-    assign meta_2to4_valid_16 = &sparse_2to4_valid_flat[15:0];
-    assign meta_4to8_valid_16 = &sparse_4to8_valid_flat[15:0];
-
-    assign tf32_sel       = (req_dtype_i == DTYPE_TF32);
-    assign bf16_sel       = (req_dtype_i == DTYPE_BF16);
-    assign fp16_dtype_sel = (req_dtype_i == DTYPE_FP16);
-    assign fp8_e4m3_sel   = (req_dtype_i == DTYPE_FP8_E4M3);
-    assign fp8_e5m2_sel   = (req_dtype_i == DTYPE_FP8_E5M2);
-    assign int8_sel       = (req_dtype_i == DTYPE_INT8);
-    assign fp4_sel        = (req_dtype_i == DTYPE_FP4);
-    assign fp6_e3m2_sel   = (req_dtype_i == DTYPE_FP6_E3M2);
-    assign fp6_e2m3_sel   = (req_dtype_i == DTYPE_FP6_E2M3);
-    assign fp16_sel       = bf16_sel || fp16_dtype_sel;
-    assign mid_fp_sel     = tf32_sel || fp16_sel;
-    assign fp6_sel        = fp6_e3m2_sel || fp6_e2m3_sel;
-    assign f4f6f8_sel     = fp8_e4m3_sel || fp8_e5m2_sel || fp6_sel;
-
-    assign req_supported  = mid_fp_sel || f4f6f8_sel || int8_sel || fp4_sel;
-    assign req_meta_valid = (!req_sparse_en_i) ||
-                            (tf32_sel       && meta_2to4_valid_4)  ||
-                            ((bf16_sel || fp16_dtype_sel) && meta_2to4_valid_8) ||
-                            ((fp8_e4m3_sel || fp8_e5m2_sel || fp6_sel || int8_sel) &&
-                             meta_2to4_valid_16) ||
-                            (fp4_sel && meta_4to8_valid_16);
-    assign invalid_sparse_meta = req_sparse_en_i && req_supported && !req_meta_valid;
-    assign unsupported_dtype   = !req_supported;
-    assign err_path            = unsupported_dtype || invalid_sparse_meta;
-    assign req_share_group     = mid_fp_sel  ? SHARE_GROUP_MIDFP :
-                                 f4f6f8_sel  ? SHARE_GROUP_F4F6F8 :
-                                 int8_sel    ? SHARE_GROUP_INT8 :
-                                 fp4_sel     ? SHARE_GROUP_FP4 :
-                                               SHARE_GROUP_NONE;
-
-    always_comb begin
-        b_tf32_sparse    = '0;
-        b_fp16_sparse    = '0;
-        b_8b_lane_sparse = '0;
-        b_fp6_sparse     = '0;
-        b_fp4_sparse     = '0;
-
-        for (sparse_grp = 0; sparse_grp < 4; sparse_grp = sparse_grp + 1) begin
-            b_tf32_sparse[(sparse_grp*2)*32 +: 32] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*32 +: 32];
-            b_tf32_sparse[(sparse_grp*2+1)*32 +: 32] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*32 +: 32];
-        end
-
-        for (sparse_grp = 0; sparse_grp < 8; sparse_grp = sparse_grp + 1) begin
-            b_fp16_sparse[(sparse_grp*2)*16 +: 16] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*16 +: 16];
-            b_fp16_sparse[(sparse_grp*2+1)*16 +: 16] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*16 +: 16];
-        end
-
-        for (sparse_grp = 0; sparse_grp < 16; sparse_grp = sparse_grp + 1) begin
-            b_8b_lane_sparse[(sparse_grp*2)*8 +: 8] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*8 +: 8];
-            b_8b_lane_sparse[(sparse_grp*2+1)*8 +: 8] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*8 +: 8];
-
-            b_fp6_sparse[(sparse_grp*2)*6 +: 6] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel0_flat[sparse_grp*2 +: 2])*6 +: 6];
-            b_fp6_sparse[(sparse_grp*2+1)*6 +: 6] =
-                req_b_packed_i[(sparse_grp*4 + sparse_2to4_sel1_flat[sparse_grp*2 +: 2])*6 +: 6];
-
-            b_fp4_sparse[(sparse_grp*4)*4 +: 4] =
-                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel0_flat[sparse_grp*3 +: 3])*4 +: 4];
-            b_fp4_sparse[(sparse_grp*4+1)*4 +: 4] =
-                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel1_flat[sparse_grp*3 +: 3])*4 +: 4];
-            b_fp4_sparse[(sparse_grp*4+2)*4 +: 4] =
-                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel2_flat[sparse_grp*3 +: 3])*4 +: 4];
-            b_fp4_sparse[(sparse_grp*4+3)*4 +: 4] =
-                req_b_packed_i[(sparse_grp*8 + sparse_4to8_sel3_flat[sparse_grp*3 +: 3])*4 +: 4];
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ingress_vld_q     <= 1'b0;
+            ingress_payload_q <= '0;
+        end else begin
+            if (ingress_fire) begin
+                ingress_vld_q                  <= 1'b1;
+                ingress_payload_q.dtype        <= req_dtype_i;
+                ingress_payload_q.sparse_en    <= req_sparse_en_i;
+                ingress_payload_q.a_packed     <= req_a_packed_i;
+                ingress_payload_q.b_packed     <= req_b_packed_i;
+                ingress_payload_q.meta         <= req_meta_i;
+                ingress_payload_q.c            <= req_c_i;
+                ingress_payload_q.tag          <= req_tag_i;
+                ingress_payload_q.mxfp8_en     <= req_mxfp8_en_i;
+                ingress_payload_q.a_mx_scale   <= req_a_mx_scale_i;
+                ingress_payload_q.b_mx_scale   <= req_b_mx_scale_i;
+                ingress_payload_q.a_unsigned   <= req_a_unsigned_i;
+                ingress_payload_q.b_unsigned   <= req_b_unsigned_i;
+                ingress_payload_q.int_sat_en   <= req_int_sat_en_i;
+                ingress_payload_q.fp4_mode     <= req_fp4_mode_i;
+                ingress_payload_q.a_sf         <= req_a_sf_i;
+                ingress_payload_q.b_sf         <= req_b_sf_i;
+            end else if (ingress_to_issue_fire) begin
+                ingress_vld_q <= 1'b0;
+            end
         end
     end
 
-    assign b_tf32_core     = req_sparse_en_i ? b_tf32_sparse    : req_b_packed_i[255:0];
-    assign b_fp16_core     = req_sparse_en_i ? b_fp16_sparse    : req_b_packed_i[255:0];
-    assign b_mid_fp_core   = tf32_sel ? b_tf32_core : b_fp16_core;
-    assign b_8b_lane_core  = req_sparse_en_i ? b_8b_lane_sparse : req_b_packed_i[255:0];
-    assign b_fp6_core      = req_sparse_en_i ? b_fp6_sparse     : req_b_packed_i[255:0];
-    assign b_fp4_core      = req_sparse_en_i ? b_fp4_sparse     : req_b_packed_i[255:0];
-
-    assign mid_fp_mode = tf32_sel ? MID_FP_MODE_TF32 :
-                         (bf16_sel ? MID_FP_MODE_BF16 : MID_FP_MODE_FP16);
-    assign f4f6f8_type = fp8_e5m2_sel ? F4F6F8_TYPE_E5M2 :
-                         fp6_e2m3_sel ? F4F6F8_TYPE_E2M3 :
-                         fp6_e3m2_sel ? F4F6F8_TYPE_E3M2 :
-                                        F4F6F8_TYPE_E4M3;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            issue_vld_q     <= 1'b0;
+            issue_payload_q <= '0;
+        end else begin
+            if (issue_load_fire) begin
+                issue_vld_q     <= 1'b1;
+                issue_payload_q <= issue_payload_d;
+            end else if (issue_out_fire) begin
+                issue_vld_q <= 1'b0;
+            end
+        end
+    end
 
     assign share_group_allow = (outstanding_q == 8'd0) ||
-                               (req_share_group == active_share_group_q);
+                               (issue_payload_q.share_group == active_share_group_q);
 
-    assign mid_fp_req_rdy  = mid_fp_in_rdy  && mid_fp_meta_in_rdy;
-    assign f4f6f8_req_rdy  = f4f6f8_in_rdy  && f4f6f8_meta_in_rdy;
-    assign int8_req_rdy    = int8_in_rdy    && int8_meta_in_rdy;
-    assign fp4_req_rdy     = fp4_in_rdy     && fp4_meta_in_rdy;
-    assign selected_core_rdy = (mid_fp_sel  && mid_fp_req_rdy) ||
-                               (f4f6f8_sel  && f4f6f8_req_rdy) ||
-                               (int8_sel    && int8_req_rdy) ||
-                               (fp4_sel     && fp4_req_rdy);
+    always_comb begin
+        selected_core_rdy = 1'b0;
+        if (issue_payload_q.f16tf32_sel || issue_payload_q.f4f6f8_sel) begin
+            selected_core_rdy = shared_fp_in_rdy;
+        end else if (issue_payload_q.int8_sel) begin
+            selected_core_rdy = int8_in_rdy && int8_meta_in_rdy;
+        end else if (issue_payload_q.fp4_sel) begin
+            selected_core_rdy = fp4_in_rdy && fp4_meta_in_rdy;
+        end
+    end
 
     assign err_can_accept = !err_vld_q || err_out_fire;
-    assign in_rdy_o = err_path ? err_can_accept : (share_group_allow && selected_core_rdy);
-    assign core_req_fire = in_vld_i && in_rdy_o && !err_path;
+    assign issue_out_rdy = issue_payload_q.err_path ? err_can_accept :
+                                                     (share_group_allow && selected_core_rdy);
+    assign core_req_fire = issue_out_fire && !issue_payload_q.err_path;
 
-    assign mid_fp_in_vld = core_req_fire && mid_fp_sel;
-    assign f4f6f8_in_vld  = core_req_fire && f4f6f8_sel;
-    assign int8_in_vld = core_req_fire && int8_sel;
-    assign fp4_in_vld  = core_req_fire && fp4_sel;
+    assign shared_fp_in_vld = core_req_fire &&
+                              (issue_payload_q.f16tf32_sel || issue_payload_q.f4f6f8_sel);
+    assign shared_fp_mode   = issue_payload_q.f4f6f8_sel;
+    assign int8_in_vld      = core_req_fire && issue_payload_q.int8_sel;
+    assign fp4_in_vld       = core_req_fire && issue_payload_q.fp4_sel;
 
-    assign req_rsp_meta = {req_tag_i, STATUS_OK};
+    assign req_rsp_meta = {issue_payload_q.tag, STATUS_OK};
 
-    mid_fp_dot_prod u_mid_fp_dot_prod (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .in_vld_i (mid_fp_in_vld),
-        .in_rdy_o (mid_fp_in_rdy),
-        .a_mode_i (mid_fp_mode),
-        .b_mode_i (mid_fp_mode),
-        .a_vec_i  (req_a_packed_i),
-        .b_vec_i  (b_mid_fp_core),
-        .c_i      (req_c_i),
-        .scale_input_d_i(4'd0),
-        .out_vld_o(mid_fp_out_vld),
-        .out_rdy_i(mid_fp_out_rdy),
-        .d_o      (mid_fp_d)
-    );
-
-    f4f6f8_dot_prod u_f4f6f8_dot_prod (
+    f16tf32_f4f6f8_shared_dot_prod #(
+        .META_W(RSP_META_W)
+    ) u_f16tf32_f4f6f8_shared_dot_prod (
         .clk         (clk),
         .rst_n       (rst_n),
-        .in_vld_i    (f4f6f8_in_vld),
-        .in_rdy_o    (f4f6f8_in_rdy),
-        .a_vec_i     (req_a_packed_i),
-        .b_vec_i     (fp6_sel ? b_fp6_core : b_8b_lane_core),
-        .c_i         (req_c_i),
-        .a_type_i    (f4f6f8_type),
-        .b_type_i    (f4f6f8_type),
-        .mxfp8_en_i  (req_mxfp8_en_i),
-        .a_mx_scale_i(req_a_mx_scale_i),
-        .b_mx_scale_i(req_b_mx_scale_i),
-        .out_vld_o   (f4f6f8_out_vld),
-        .out_rdy_i   (f4f6f8_out_rdy),
-        .d_o         (f4f6f8_d)
+        .in_vld_i    (shared_fp_in_vld),
+        .in_rdy_o    (shared_fp_in_rdy),
+        .mode_i      (shared_fp_mode),
+        .f16tf32_dtype_i(issue_payload_q.f16tf32_dtype),
+        .f4f6f8_dtype_i(issue_payload_q.f4f6f8_dtype),
+        .a_vec_i     (issue_payload_q.a_vec),
+        .b_vec_i     (issue_payload_q.b_vec),
+        .c_i         (issue_payload_q.c),
+        .scale_input_d_i(4'd0),
+        .mxfp8_en_i  (issue_payload_q.mxfp8_en),
+        .a_mx_scale_i(issue_payload_q.a_mx_scale),
+        .b_mx_scale_i(issue_payload_q.b_mx_scale),
+        .meta_i      (req_rsp_meta),
+        .out_vld_o   (shared_fp_out_vld),
+        .out_rdy_i   (shared_fp_out_rdy),
+        .d_o         (shared_fp_d),
+        .meta_o      (shared_fp_meta)
     );
 
     int8_dot_prod u_int8_dot_prod (
@@ -630,12 +631,12 @@ module dot_cluster_top #(
         .rst_n       (rst_n),
         .in_vld_i    (int8_in_vld),
         .in_rdy_o    (int8_in_rdy),
-        .a_vec_i     (req_a_packed_i),
-        .b_vec_i     (b_8b_lane_core),
-        .c_i         (req_c_i),
-        .a_unsigned_i(req_a_unsigned_i),
-        .b_unsigned_i(req_b_unsigned_i),
-        .sat_en_i    (req_int_sat_en_i),
+        .a_vec_i     (issue_payload_q.a_vec),
+        .b_vec_i     (issue_payload_q.b_vec),
+        .c_i         (issue_payload_q.c),
+        .a_unsigned_i(issue_payload_q.a_unsigned),
+        .b_unsigned_i(issue_payload_q.b_unsigned),
+        .sat_en_i    (issue_payload_q.int_sat_en),
         .out_vld_o   (int8_out_vld),
         .out_rdy_i   (int8_out_rdy),
         .d_o         (int8_d),
@@ -647,12 +648,12 @@ module dot_cluster_top #(
         .rst_n     (rst_n),
         .in_vld_i  (fp4_in_vld),
         .in_rdy_o  (fp4_in_rdy),
-        .a_fp4_i   (req_a_packed_i),
-        .b_fp4_i   (b_fp4_core),
-        .fp4_mode_i(req_fp4_mode_i),
-        .a_sf_i    (req_a_sf_i),
-        .b_sf_i    (req_b_sf_i),
-        .c_fp32_i  (req_c_i),
+        .a_fp4_i   (issue_payload_q.a_vec),
+        .b_fp4_i   (issue_payload_q.b_vec),
+        .fp4_mode_i(issue_payload_q.fp4_mode),
+        .a_sf_i    (issue_payload_q.a_sf),
+        .b_sf_i    (issue_payload_q.b_sf),
+        .c_fp32_i  (issue_payload_q.c),
         .out_vld_o (fp4_out_vld),
         .out_rdy_i (fp4_out_rdy),
         .d_fp32_o  (fp4_d)
@@ -660,35 +661,7 @@ module dot_cluster_top #(
 
     dot_rsp_meta_pipe #(
         .W      (RSP_META_W),
-        .STAGES (5)
-    ) u_mid_fp_meta_pipe (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .in_vld_i     (mid_fp_in_vld),
-        .in_rdy_o     (mid_fp_meta_in_rdy),
-        .in_data_i    (req_rsp_meta),
-        .out_vld_o    (mid_fp_meta_vld),
-        .out_rdy_i    (mid_fp_out_rdy),
-        .out_data_o   (mid_fp_meta)
-    );
-
-    dot_rsp_meta_pipe #(
-        .W      (RSP_META_W),
-        .STAGES (5)
-    ) u_f4f6f8_meta_pipe (
-        .clk          (clk),
-        .rst_n        (rst_n),
-        .in_vld_i     (f4f6f8_in_vld),
-        .in_rdy_o     (f4f6f8_meta_in_rdy),
-        .in_data_i    (req_rsp_meta),
-        .out_vld_o    (f4f6f8_meta_vld),
-        .out_rdy_i    (f4f6f8_out_rdy),
-        .out_data_o   (f4f6f8_meta)
-    );
-
-    dot_rsp_meta_pipe #(
-        .W      (RSP_META_W),
-        .STAGES (4)
+        .STAGES (3)
     ) u_int8_meta_pipe (
         .clk          (clk),
         .rst_n        (rst_n),
@@ -721,59 +694,56 @@ module dot_cluster_top #(
             err_status_q <= STATUS_OK;
             err_tag_q    <= '0;
         end else begin
-            if (in_vld_i && in_rdy_o && err_path) begin
+            if (issue_out_fire && issue_payload_q.err_path) begin
                 err_vld_q    <= 1'b1;
-                err_d_q      <= req_c_i;
-                err_status_q <= unsupported_dtype ? STATUS_UNSUPPORTED_DTYPE :
-                                                     STATUS_INVALID_SPARSE_META;
-                err_tag_q    <= req_tag_i;
+                err_d_q      <= issue_payload_q.c;
+                err_status_q <= issue_payload_q.status;
+                err_tag_q    <= issue_payload_q.tag;
             end else if (err_out_fire) begin
                 err_vld_q <= 1'b0;
             end
         end
     end
 
-    assign arb_err_sel    = err_vld_q;
-    assign arb_mid_fp_sel = !arb_err_sel && mid_fp_out_vld;
-    assign arb_f4f6f8_sel  = !arb_err_sel && !arb_mid_fp_sel && f4f6f8_out_vld;
-    assign arb_int8_sel   = !arb_err_sel && !arb_mid_fp_sel &&
-                            !arb_f4f6f8_sel && int8_out_vld;
-    assign arb_fp4_sel    = !arb_err_sel && !arb_mid_fp_sel &&
-                            !arb_f4f6f8_sel && !arb_int8_sel && fp4_out_vld;
+    assign arb_err_sel       = err_vld_q;
+    assign arb_shared_fp_sel = !arb_err_sel && shared_fp_out_vld;
+    assign arb_int8_sel      = !arb_err_sel && !arb_shared_fp_sel && int8_out_vld;
+    assign arb_fp4_sel       = !arb_err_sel && !arb_shared_fp_sel &&
+                               !arb_int8_sel && fp4_out_vld;
 
-    assign err_out_rdy    = out_rdy_i && arb_err_sel;
-    assign mid_fp_out_rdy = out_rdy_i && arb_mid_fp_sel;
-    assign f4f6f8_out_rdy  = out_rdy_i && arb_f4f6f8_sel;
-    assign int8_out_rdy   = out_rdy_i && arb_int8_sel;
-    assign fp4_out_rdy    = out_rdy_i && arb_fp4_sel;
+    assign err_out_rdy       = out_rdy_i && arb_err_sel;
+    assign shared_fp_out_rdy = out_rdy_i && arb_shared_fp_sel;
+    assign int8_out_rdy      = out_rdy_i && arb_int8_sel;
+    assign fp4_out_rdy       = out_rdy_i && arb_fp4_sel;
     assign err_out_fire = err_vld_q && err_out_rdy;
 
-    assign out_vld_o = err_vld_q || mid_fp_out_vld || f4f6f8_out_vld ||
-                       int8_out_vld || fp4_out_vld;
-    assign int8_status = int8_meta[7:0] | ({8{int8_overflow}} & STATUS_INT_OVERFLOW);
+    assign out_vld_o = err_vld_q || shared_fp_out_vld || int8_out_vld || fp4_out_vld;
 
     always_comb begin
-        out_d_o = ({32{arb_err_sel}}    & err_d_q) |
-                  ({32{arb_mid_fp_sel}} & mid_fp_d) |
-                  ({32{arb_f4f6f8_sel}} & f4f6f8_d) |
-                  ({32{arb_int8_sel}}   & int8_d) |
-                  ({32{arb_fp4_sel}}    & fp4_d);
+        out_d_o      = 32'h0000_0000;
+        out_status_o = STATUS_OK;
+        out_tag_o    = '0;
 
-        out_status_o = ({8{arb_err_sel}}    & err_status_q) |
-                       ({8{arb_mid_fp_sel}} & mid_fp_meta[7:0]) |
-                       ({8{arb_f4f6f8_sel}} & f4f6f8_meta[7:0]) |
-                       ({8{arb_int8_sel}}   & int8_status) |
-                       ({8{arb_fp4_sel}}    & fp4_meta[7:0]);
-
-        out_tag_o = ({TAG_W{arb_err_sel}}    & err_tag_q) |
-                    ({TAG_W{arb_mid_fp_sel}} & mid_fp_meta[RSP_META_W-1:8]) |
-                    ({TAG_W{arb_f4f6f8_sel}} & f4f6f8_meta[RSP_META_W-1:8]) |
-                    ({TAG_W{arb_int8_sel}}   & int8_meta[RSP_META_W-1:8]) |
-                    ({TAG_W{arb_fp4_sel}}    & fp4_meta[RSP_META_W-1:8]);
+        if (arb_err_sel) begin
+            out_d_o      = err_d_q;
+            out_status_o = err_status_q;
+            out_tag_o    = err_tag_q;
+        end else if (arb_shared_fp_sel) begin
+            out_d_o      = shared_fp_d;
+            out_status_o = shared_fp_meta[7:0];
+            out_tag_o    = shared_fp_meta[RSP_META_W-1:8];
+        end else if (arb_int8_sel) begin
+            out_d_o      = int8_d;
+            out_status_o = int8_meta[7:0] | (int8_overflow ? STATUS_INT_OVERFLOW : STATUS_OK);
+            out_tag_o    = int8_meta[RSP_META_W-1:8];
+        end else if (arb_fp4_sel) begin
+            out_d_o      = fp4_d;
+            out_status_o = fp4_meta[7:0];
+            out_tag_o    = fp4_meta[RSP_META_W-1:8];
+        end
     end
 
-    assign core_rsp_fire = (mid_fp_out_vld && mid_fp_out_rdy) ||
-                           (f4f6f8_out_vld  && f4f6f8_out_rdy)  ||
+    assign core_rsp_fire = (shared_fp_out_vld && shared_fp_out_rdy) ||
                            (int8_out_vld && int8_out_rdy) ||
                            (fp4_out_vld  && fp4_out_rdy);
 
@@ -794,7 +764,7 @@ module dot_cluster_top #(
             outstanding_q <= outstanding_nxt;
 
             if (outstanding_q == 8'd0 && core_req_fire) begin
-                active_share_group_q <= req_share_group;
+                active_share_group_q <= issue_payload_q.share_group;
             end else if (outstanding_nxt == 8'd0) begin
                 active_share_group_q <= SHARE_GROUP_NONE;
             end

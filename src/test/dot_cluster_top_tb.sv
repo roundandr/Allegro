@@ -116,6 +116,7 @@ module dot_cluster_top_tb;
     );
         begin
             @(posedge clk);
+            #1;
             req_dtype_i     = dtype_i;
             req_sparse_en_i = sparse_i;
             req_a_packed_i  = a_i;
@@ -158,6 +159,7 @@ module dot_cluster_top_tb;
             end
 
             @(posedge clk);
+            #1;
         end
     endtask
 
@@ -311,7 +313,7 @@ module dot_cluster_top_tb;
         in_vld_i        = 1'b1;
         #1;
         if (!in_rdy_o) begin
-            $fatal(1, "MID-FP shared datapath did not accept FP16 while TF32 was outstanding");
+            $fatal(1, "F16TF32 shared datapath did not accept FP16 while TF32 was outstanding");
         end
 
         @(posedge clk);

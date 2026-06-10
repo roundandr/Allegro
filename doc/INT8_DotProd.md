@@ -156,19 +156,19 @@ $$
 
 ```text
 if unsigned:
-    operand_ext = {10'b0, operand[7:0]}
+    operand_ext = {1'b0, operand[7:0]}
 else:
-    operand_ext = {{10{operand[7]}}, operand[7:0]}
+    operand_ext = {operand[7], operand[7:0]}
 ```
 
-推荐统一扩展为 signed 18-bit 内部操作数，覆盖 S8、U8 以及后续乘积路径的统一处理。
+推荐统一扩展为 signed 9-bit 内部操作数，覆盖 S8、U8，再生成 signed 18-bit product。
 
 ### Decode 输出接口
 
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
-| `a_ext_o[k]` | 18 | 第 k 个 A 操作数，signed 扩展后整数 |
-| `b_ext_o[k]` | 18 | 第 k 个 B 操作数，signed 扩展后整数 |
+| `a_ext_o[k]` | 9 | 第 k 个 A 操作数，signed 扩展后整数 |
+| `b_ext_o[k]` | 9 | 第 k 个 B 操作数，signed 扩展后整数 |
 
 ---
 
@@ -369,16 +369,14 @@ else:
 
 | Stage | 名称 | 主要功能 |
 | --- | --- | --- |
-| S0 | Input Decode / Product Generation | 输入寄存、S8/U8 decode、C sign extension、32 路 8x8 精确整数乘法，输出 signed 18-bit product |
-| S1 | Product Reduction 0 | 32 路 product reduction 前半段，推荐完成 `32 -> 16 -> 8` |
-| S2 | Product Reduction 1 | product reduction 后半段，推荐完成 `8 -> 4 -> 2 -> 1`，输出 signed 22-bit `P_sum` |
+| S0 | Input Decode / Product Generation | 输入寄存、S8/U8 decode、32 路 9-bit 统一 signed operand 精确整数乘法，输出 signed 18-bit product |
+| S1 | Product Reduction | 32 路 product reduction，完成 `32 -> 16 -> 8 -> 4 -> 2 -> 1`，输出 signed 22-bit `P_sum` |
 | S3 | Add C / Overflow Check / INT32 Pack | `P_sum + C`，得到 signed 33-bit `S_sum`，生成 overflow，并在 S3 末端完成 wrap 或 saturate 输出 |
 
-整数路径的关键路径通常位于 S0 乘法器阵列和 S1/S2 reduction tree。为平衡时序，product reduction 固定拆成两级流水：
+整数路径的关键路径通常位于 S0 乘法器阵列和 S1 reduction tree。当前实现将 product reduction 合并为一级流水：
 
 ```text
-S1: 32 -> 16 -> 8
-S2: 8  -> 4  -> 2 -> 1
+S1: 32 -> 16 -> 8 -> 4 -> 2 -> 1
 ```
 
 ---
@@ -397,13 +395,13 @@ S2: 8  -> 4  -> 2 -> 1
 | --- | --: | --- |
 | `x_i` | 8 | 8-bit 输入 |
 | `unsigned_i` | 1 | 0: S8，1: U8 |
-| `x_ext_o` | 18 | signed 18-bit 扩展输出 |
+| `x_ext_o` | 9 | signed 9-bit 扩展输出 |
 
 ### 实现要点
 
 * S8 模式执行符号扩展；
 * U8 模式执行零扩展；
-* 输出统一按 signed 18-bit 参与后续乘法。
+* 输出统一按 signed 9-bit 参与后续乘法。
 
 ---
 
@@ -421,8 +419,8 @@ $$
 
 | 接口名称 | 位宽 | 说明 |
 | --- | --: | --- |
-| `a_ext_i` | 18 | signed 扩展后的 A |
-| `b_ext_i` | 18 | signed 扩展后的 B |
+| `a_ext_i` | 9 | signed 扩展后的 A |
+| `b_ext_i` | 9 | signed 扩展后的 B |
 | `prod_o` | 18 | 精确 product |
 
 ### 实现要点
@@ -436,7 +434,7 @@ U8 x S8: unsigned x signed
 U8 x U8: unsigned x unsigned
 ```
 
-RTL 也可以统一先扩展到 signed 18-bit，再使用 signed multiplier，综合工具会裁剪无效位。
+RTL 也可以统一先扩展到 signed 9-bit，再使用 signed multiplier 生成 18-bit product。
 
 ---
 

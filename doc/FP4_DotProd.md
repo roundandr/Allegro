@@ -266,7 +266,7 @@ $$
 | `ALIGN_MAG_W` | 46 | Step 5 对齐前单项 magnitude 位宽，`35 + 11` |
 | `ALIGN_TERM_W` | 47 | 对齐后的 signed fixed-point term 位宽，含符号和 magnitude |
 | `ALIGN_SHIFT_W` | 6 | 对 `ALIGN_MAG_W` 宽度数据移位的 shift amount 位宽 |
-| `SUM_W` | 50 | 5 路对齐后求和结果位宽 |
+| `SUM_W` | 49 | 4 路 gamma 加 1 路 C 的定点求和结果位宽 |
 | `FP4_DOT_EXP` | -2 | 当前 S0 FP4 乘积使用 `Q*.2` 编码，对应 group dot exponent |
 | `GAMMA_NORM_EXP` | 8 | 从 gamma raw exponent 转 normalized exponent 的偏移 |
 | `C_NORM_EXP` | 23 | 从 C raw exponent 转 normalized exponent 的偏移 |
@@ -281,7 +281,7 @@ $$
 * `ALIGN_MAG_W = ALIGN_FRAC_W + ALIGN_INT_W = 35 + 11 = 46`，用于 S2 对齐时容纳 raw magnitude 左移后的结果；
 * `ALIGN_TERM_W = ALIGN_MAG_W + 1 = 47`，表示带符号的对齐结果；
 * `ALIGN_SHIFT_W = ceil(log2(ALIGN_MAG_W + 1)) = 6`，用于表达 `0..46` 的移位量；
-* `SUM_W = ALIGN_TERM_W + ceil(log2(5)) = 47 + 3 = 50`，可覆盖 5 路同宽 signed 加法；
+* `SUM_W = ALIGN_TERM_W + 2 = 47 + 2 = 49`。4 路 gamma 最大幅度为 `4 × 2025`，C 的 aligned significand 小于 2，因此 13 个 integer magnitude bit 足够覆盖 mmasim 的 35-bit fractional 对齐精度；
 * `FP4_DOT_EXP = -2`，因为 `fp4_product` 中 `1.5 -> 3` 带 `exp=-1`，两个 FP4 相乘后 group dot 统一带 `exp=-2`。
 * `GAMMA_NORM_EXP = 8`，因为 `gamma_raw = sigma_int × sf_sig_prod` 相对 normalized significand 带 8 个 fractional bits；
 * `C_NORM_EXP = 23`，因为 FP32 C raw significand 带 23 个 fractional bits。
@@ -615,7 +615,7 @@ $$
    final CPA
 ```
 
-`SUM_W = 50`，能够无损覆盖 5 路 `ALIGN_TERM_W = 47` 的 signed 求和。
+`SUM_W = 49`，能够无损覆盖 4 路 gamma 与 1 路 C 在 35-bit fractional 对齐域中的 signed 求和。
 
 ---
 
@@ -1007,7 +1007,7 @@ $$
 | --- | --: | --- |
 | `gamma_aligned_i` | 4 × 47 | 4 个对齐后的 gamma fixed-point 值 |
 | `c_aligned_i` | 47 | 对齐后的 c fixed-point 值 |
-| `sum_o` | 50 | 定点求和结果 |
+| `sum_o` | 49 | 定点求和结果 |
 | `sum_zero_o` | 1 | 求和结果是否为 0 |
 | `sum_sign_o` | 1 | 求和结果符号 |
 
@@ -1046,7 +1046,7 @@ $$
 
 | 接口名称 | 位宽 | 说明 |
 | --- | -: | --- |
-| `sum_i` | 50 | 定点求和结果 |
+| `sum_i` | 49 | 定点求和结果 |
 | `base_exp_i` | 9 | 融合累加域的基准指数 |
 | `d_fp32_o` | 32 | FP32 输出 |
 
@@ -1362,7 +1362,7 @@ $$
 输出：
 
 ```text
-sum_s3  : signed integer, width = 50
+sum_s3  : signed integer, width = 49
 base_exp_s3 = emax_s2 - 35
 ```
 
@@ -1370,7 +1370,7 @@ base_exp_s3 = emax_s2 - 35
 
 | 信号 | 位宽 / 格式 | 说明 |
 | --- | --: | --- |
-| `sum_s3` | 50 | 对齐后的 5 输入定点求和结果 |
+| `sum_s3` | 49 | 对齐后的 5 输入定点求和结果 |
 | `base_exp_s3` | 9 | 公共基准指数 |
 | `special_valid_s3` | 1 | 特殊值旁路有效 |
 | `special_result_s3` | 32 | 特殊值旁路结果 |

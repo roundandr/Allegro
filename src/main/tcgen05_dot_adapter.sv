@@ -37,21 +37,13 @@ module tcgen05_dot_adapter (
     output logic [7:0]   status_o
 );
     import tcgen05_mma_pkg::*;
+    import dot_prod_pkg::*;
 
     localparam logic [1:0] CORE_NONE  = 2'd0;
-    localparam logic [1:0] CORE_MIDFP = 2'd1;
+    localparam logic [1:0] CORE_F16TF32 = 2'd1;
     localparam logic [1:0] CORE_F4F6F8  = 2'd2;
     localparam logic [1:0] CORE_INT8  = 2'd3;
     localparam logic [1:0] CORE_FP4   = 2'd0;
-
-    localparam logic [1:0] MID_FP_MODE_TF32 = 2'd0;
-    localparam logic [1:0] MID_FP_MODE_BF16 = 2'd1;
-    localparam logic [1:0] MID_FP_MODE_FP16 = 2'd2;
-
-    localparam logic [1:0] FP4_MODE_NVFP4     = 2'd0;
-    localparam logic [1:0] FP4_MODE_MXFP4     = 2'd1;
-    localparam logic [1:0] FP4_MODE_FP4       = 2'd2;
-    localparam logic [1:0] FP4_MODE_MXFP4_4X  = 2'd3;
 
     logic busy_q;
     logic err_vld_q;
@@ -69,71 +61,63 @@ module tcgen05_dot_adapter (
     logic issue_fire;
     logic core_out_fire;
 
-    logic mid_fp_supported;
+    logic f16tf32_supported;
     logic f4f6f8_supported;
     logic int8_supported;
     logic fp4_supported;
 
-    logic mid_fp_sel;
+    logic f16tf32_sel;
     logic f4f6f8_sel;
     logic int8_sel;
     logic fp4_sel;
 
     logic [1:0] selected_core;
     logic       selected_is_fp4;
-    logic [1:0] mid_fp_a_mode;
-    logic [1:0] mid_fp_b_mode;
-    logic [2:0] f4f6f8_a_type;
-    logic [2:0] f4f6f8_b_type;
+    logic [1:0] f16tf32_a_dtype;
+    logic [1:0] f16tf32_b_dtype;
+    logic [2:0] f4f6f8_a_dtype;
+    logic [2:0] f4f6f8_b_dtype;
     logic       f4f6f8_mx_en;
-    logic       int8_a_unsigned;
-    logic       int8_b_unsigned;
     logic [1:0] fp4_mode;
-    logic       b_type_e2m1_sel;
-    logic       b_type_fp6_sel;
 
-    logic [255:0] b_mid_fp_core;
+    logic [255:0] b_f16tf32_core;
     logic [255:0] b_tf32_core;
     logic [255:0] b_fp16_core;
     logic [255:0] b_8b_core;
     logic [255:0] b_6b_core;
     logic [255:0] b_4b_core;
     logic [255:0] b_fp4_core;
-    logic [255:0] f4f6f8_b_core;
+    logic [255:0] f4f6f8_b_vec;
 
     logic [31:0] c_core;
 
-    logic mid_fp_in_rdy;
+    logic f16tf32_in_rdy;
     logic f4f6f8_in_rdy;
     logic int8_in_rdy;
     logic fp4_in_rdy;
 
-    logic mid_fp_in_vld;
+    logic f16tf32_in_vld;
     logic f4f6f8_in_vld;
     logic int8_in_vld;
     logic fp4_in_vld;
+    logic int8_a_unsigned;
+    logic int8_b_unsigned;
 
-    logic mid_fp_out_vld;
+    logic f16tf32_out_vld;
     logic f4f6f8_out_vld;
     logic int8_out_vld;
     logic fp4_out_vld;
 
-    logic mid_fp_out_rdy;
+    logic f16tf32_out_rdy;
     logic f4f6f8_out_rdy;
     logic int8_out_rdy;
     logic fp4_out_rdy;
 
-    logic [31:0] mid_fp_d;
+    logic [31:0] f16tf32_d;
     logic [31:0] f4f6f8_d;
     logic [31:0] int8_d;
     logic [31:0] fp4_d;
     logic        int8_overflow;
-
-    localparam logic [2:0] F4F6F8_TYPE_E4M3 = 3'd0;
-    localparam logic [2:0] F4F6F8_TYPE_E5M2 = 3'd1;
-    localparam logic [2:0] F4F6F8_TYPE_E2M3 = 3'd2;
-    localparam logic [2:0] F4F6F8_TYPE_E3M2 = 3'd3;
-    localparam logic [2:0] F4F6F8_TYPE_E2M1 = 3'd4;
 
     function automatic logic [3:0] popcount4(input logic [3:0] value_i);
         integer bit_idx;
@@ -430,7 +414,7 @@ module tcgen05_dot_adapter (
         end
     end
 
-    assign mid_fp_supported =
+    assign f16tf32_supported =
         ((kind_i == TCGEN05_KIND_TF32) &&
          (scale_type_i == TCGEN05_SCALE_NONE) &&
          (scale_vec_i == TCGEN05_SCALE_VEC_NONE) &&
@@ -507,11 +491,11 @@ module tcgen05_dot_adapter (
            ((scale_vec_i == TCGEN05_SCALE_VEC_4X) ||
             (scale_vec_i == TCGEN05_SCALE_VEC_BLOCK16)))));
 
-    assign unsupported_req = !(mid_fp_supported || f4f6f8_supported || int8_supported || fp4_supported);
+    assign unsupported_req = !(f16tf32_supported || f4f6f8_supported || int8_supported || fp4_supported);
     assign invalid_sparse_meta = sparse_req && !sparse_meta_valid;
     assign err_path = unsupported_req || invalid_sparse_meta;
 
-    assign mid_fp_sel = mid_fp_supported && !err_path;
+    assign f16tf32_sel = f16tf32_supported && !err_path;
     assign f4f6f8_sel = f4f6f8_supported && !err_path;
     assign int8_sel = int8_supported && !err_path;
     assign fp4_sel = fp4_supported && !err_path;
@@ -519,8 +503,8 @@ module tcgen05_dot_adapter (
     always_comb begin
         selected_core = CORE_NONE;
         selected_is_fp4 = 1'b0;
-        if (mid_fp_sel) begin
-            selected_core = CORE_MIDFP;
+        if (f16tf32_sel) begin
+            selected_core = CORE_F16TF32;
         end else if (f4f6f8_sel) begin
             selected_core = CORE_F4F6F8;
         end else if (int8_sel) begin
@@ -533,87 +517,85 @@ module tcgen05_dot_adapter (
 
     assign b_tf32_core   = sparse_req ? select_b_2to4_32(b_vec_i, sparse_meta_i) : b_vec_i[255:0];
     assign b_fp16_core   = sparse_req ? select_b_2to4_16(b_vec_i, sparse_meta_i) : b_vec_i[255:0];
-    assign b_mid_fp_core = (kind_i == TCGEN05_KIND_TF32) ? b_tf32_core : b_fp16_core;
+    assign b_f16tf32_core = (kind_i == TCGEN05_KIND_TF32) ? b_tf32_core : b_fp16_core;
     assign b_8b_core     = sparse_req ? select_b_2to4_8(b_vec_i, sparse_meta_i)  : b_vec_i[255:0];
     assign b_6b_core     = sparse_req ? select_b_2to4_6(b_vec_i, sparse_meta_i)  : b_vec_i[255:0];
     assign b_4b_core     = sparse_req ? select_b_2to4_4(b_vec_i, sparse_meta_i)  : b_vec_i[255:0];
     assign b_fp4_core    = sparse_req ? select_b_4to8_4(b_vec_i, sparse_meta_i) : b_vec_i[255:0];
-    assign int8_a_unsigned = (a_type_i == TCGEN05_TYPE_U8);
-    assign int8_b_unsigned = (b_type_i == TCGEN05_TYPE_U8);
-    assign b_type_e2m1_sel = (b_type_i == TCGEN05_TYPE_E2M1);
-    assign b_type_fp6_sel  = (b_type_i == TCGEN05_TYPE_E2M3) ||
-                             (b_type_i == TCGEN05_TYPE_E3M2);
-    assign f4f6f8_b_core   = b_type_e2m1_sel ? b_4b_core :
-                             (b_type_fp6_sel ? b_6b_core : b_8b_core);
+    assign f4f6f8_b_vec  = (b_type_i == TCGEN05_TYPE_E2M1) ? b_4b_core :
+                           (((b_type_i == TCGEN05_TYPE_E2M3) ||
+                             (b_type_i == TCGEN05_TYPE_E3M2)) ? b_6b_core : b_8b_core);
 
-    assign mid_fp_a_mode = (kind_i == TCGEN05_KIND_TF32) ? MID_FP_MODE_TF32 :
-                           ((a_type_i == TCGEN05_TYPE_BF16) ? MID_FP_MODE_BF16 :
-                                                              MID_FP_MODE_FP16);
-    assign mid_fp_b_mode = (kind_i == TCGEN05_KIND_TF32) ? MID_FP_MODE_TF32 :
-                           ((b_type_i == TCGEN05_TYPE_BF16) ? MID_FP_MODE_BF16 :
-                                                              MID_FP_MODE_FP16);
+    assign f16tf32_a_dtype = (kind_i == TCGEN05_KIND_TF32) ? DOT_F16TF32_DTYPE_TF32 :
+                           ((a_type_i == TCGEN05_TYPE_BF16) ? DOT_F16TF32_DTYPE_BF16 :
+                                                              DOT_F16TF32_DTYPE_FP16);
+    assign f16tf32_b_dtype = (kind_i == TCGEN05_KIND_TF32) ? DOT_F16TF32_DTYPE_TF32 :
+                           ((b_type_i == TCGEN05_TYPE_BF16) ? DOT_F16TF32_DTYPE_BF16 :
+                                                              DOT_F16TF32_DTYPE_FP16);
 
     always_comb begin
-        f4f6f8_a_type = F4F6F8_TYPE_E4M3;
+        f4f6f8_a_dtype = DOT_F4F6F8_DTYPE_E4M3;
         case (a_type_i)
-            TCGEN05_TYPE_E5M2: f4f6f8_a_type = F4F6F8_TYPE_E5M2;
-            TCGEN05_TYPE_E2M3: f4f6f8_a_type = F4F6F8_TYPE_E2M3;
-            TCGEN05_TYPE_E3M2: f4f6f8_a_type = F4F6F8_TYPE_E3M2;
-            TCGEN05_TYPE_E2M1: f4f6f8_a_type = F4F6F8_TYPE_E2M1;
-            default:           f4f6f8_a_type = F4F6F8_TYPE_E4M3;
+            TCGEN05_TYPE_E5M2: f4f6f8_a_dtype = DOT_F4F6F8_DTYPE_E5M2;
+            TCGEN05_TYPE_E2M3: f4f6f8_a_dtype = DOT_F4F6F8_DTYPE_E2M3;
+            TCGEN05_TYPE_E3M2: f4f6f8_a_dtype = DOT_F4F6F8_DTYPE_E3M2;
+            TCGEN05_TYPE_E2M1: f4f6f8_a_dtype = DOT_F4F6F8_DTYPE_E2M1;
+            default:           f4f6f8_a_dtype = DOT_F4F6F8_DTYPE_E4M3;
         endcase
     end
 
     always_comb begin
-        f4f6f8_b_type = F4F6F8_TYPE_E4M3;
+        f4f6f8_b_dtype = DOT_F4F6F8_DTYPE_E4M3;
         case (b_type_i)
-            TCGEN05_TYPE_E5M2: f4f6f8_b_type = F4F6F8_TYPE_E5M2;
-            TCGEN05_TYPE_E2M3: f4f6f8_b_type = F4F6F8_TYPE_E2M3;
-            TCGEN05_TYPE_E3M2: f4f6f8_b_type = F4F6F8_TYPE_E3M2;
-            TCGEN05_TYPE_E2M1: f4f6f8_b_type = F4F6F8_TYPE_E2M1;
-            default:           f4f6f8_b_type = F4F6F8_TYPE_E4M3;
+            TCGEN05_TYPE_E5M2: f4f6f8_b_dtype = DOT_F4F6F8_DTYPE_E5M2;
+            TCGEN05_TYPE_E2M3: f4f6f8_b_dtype = DOT_F4F6F8_DTYPE_E2M3;
+            TCGEN05_TYPE_E3M2: f4f6f8_b_dtype = DOT_F4F6F8_DTYPE_E3M2;
+            TCGEN05_TYPE_E2M1: f4f6f8_b_dtype = DOT_F4F6F8_DTYPE_E2M1;
+            default:           f4f6f8_b_dtype = DOT_F4F6F8_DTYPE_E4M3;
         endcase
     end
 
     assign f4f6f8_mx_en = (kind_i == TCGEN05_KIND_MXF8F6F4);
 
-    assign fp4_mode = (scale_type_i == TCGEN05_SCALE_UE4M3) ? FP4_MODE_NVFP4 :
+    assign fp4_mode = (scale_type_i == TCGEN05_SCALE_UE4M3) ? DOT_FP4_MODE_NVFP4 :
                       (((scale_type_i == TCGEN05_SCALE_UE8M0) &&
                         ((scale_vec_i == TCGEN05_SCALE_VEC_4X) ||
-                         (scale_vec_i == TCGEN05_SCALE_VEC_BLOCK16))) ? FP4_MODE_MXFP4_4X :
-                       ((scale_type_i == TCGEN05_SCALE_UE8M0) ? FP4_MODE_MXFP4 :
-                                                                FP4_MODE_FP4));
+                         (scale_vec_i == TCGEN05_SCALE_VEC_BLOCK16))) ? DOT_FP4_MODE_MXFP4_4X :
+                       ((scale_type_i == TCGEN05_SCALE_UE8M0) ? DOT_FP4_MODE_MXFP4 :
+                                                                DOT_FP4_MODE_FP4));
 
     assign c_core = enable_input_d_i ? c_i : 32'h0000_0000;
 
     assign in_rdy_o = (!busy_q && !err_vld_q) &&
                       (err_path ||
-                       (mid_fp_sel && mid_fp_in_rdy) ||
+                       (f16tf32_sel && f16tf32_in_rdy) ||
                        (f4f6f8_sel && f4f6f8_in_rdy) ||
                        (int8_sel && int8_in_rdy) ||
                        (fp4_sel && fp4_in_rdy));
 
     assign issue_fire = in_vld_i && in_rdy_o;
 
-    assign mid_fp_in_vld = issue_fire && mid_fp_sel;
+    assign f16tf32_in_vld = issue_fire && f16tf32_sel;
     assign f4f6f8_in_vld   = issue_fire && f4f6f8_sel;
     assign int8_in_vld   = issue_fire && int8_sel;
     assign fp4_in_vld    = issue_fire && fp4_sel;
+    assign int8_a_unsigned = (a_type_i == TCGEN05_TYPE_U8);
+    assign int8_b_unsigned = (b_type_i == TCGEN05_TYPE_U8);
 
-    mid_fp_dot_prod u_mid_fp_dot_prod (
+    f16tf32_dot_prod u_f16tf32_dot_prod (
         .clk      (clk),
         .rst_n    (rst_n),
-        .in_vld_i (mid_fp_in_vld),
-        .in_rdy_o (mid_fp_in_rdy),
-        .a_mode_i (mid_fp_a_mode),
-        .b_mode_i (mid_fp_b_mode),
+        .in_vld_i (f16tf32_in_vld),
+        .in_rdy_o (f16tf32_in_rdy),
+        .a_dtype_i (f16tf32_a_dtype),
+        .b_dtype_i (f16tf32_b_dtype),
         .a_vec_i  (a_vec_i),
-        .b_vec_i  (b_mid_fp_core),
+        .b_vec_i  (b_f16tf32_core),
         .c_i      (c_core),
         .scale_input_d_i(scale_input_d_i),
-        .out_vld_o(mid_fp_out_vld),
-        .out_rdy_i(mid_fp_out_rdy),
-        .d_o      (mid_fp_d)
+        .out_vld_o(f16tf32_out_vld),
+        .out_rdy_i(f16tf32_out_rdy),
+        .d_o      (f16tf32_d)
     );
 
     f4f6f8_dot_prod u_f4f6f8_dot_prod (
@@ -622,10 +604,10 @@ module tcgen05_dot_adapter (
         .in_vld_i    (f4f6f8_in_vld),
         .in_rdy_o    (f4f6f8_in_rdy),
         .a_vec_i     (a_vec_i),
-        .b_vec_i     (f4f6f8_b_core),
+        .b_vec_i     (f4f6f8_b_vec),
         .c_i         (c_core),
-        .a_type_i    (f4f6f8_a_type),
-        .b_type_i    (f4f6f8_b_type),
+        .a_dtype_i    (f4f6f8_a_dtype),
+        .b_dtype_i    (f4f6f8_b_dtype),
         .mxfp8_en_i  (f4f6f8_mx_en),
         .a_mx_scale_i(a_sf_i[7:0]),
         .b_mx_scale_i(b_sf_i[7:0]),
@@ -667,7 +649,7 @@ module tcgen05_dot_adapter (
         .d_fp32_o  (fp4_d)
     );
 
-    assign mid_fp_out_rdy = out_rdy_i && busy_q && (active_core_q == CORE_MIDFP) && !active_is_fp4_q;
+    assign f16tf32_out_rdy = out_rdy_i && busy_q && (active_core_q == CORE_F16TF32) && !active_is_fp4_q;
     assign f4f6f8_out_rdy   = out_rdy_i && busy_q && (active_core_q == CORE_F4F6F8);
     assign int8_out_rdy   = out_rdy_i && busy_q && (active_core_q == CORE_INT8);
     assign fp4_out_rdy    = out_rdy_i && busy_q && active_is_fp4_q;
@@ -682,10 +664,10 @@ module tcgen05_dot_adapter (
             status_o = err_status_q;
         end else if (busy_q) begin
             status_o = int8_overflow ? TCGEN05_STATUS_INT_OVERFLOW : TCGEN05_STATUS_OK;
-            if ((active_core_q == CORE_MIDFP) && !active_is_fp4_q) begin
-                out_vld_o = mid_fp_out_vld;
-                d_o = (active_d_type_q == TCGEN05_TYPE_F16) ? {16'h0000, fp32_to_fp16_rne(mid_fp_d)} :
-                                                              mid_fp_d;
+            if ((active_core_q == CORE_F16TF32) && !active_is_fp4_q) begin
+                out_vld_o = f16tf32_out_vld;
+                d_o = (active_d_type_q == TCGEN05_TYPE_F16) ? {16'h0000, fp32_to_fp16_rne(f16tf32_d)} :
+                                                              f16tf32_d;
             end else if (active_core_q == CORE_F4F6F8) begin
                 out_vld_o = f4f6f8_out_vld;
                 d_o = (active_d_type_q == TCGEN05_TYPE_F16) ? {16'h0000, fp32_to_fp16_rne(f4f6f8_d)} :

@@ -125,8 +125,8 @@ async def reset_dut(dut) -> None:
     dut.a_vec_i.value = 0
     dut.b_vec_i.value = 0
     dut.c_i.value = 0
-    dut.a_type_i.value = F4F6F8_TYPE_E4M3
-    dut.b_type_i.value = F4F6F8_TYPE_E4M3
+    dut.a_dtype_i.value = F4F6F8_TYPE_E4M3
+    dut.b_dtype_i.value = F4F6F8_TYPE_E4M3
     dut.mxfp8_en_i.value = 0
     dut.a_mx_scale_i.value = E8M0_BIAS
     dut.b_mx_scale_i.value = E8M0_BIAS
@@ -164,8 +164,8 @@ async def run_case(
     dut.a_vec_i.value = a_bits
     dut.b_vec_i.value = b_bits
     dut.c_i.value = c_bits
-    dut.a_type_i.value = a_type
-    dut.b_type_i.value = b_type
+    dut.a_dtype_i.value = a_type
+    dut.b_dtype_i.value = b_type
     dut.mxfp8_en_i.value = mxfp8_en
     dut.a_mx_scale_i.value = a_mx_scale
     dut.b_mx_scale_i.value = b_mx_scale
@@ -191,8 +191,8 @@ async def f4f6f8_dot_matches_mmasim(dut):
         "a_vec_i",
         "b_vec_i",
         "c_i",
-        "a_type_i",
-        "b_type_i",
+        "a_dtype_i",
+        "b_dtype_i",
         "mxfp8_en_i",
         "a_mx_scale_i",
         "b_mx_scale_i",
@@ -268,12 +268,17 @@ async def f4f6f8_dot_matches_mmasim(dut):
         (FP8_E4M3, [0x38] * 32, [0x38] * 32, fp32_bits(1.0), 127, 0xFF),
         (FP8_E4M3, [0x7F] + [0x00] * 31, [0x38] + [0x00] * 31, fp32_bits(0.0), 128, 126),
         (FP8_E5M2, [0x00] * 32, [0x00] * 32, fp32_bits(3.5), 128, 126),
+        (FP8_E5M2, [0x00] * 32, [0x00] * 32, fp32_bits(3.5), 254, 254),
+        (FP8_E5M2, [0x00] * 32, [0x00] * 32, fp32_bits(-2.25), 0, 0),
+        (FP8_E5M2, [0x00] + [0x00] * 31, [0x7B] + [0x00] * 31, fp32_bits(1.0), 254, 254),
         (FP8_E5M2, [0x00] + [0x00] * 31, [0x7C] + [0x00] * 31, fp32_bits(0.0), 128, 126),
         (FP8_E5M2, [0x7C] + [0x00] * 31, [0x3C] + [0x00] * 31, 0xFF800000, 127, 127),
         (FP8_E5M2, [0x7C] + [0x00] * 31, [0x3C] + [0x00] * 31, 0x7F800000, 127, 127),
         (FP8_E5M2, [0x3C] * 32, [0x3C] * 32, 0x7FC00001, 127, 127),
         (FP8_E4M3, [0x7E] * 32, [0x7E] * 32, fp32_bits(0.0), 254, 254),
+        (FP8_E4M3, [0x38] + [0x00] * 31, [0x38] + [0x00] * 31, fp32_bits(1.0), 254, 254),
         (FP8_E4M3, [0x38] + [0x00] * 31, [0x38] + [0x00] * 31, fp32_bits(0.0), 0, 0),
+        (FP8_E4M3, [0x38] + [0x00] * 31, [0x38] + [0x00] * 31, fp32_bits(1.0), 0, 0),
         (FP8_E4M3, [0x38] + [0x00] * 31, [0x38] + [0x00] * 31, fp32_bits(0.0), 62, 62),
         (FP8_E5M2, [0x3C] + [0x00] * 31, [0x3C] + [0x00] * 31, fp32_bits(0.0), 0, 254),
     ]
@@ -350,6 +355,34 @@ async def f4f6f8_dot_matches_mmasim(dut):
             )
             assert actual == expected, (
                 f"mixed MX directed case a={type_name(a_type)} b={type_name(b_type)} mismatch: "
+                f"got 0x{actual:08x}, expected 0x{expected:08x}"
+            )
+
+            expected = golden(
+                a_bits,
+                b_bits,
+                c_bits,
+                FP8_E4M3,
+                mxfp8_en=1,
+                a_mx_scale=160,
+                b_mx_scale=96,
+                a_type=a_type,
+                b_type=b_type,
+            )
+            actual = await run_case(
+                dut,
+                a_bits,
+                b_bits,
+                c_bits,
+                FP8_E4M3,
+                mxfp8_en=1,
+                a_mx_scale=160,
+                b_mx_scale=96,
+                a_type=a_type,
+                b_type=b_type,
+            )
+            assert actual == expected, (
+                f"mixed non-bias MX directed case a={type_name(a_type)} b={type_name(b_type)} mismatch: "
                 f"got 0x{actual:08x}, expected 0x{expected:08x}"
             )
 

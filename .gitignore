@@ -12,5 +12,12 @@ src/test/cocotb/coverage*.dat
 src/test/cocotb/coverage_annotated*/
 src/test/cocotb/coverage_final*/
 
-reports/yosys_proxy/
-reports/cocotb_large/
+obj_dir/
+
+openroad/**/run/
+openroad/logs/
+openroad/objects/
+openroad/orfs_artifacts/
+openroad/reports/
+openroad/results/
+openroad/runs/

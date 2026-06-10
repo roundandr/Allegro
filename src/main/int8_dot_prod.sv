@@ -28,31 +28,16 @@ module int8_dot_prod (
     output logic         overflow_o
 );
 
-    localparam int ELEM_W    = 8;
-    localparam int NUM_ELEMS = 32;
-    localparam int OP_W      = 9;
-    localparam int PROD_W    = 18;
-    localparam int PSUM_W    = 22;
-    localparam int SUM_W     = 33;
-    localparam int REDUCE_L1_GROUPS = 16;
-    localparam int REDUCE_L2_GROUPS = 8;
-    localparam int REDUCE_L3_GROUPS = 4;
-    localparam int REDUCE_L4_GROUPS = 2;
-    localparam int STAGE0_W = NUM_ELEMS*PROD_W + 32 + 1;
-    localparam int STAGE1_W = PSUM_W + 32 + 1;
-    localparam int STAGE3_W = 32 + 1;
-
-    localparam logic signed [SUM_W-1:0] INT32_MAX_EXT = 33'sh0_7fff_ffff;
-    localparam logic signed [SUM_W-1:0] INT32_MIN_EXT = 33'sh1_8000_0000;
+    import dot_prod_pkg::*;
 
     typedef struct packed {
-        logic signed [NUM_ELEMS*PROD_W-1:0] prod_flat;
+        logic signed [DOT_INT8_NUM_ELEMS*DOT_INT8_PROD_W-1:0] prod_flat;
         logic [31:0]                        c;
         logic                               sat_en;
     } stage0_data_t;
 
     typedef struct packed {
-        logic signed [PSUM_W-1:0] psum;
+        logic signed [DOT_INT8_PSUM_W-1:0] psum;
         logic [31:0]              c;
         logic                     sat_en;
     } stage1_data_t;
@@ -77,43 +62,43 @@ module int8_dot_prod (
     logic s1_rdy;
     logic s3_rdy;
 
-    logic signed [NUM_ELEMS*PROD_W-1:0] s0_prod_flat_tmp;
-    logic signed [REDUCE_L1_GROUPS*PSUM_W-1:0] s1_sum_l1_flat_tmp;
-    logic signed [REDUCE_L2_GROUPS*PSUM_W-1:0] s1_sum_l2_flat_tmp;
-    logic signed [REDUCE_L3_GROUPS*PSUM_W-1:0] s1_sum_l3_flat_tmp;
-    logic signed [REDUCE_L4_GROUPS*PSUM_W-1:0] s1_sum_l4_flat_tmp;
-    logic signed [PSUM_W-1:0] s1_reduce_sum_tmp;
+    logic signed [DOT_INT8_NUM_ELEMS*DOT_INT8_PROD_W-1:0] s0_prod_flat_tmp;
+    logic signed [DOT_INT8_REDUCE_L1_GROUPS*DOT_INT8_PSUM_W-1:0] s1_sum_l1_flat_tmp;
+    logic signed [DOT_INT8_REDUCE_L2_GROUPS*DOT_INT8_PSUM_W-1:0] s1_sum_l2_flat_tmp;
+    logic signed [DOT_INT8_REDUCE_L3_GROUPS*DOT_INT8_PSUM_W-1:0] s1_sum_l3_flat_tmp;
+    logic signed [DOT_INT8_REDUCE_L4_GROUPS*DOT_INT8_PSUM_W-1:0] s1_sum_l4_flat_tmp;
+    logic signed [DOT_INT8_PSUM_W-1:0] s1_reduce_sum_tmp;
 
-    function automatic logic signed [PROD_W-1:0] int8_product(
-        input logic [ELEM_W-1:0] a_i,
-        input logic [ELEM_W-1:0] b_i,
+    function automatic logic signed [DOT_INT8_PROD_W-1:0] int8_product(
+        input logic [DOT_INT8_ELEM_W-1:0] a_i,
+        input logic [DOT_INT8_ELEM_W-1:0] b_i,
         input logic              a_is_unsigned_i,
         input logic              b_is_unsigned_i
     );
-        logic signed [OP_W-1:0] a_ext;
-        logic signed [OP_W-1:0] b_ext;
+        logic signed [DOT_INT8_OP_W-1:0] a_ext;
+        logic signed [DOT_INT8_OP_W-1:0] b_ext;
         begin
             if (a_is_unsigned_i) begin
                 a_ext = $signed({1'b0, a_i});
             end else begin
-                a_ext = $signed({a_i[ELEM_W-1], a_i});
+                a_ext = $signed({a_i[DOT_INT8_ELEM_W-1], a_i});
             end
 
             if (b_is_unsigned_i) begin
                 b_ext = $signed({1'b0, b_i});
             end else begin
-                b_ext = $signed({b_i[ELEM_W-1], b_i});
+                b_ext = $signed({b_i[DOT_INT8_ELEM_W-1], b_i});
             end
 
             int8_product = a_ext * b_ext;
         end
     endfunction
 
-    function automatic logic signed [PSUM_W-1:0] product_to_psum(
-        input logic signed [PROD_W-1:0] product_i
+    function automatic logic signed [DOT_INT8_PSUM_W-1:0] product_to_psum(
+        input logic signed [DOT_INT8_PROD_W-1:0] product_i
     );
         begin
-            product_to_psum = $signed({{(PSUM_W-PROD_W){product_i[PROD_W-1]}},
+            product_to_psum = $signed({{(DOT_INT8_PSUM_W-DOT_INT8_PROD_W){product_i[DOT_INT8_PROD_W-1]}},
                                       product_i});
         end
     endfunction
@@ -137,10 +122,10 @@ module int8_dot_prod (
 
     genvar prod_idx;
     generate
-        for (prod_idx = 0; prod_idx < NUM_ELEMS; prod_idx = prod_idx + 1) begin : gen_s0_product
-            assign s0_prod_flat_tmp[prod_idx*PROD_W +: PROD_W] =
-                int8_product(a_vec_i[prod_idx*ELEM_W +: ELEM_W],
-                             b_vec_i[prod_idx*ELEM_W +: ELEM_W],
+        for (prod_idx = 0; prod_idx < DOT_INT8_NUM_ELEMS; prod_idx = prod_idx + 1) begin : gen_s0_product
+            assign s0_prod_flat_tmp[prod_idx*DOT_INT8_PROD_W +: DOT_INT8_PROD_W] =
+                int8_product(a_vec_i[prod_idx*DOT_INT8_ELEM_W +: DOT_INT8_ELEM_W],
+                             b_vec_i[prod_idx*DOT_INT8_ELEM_W +: DOT_INT8_ELEM_W],
                              a_unsigned_i,
                              b_unsigned_i);
         end
@@ -159,33 +144,33 @@ module int8_dot_prod (
     genvar red3_idx;
     genvar red4_idx;
     generate
-        for (red1_idx = 0; red1_idx < REDUCE_L1_GROUPS; red1_idx = red1_idx + 1) begin : gen_reduce_l1
-            assign s1_sum_l1_flat_tmp[red1_idx*PSUM_W +: PSUM_W] =
-                product_to_psum($signed(s0_q.prod_flat[(2*red1_idx)*PROD_W +: PROD_W])) +
-                product_to_psum($signed(s0_q.prod_flat[(2*red1_idx+1)*PROD_W +: PROD_W]));
+        for (red1_idx = 0; red1_idx < DOT_INT8_REDUCE_L1_GROUPS; red1_idx = red1_idx + 1) begin : gen_reduce_l1
+            assign s1_sum_l1_flat_tmp[red1_idx*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W] =
+                product_to_psum($signed(s0_q.prod_flat[(2*red1_idx)*DOT_INT8_PROD_W +: DOT_INT8_PROD_W])) +
+                product_to_psum($signed(s0_q.prod_flat[(2*red1_idx+1)*DOT_INT8_PROD_W +: DOT_INT8_PROD_W]));
         end
 
-        for (red2_idx = 0; red2_idx < REDUCE_L2_GROUPS; red2_idx = red2_idx + 1) begin : gen_reduce_l2
-            assign s1_sum_l2_flat_tmp[red2_idx*PSUM_W +: PSUM_W] =
-                $signed(s1_sum_l1_flat_tmp[(2*red2_idx)*PSUM_W +: PSUM_W]) +
-                $signed(s1_sum_l1_flat_tmp[(2*red2_idx+1)*PSUM_W +: PSUM_W]);
+        for (red2_idx = 0; red2_idx < DOT_INT8_REDUCE_L2_GROUPS; red2_idx = red2_idx + 1) begin : gen_reduce_l2
+            assign s1_sum_l2_flat_tmp[red2_idx*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W] =
+                $signed(s1_sum_l1_flat_tmp[(2*red2_idx)*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]) +
+                $signed(s1_sum_l1_flat_tmp[(2*red2_idx+1)*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]);
         end
 
-        for (red3_idx = 0; red3_idx < REDUCE_L3_GROUPS; red3_idx = red3_idx + 1) begin : gen_reduce_l3
-            assign s1_sum_l3_flat_tmp[red3_idx*PSUM_W +: PSUM_W] =
-                $signed(s1_sum_l2_flat_tmp[(2*red3_idx)*PSUM_W +: PSUM_W]) +
-                $signed(s1_sum_l2_flat_tmp[(2*red3_idx+1)*PSUM_W +: PSUM_W]);
+        for (red3_idx = 0; red3_idx < DOT_INT8_REDUCE_L3_GROUPS; red3_idx = red3_idx + 1) begin : gen_reduce_l3
+            assign s1_sum_l3_flat_tmp[red3_idx*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W] =
+                $signed(s1_sum_l2_flat_tmp[(2*red3_idx)*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]) +
+                $signed(s1_sum_l2_flat_tmp[(2*red3_idx+1)*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]);
         end
 
-        for (red4_idx = 0; red4_idx < REDUCE_L4_GROUPS; red4_idx = red4_idx + 1) begin : gen_reduce_l4
-            assign s1_sum_l4_flat_tmp[red4_idx*PSUM_W +: PSUM_W] =
-                $signed(s1_sum_l3_flat_tmp[(2*red4_idx)*PSUM_W +: PSUM_W]) +
-                $signed(s1_sum_l3_flat_tmp[(2*red4_idx+1)*PSUM_W +: PSUM_W]);
+        for (red4_idx = 0; red4_idx < DOT_INT8_REDUCE_L4_GROUPS; red4_idx = red4_idx + 1) begin : gen_reduce_l4
+            assign s1_sum_l4_flat_tmp[red4_idx*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W] =
+                $signed(s1_sum_l3_flat_tmp[(2*red4_idx)*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]) +
+                $signed(s1_sum_l3_flat_tmp[(2*red4_idx+1)*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]);
         end
     endgenerate
 
-    assign s1_reduce_sum_tmp = $signed(s1_sum_l4_flat_tmp[0*PSUM_W +: PSUM_W]) +
-                               $signed(s1_sum_l4_flat_tmp[1*PSUM_W +: PSUM_W]);
+    assign s1_reduce_sum_tmp = $signed(s1_sum_l4_flat_tmp[0*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]) +
+                               $signed(s1_sum_l4_flat_tmp[1*DOT_INT8_PSUM_W +: DOT_INT8_PSUM_W]);
 
     always_comb begin
         s1_d = '0;
@@ -194,9 +179,9 @@ module int8_dot_prod (
         s1_d.sat_en = s0_q.sat_en;
     end
 
-    logic signed [SUM_W-1:0] c_ext_s3;
-    logic signed [SUM_W-1:0] psum_ext_s3;
-    logic signed [SUM_W-1:0] sum_s3;
+    logic signed [DOT_INT8_SUM_W-1:0] c_ext_s3;
+    logic signed [DOT_INT8_SUM_W-1:0] psum_ext_s3;
+    logic signed [DOT_INT8_SUM_W-1:0] sum_s3;
     logic                    pos_overflow_s3;
     logic                    neg_overflow_s3;
 
@@ -204,11 +189,11 @@ module int8_dot_prod (
         s3_d = '0;
 
         c_ext_s3    = $signed({s1_q.c[31], s1_q.c});
-        psum_ext_s3 = $signed({{(SUM_W-PSUM_W){s1_q.psum[PSUM_W-1]}}, s1_q.psum});
+        psum_ext_s3 = $signed({{(DOT_INT8_SUM_W-DOT_INT8_PSUM_W){s1_q.psum[DOT_INT8_PSUM_W-1]}}, s1_q.psum});
         sum_s3      = c_ext_s3 + psum_ext_s3;
 
-        pos_overflow_s3 = sum_s3 > INT32_MAX_EXT;
-        neg_overflow_s3 = sum_s3 < INT32_MIN_EXT;
+        pos_overflow_s3 = sum_s3 > DOT_INT8_INT32_MAX_EXT;
+        neg_overflow_s3 = sum_s3 < DOT_INT8_INT32_MIN_EXT;
 
         s3_d.result   = pack_int32(sum_s3[31:0], s1_q.sat_en,
                                    pos_overflow_s3, neg_overflow_s3);
@@ -216,7 +201,7 @@ module int8_dot_prod (
     end
 
     pipeline_reg #(
-        .W(STAGE0_W)
+        .W(DOT_INT8_STAGE0_W)
     ) u_stage0_reg (
         .clk      (clk),
         .rst_n    (rst_n),
@@ -229,7 +214,7 @@ module int8_dot_prod (
     );
 
     pipeline_reg #(
-        .W(STAGE1_W)
+        .W(DOT_INT8_STAGE1_W)
     ) u_stage1_reg (
         .clk      (clk),
         .rst_n    (rst_n),
@@ -242,7 +227,7 @@ module int8_dot_prod (
     );
 
     pipeline_reg #(
-        .W(STAGE3_W)
+        .W(DOT_INT8_STAGE3_W)
     ) u_stage3_reg (
         .clk      (clk),
         .rst_n    (rst_n),

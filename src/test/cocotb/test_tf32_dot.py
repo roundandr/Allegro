@@ -31,8 +31,8 @@ def case_dump(a_bits: int, b_bits: int, c_bits: int, scale_input_d: int = 0) -> 
 async def reset_dut(dut) -> None:
     dut.in_vld_i.value = 0
     dut.out_rdy_i.value = 1
-    dut.a_mode_i.value = 0
-    dut.b_mode_i.value = 0
+    dut.a_dtype_i.value = 0
+    dut.b_dtype_i.value = 0
     dut.a_vec_i.value = 0
     dut.b_vec_i.value = 0
     dut.c_i.value = 0
@@ -61,8 +61,8 @@ async def run_case(
     dut.b_vec_i.value = b_bits
     dut.c_i.value = c_bits
     dut.scale_input_d_i.value = scale_input_d
-    dut.a_mode_i.value = 0
-    dut.b_mode_i.value = 0
+    dut.a_dtype_i.value = 0
+    dut.b_dtype_i.value = 0
     dut.in_vld_i.value = 1
     await RisingEdge(dut.clk)
     dut.in_vld_i.value = 0
@@ -108,8 +108,8 @@ async def tf32_dot_matches_mmasim(dut):
         "rst_n",
         "in_vld_i",
         "in_rdy_o",
-        "a_mode_i",
-        "b_mode_i",
+        "a_dtype_i",
+        "b_dtype_i",
         "a_vec_i",
         "b_vec_i",
         "c_i",

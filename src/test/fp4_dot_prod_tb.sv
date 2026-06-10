@@ -175,6 +175,19 @@ module tb_fp4_dot_prod;
         end
         c_fp32_i = 32'h2d80_0000;
         send_and_check(a_fp4_i, b_fp4_i, a_sf_i, b_sf_i, c_fp32_i,
+                       32'h3080_0000, "large_cancel_keeps_aligned_c");
+
+        clear_vectors();
+        for (int i = 0; i < 16; i++) begin
+            set_elem(a_fp4_i, i, fp4_code(1'b0, 3'd7));
+            set_elem(b_fp4_i, i, fp4_code(1'b0, 3'd7));
+        end
+        for (int i = 16; i < 32; i++) begin
+            set_elem(a_fp4_i, i, fp4_code(1'b1, 3'd7));
+            set_elem(b_fp4_i, i, fp4_code(1'b0, 3'd7));
+        end
+        c_fp32_i = 32'h2d80_0000;
+        send_and_check(a_fp4_i, b_fp4_i, a_sf_i, b_sf_i, c_fp32_i,
                        32'h0000_0000, "large_cancel_truncates_tiny_c");
 
         clear_vectors();

@@ -1,33 +1,36 @@
 // ============================================================================
-// File Name   : f4f6f8_dot_prod.sv
+// File Name   : f4f6f8_s0_s2_frontend.sv
 // Author      : LIU YUXUAN
-// Date        : 2026-04-22
-// Description : 32-element FP4/FP6/FP8/MX low-precision dot-product with FP32
-//               accumulate. The datapath follows the 6-stage FDA pipeline
-//               defined in doc/F4F6F8_DotProd.md.
-//
-// Revision History:
-//   Date        Version   Author      Description
-//   ----------  --------  ----------  ----------------------------------------
-//   2026-04-22  v0.1      LIU YUXUAN       Initial version
+// Date        : 2026-06-03
+// Description : F4/F6/F8 S0-S2 frontend for the shared F16TF32/F4F6F8 dot-product
+//               tail.  The output payload is a 33-term signed fixed-point
+//               vector ready for the shared accumulation tree.
 // ============================================================================
 
-module f4f6f8_dot_prod (
+module f4f6f8_s0_s2_frontend #(
+    parameter int META_W = 16
+) (
     input  logic         clk,
     input  logic         rst_n,
+
     input  logic         in_vld_i,
     output logic         in_rdy_o,
+    input  logic [2:0]   f4f6f8_dtype_i,
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
-    input  logic [2:0]   a_dtype_i,
-    input  logic [2:0]   b_dtype_i,
     input  logic         mxfp8_en_i,
     input  logic [7:0]   a_mx_scale_i,
     input  logic [7:0]   b_mx_scale_i,
+    input  logic [META_W-1:0] meta_i,
+
     output logic         out_vld_o,
     input  logic         out_rdy_i,
-    output logic [31:0]  d_o
+    output logic [1088:0] term_flat_o,
+    output logic signed [9:0] base_exp_o,
+    output logic         special_vld_o,
+    output logic [31:0]  special_result_o,
+    output logic [META_W-1:0] meta_o
 );
 
     import dot_prod_pkg::*;
@@ -51,6 +54,7 @@ module f4f6f8_dot_prod (
     } fp32_dec_t;
 
     typedef struct packed {
+        logic [META_W-1:0]              meta;
         logic                           special_vld;
         logic [31:0]                    special_result;
         logic [DOT_F4F6F8_NUM_ELEMS-1:0]           prod_sign_flat;
@@ -67,6 +71,7 @@ module f4f6f8_dot_prod (
     } stage0_data_t;
 
     typedef struct packed {
+        logic [META_W-1:0]              meta;
         logic                           special_vld;
         logic [31:0]                    special_result;
         logic [DOT_F4F6F8_NUM_ELEMS-1:0]           prod_sign_flat;
@@ -82,64 +87,31 @@ module f4f6f8_dot_prod (
         logic                           emax_vld;
     } stage1_data_t;
 
+    localparam int SHARED_SUM_W  = DOT_F4F6F8_SUM_W;
+    localparam int SHARED_EXP_W  = DOT_F4F6F8_FULL_EXP_W;
+    localparam int SHARED_TERM_N = DOT_F4F6F8_NUM_ELEMS + 1;
+
     typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
-        logic [DOT_F4F6F8_NUM_ELEMS*DOT_F4F6F8_ALIGN_TERM_W-1:0] aligned_prod_flat;
-        logic signed [DOT_F4F6F8_ALIGN_TERM_W-1:0]    c_aligned;
-        logic signed [DOT_F4F6F8_FULL_EXP_W-1:0]   base_exp;
+        logic [META_W-1:0] meta;
+        logic [SHARED_TERM_N*SHARED_SUM_W-1:0] term_flat;
+        logic signed [SHARED_EXP_W-1:0] base_exp;
+        logic special_vld;
+        logic [31:0] special_result;
     } stage2_data_t;
-
-    typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
-        logic [DOT_F4F6F8_ACC_PARTIALS*DOT_F4F6F8_SUM_W-1:0]  partial_sum_flat;
-        logic signed [DOT_F4F6F8_FULL_EXP_W-1:0]   base_exp;
-    } stage3_data_t;
-
-    typedef struct packed {
-        logic                           special_vld;
-        logic [31:0]                    special_result;
-        logic signed [DOT_F4F6F8_SUM_W-1:0]        sum;
-        logic signed [DOT_F4F6F8_FULL_EXP_W-1:0]   base_exp;
-    } stage4_data_t;
-
-    typedef struct packed {
-        logic [31:0] result;
-    } stage5_data_t;
 
     stage0_data_t s0_pre_d;
     stage0_data_t s0_d;
     stage1_data_t s1_pre_d;
     stage1_data_t s1_d;
     stage2_data_t s2_d;
-    stage3_data_t s3_pre_d;
-    stage3_data_t s3_d;
-    stage4_data_t s4_d;
-    stage5_data_t s5_d;
-
     stage0_data_t s0_q;
     stage1_data_t s1_q;
     stage2_data_t s2_q;
-    stage3_data_t s3_q;
-    stage4_data_t s4_q;
-    stage5_data_t s5_q;
-
     logic s0_vld_q;
     logic s1_vld_q;
     logic s2_vld_q;
-    logic s3_vld_q;
-    logic s4_vld_q;
-    logic s5_vld_q;
-
     logic s1_rdy;
     logic s2_rdy;
-    logic s3_rdy;
-    logic s4_rdy;
-    logic s5_rdy;
-
-    logic [31:0] s5_pack_result;
-
     logic [DOT_F4F6F8_NUM_ELEMS-1:0]                    s0_prod_sign_flat_tmp;
     logic [DOT_F4F6F8_NUM_ELEMS*(DOT_F4F6F8_ALIGN_TERM_W-1)-1:0]   s0_prod_mag_flat_tmp;
     logic [DOT_F4F6F8_NUM_ELEMS*DOT_F4F6F8_PROD_EXP_W-1:0]         s0_prod_exp_flat_tmp;
@@ -154,25 +126,14 @@ module f4f6f8_dot_prod (
     logic [DOT_F4F6F8_NUM_ELEMS*DOT_F4F6F8_PROD_EXP_W-1:0]         s1_prod_exp_q_flat;
     logic [DOT_F4F6F8_NUM_ELEMS-1:0]                    s1_prod_zero_q_flat;
 
-    logic [DOT_F4F6F8_NUM_ELEMS*DOT_F4F6F8_ALIGN_TERM_W-1:0] s2_aligned_prod_flat_tmp;
-    logic [DOT_F4F6F8_NUM_ELEMS*DOT_F4F6F8_ALIGN_TERM_W-1:0] s2_aligned_prod_q_flat;
-    logic [DOT_F4F6F8_NUM_ELEMS*DOT_F4F6F8_ALIGN_TERM_W-1:0] s2_prod_aligned_flat;
-    logic signed [DOT_F4F6F8_ALIGN_TERM_W-1:0]               s2_c_aligned;
-    logic [DOT_F4F6F8_ACC_PARTIALS*DOT_F4F6F8_SUM_W-1:0]     s3_partial_sum_flat_tmp;
-    logic [DOT_F4F6F8_ACC_PARTIALS*DOT_F4F6F8_SUM_W-1:0]     s3_partial_sum_q_flat;
-    logic [8*DOT_F4F6F8_SUM_W-1:0]                           s3_sum8_term_flat [0:3];
-    logic signed [DOT_F4F6F8_SUM_W-1:0]                      s3_sum8_out [0:3];
-    logic signed [DOT_F4F6F8_SUM_W-1:0]                      s3_term_tmp [0:DOT_F4F6F8_NUM_ELEMS];
-    logic signed [DOT_F4F6F8_SUM_W-1:0]                      s3_partial_sum_tmp [0:DOT_F4F6F8_ACC_PARTIALS-1];
-    logic [DOT_F4F6F8_ACC_PARTIALS*DOT_F4F6F8_SUM_W-1:0]     s4_sum_term_flat;
-    logic signed [DOT_F4F6F8_SUM_W-1:0]                      s4_sum_tree;
+    logic [SHARED_TERM_N*SHARED_SUM_W-1:0]              s2_term_flat_tmp;
+    logic [DOT_F4F6F8_NUM_ELEMS*SHARED_SUM_W-1:0]       s2_prod_aligned_flat;
+    logic signed [SHARED_SUM_W-1:0]                     s2_c_aligned;
 
     assign s1_prod_sign_q_flat = s1_q.prod_sign_flat;
     assign s1_prod_mag_q_flat  = s1_q.prod_mag_flat;
     assign s1_prod_exp_q_flat  = s1_q.prod_exp_flat;
     assign s1_prod_zero_q_flat = s1_q.prod_zero_flat;
-    assign s2_aligned_prod_q_flat = s2_q.aligned_prod_flat;
-    assign s3_partial_sum_q_flat  = s3_q.partial_sum_flat;
 
     function automatic fp8_dec_t decode_fp8(
         input logic [DOT_F4F6F8_FP8_W-1:0] fp8_i,
@@ -414,7 +375,7 @@ module f4f6f8_dot_prod (
         for (s2_align_idx = 0; s2_align_idx < DOT_F4F6F8_NUM_ELEMS; s2_align_idx = s2_align_idx + 1) begin : gen_prod_align
             dot_align_fixed_rz #(
                 .MAG_W (DOT_F4F6F8_ALIGN_TERM_W-1),
-                .TERM_W(DOT_F4F6F8_ALIGN_TERM_W),
+                .TERM_W(SHARED_SUM_W),
                 .EXP_W (DOT_F4F6F8_FULL_EXP_W)
             ) u_prod_align (
                 .term_vld_i (!s1_prod_zero_q_flat[s2_align_idx]),
@@ -425,14 +386,14 @@ module f4f6f8_dot_prod (
                               s1_prod_exp_q_flat[s2_align_idx*DOT_F4F6F8_PROD_EXP_W+DOT_F4F6F8_PROD_EXP_W-1]}},
                               s1_prod_exp_q_flat[s2_align_idx*DOT_F4F6F8_PROD_EXP_W +: DOT_F4F6F8_PROD_EXP_W]})),
                 .emax_i     (s1_q.emax),
-                .term_o     (s2_prod_aligned_flat[s2_align_idx*DOT_F4F6F8_ALIGN_TERM_W +: DOT_F4F6F8_ALIGN_TERM_W])
+                .term_o     (s2_prod_aligned_flat[s2_align_idx*SHARED_SUM_W +: SHARED_SUM_W])
             );
         end
     endgenerate
 
     dot_align_fixed_rz #(
         .MAG_W (DOT_F4F6F8_ALIGN_TERM_W-1),
-        .TERM_W(DOT_F4F6F8_ALIGN_TERM_W),
+        .TERM_W(SHARED_SUM_W),
         .EXP_W (DOT_F4F6F8_FULL_EXP_W)
     ) u_c_align (
         .term_vld_i (!s1_q.c_zero),
@@ -441,41 +402,6 @@ module f4f6f8_dot_prod (
         .term_exp_i (s1_q.c_exp_prod_domain),
         .emax_i     (s1_q.emax),
         .term_o     (s2_c_aligned)
-    );
-
-    genvar s3_part_idx;
-    genvar s3_term_idx;
-    generate
-        for (s3_part_idx = 0; s3_part_idx < 4; s3_part_idx = s3_part_idx + 1) begin : gen_s3_reduce8
-            for (s3_term_idx = 0; s3_term_idx < 8; s3_term_idx = s3_term_idx + 1) begin : gen_s3_reduce8_term
-                assign s3_sum8_term_flat[s3_part_idx][s3_term_idx*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] =
-                    s3_term_tmp[s3_part_idx*8+s3_term_idx];
-            end
-
-            dot_signed_reduce_tree #(
-                .TERM_W(DOT_F4F6F8_SUM_W),
-                .TERM_N(8)
-            ) u_sum8_tree (
-                .term_flat_i(s3_sum8_term_flat[s3_part_idx]),
-                .sum_o      (s3_sum8_out[s3_part_idx])
-            );
-        end
-    endgenerate
-
-    genvar s4_sum_idx;
-    generate
-        for (s4_sum_idx = 0; s4_sum_idx < DOT_F4F6F8_ACC_PARTIALS; s4_sum_idx = s4_sum_idx + 1) begin : gen_s4_sum_terms
-            assign s4_sum_term_flat[s4_sum_idx*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] =
-                s3_partial_sum_q_flat[s4_sum_idx*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W];
-        end
-    endgenerate
-
-    dot_signed_reduce_tree #(
-        .TERM_W(DOT_F4F6F8_SUM_W),
-        .TERM_N(DOT_F4F6F8_ACC_PARTIALS)
-    ) u_s4_sum_tree (
-        .term_flat_i(s4_sum_term_flat),
-        .sum_o      (s4_sum_tree)
     );
 
     integer idx0;
@@ -496,6 +422,7 @@ module f4f6f8_dot_prod (
     logic signed [DOT_F4F6F8_PROD_EXP_W-1:0] lane_prod_exp_tmp;
     always @(*) begin
         s0_pre_d = '0;
+        s0_pre_d.meta = meta_i;
         s0_prod_sign_flat_tmp = '0;
         s0_prod_mag_flat_tmp  = '0;
         s0_prod_exp_flat_tmp  = '0;
@@ -528,7 +455,7 @@ module f4f6f8_dot_prod (
         s0_pre_d.c_mag = c_mag_tmp_s0;
 
         for (idx0 = 0; idx0 < DOT_F4F6F8_NUM_ELEMS; idx0 = idx0 + 1) begin
-            case (a_dtype_i)
+            case (f4f6f8_dtype_i)
                 DOT_F4F6F8_DTYPE_E4M3: begin
                     a_dec_tmp = decode_fp8(a_vec_i[idx0*DOT_F4F6F8_FP8_W +: DOT_F4F6F8_FP8_W], 1'b0);
                 end
@@ -549,7 +476,7 @@ module f4f6f8_dot_prod (
                 end
             endcase
 
-            case (b_dtype_i)
+            case (f4f6f8_dtype_i)
                 DOT_F4F6F8_DTYPE_E4M3: begin
                     b_dec_tmp = decode_fp8(b_vec_i[idx0*DOT_F4F6F8_FP8_W +: DOT_F4F6F8_FP8_W], 1'b0);
                 end
@@ -648,6 +575,7 @@ module f4f6f8_dot_prod (
 
     always @(*) begin
         s1_pre_d = '0;
+        s1_pre_d.meta = s0_q.meta;
         s1_emax_vld_flat_tmp = '0;
         s1_emax_exp_flat_tmp = '0;
 
@@ -682,7 +610,8 @@ module f4f6f8_dot_prod (
 
     always @(*) begin
         s2_d = '0;
-        s2_aligned_prod_flat_tmp = '0;
+        s2_d.meta = s1_q.meta;
+        s2_term_flat_tmp = '0;
         s2_d.special_vld    = s1_q.special_vld;
         s2_d.special_result = s1_q.special_result;
 
@@ -690,86 +619,19 @@ module f4f6f8_dot_prod (
             s2_d.base_exp = s1_q.emax + s1_q.mx_scale_exp_sum - DOT_F4F6F8_ALIGN_FRAC_BITS_EXP;
 
             for (idx2 = 0; idx2 < DOT_F4F6F8_NUM_ELEMS; idx2 = idx2 + 1) begin
-                s2_aligned_prod_flat_tmp[idx2*DOT_F4F6F8_ALIGN_TERM_W +: DOT_F4F6F8_ALIGN_TERM_W] =
-                    s2_prod_aligned_flat[idx2*DOT_F4F6F8_ALIGN_TERM_W +: DOT_F4F6F8_ALIGN_TERM_W];
+                s2_term_flat_tmp[(idx2+1)*SHARED_SUM_W +: SHARED_SUM_W] =
+                    s2_prod_aligned_flat[idx2*SHARED_SUM_W +: SHARED_SUM_W];
             end
 
-            s2_d.c_aligned = s2_c_aligned;
+            s2_term_flat_tmp[0*SHARED_SUM_W +: SHARED_SUM_W] =
+                s2_c_aligned;
         end else begin
             s2_d.base_exp = '0;
-            s2_d.c_aligned = '0;
         end
 
-        s2_d.aligned_prod_flat = s2_aligned_prod_flat_tmp;
+        s2_d.term_flat = s2_term_flat_tmp;
     end
 
-    function automatic logic signed [DOT_F4F6F8_SUM_W-1:0] extend_align_term(
-        input logic signed [DOT_F4F6F8_ALIGN_TERM_W-1:0] term_i
-    );
-        begin
-            extend_align_term = $signed({{(DOT_F4F6F8_SUM_W-DOT_F4F6F8_ALIGN_TERM_W){term_i[DOT_F4F6F8_ALIGN_TERM_W-1]}}, term_i});
-        end
-    endfunction
-
-    integer idx3;
-    always @(*) begin
-        s3_pre_d = '0;
-        s3_pre_d.special_vld    = s2_q.special_vld;
-        s3_pre_d.special_result = s2_q.special_result;
-        s3_pre_d.base_exp       = s2_q.base_exp;
-
-        for (idx3 = 0; idx3 < DOT_F4F6F8_NUM_ELEMS + 1; idx3 = idx3 + 1) begin
-            s3_term_tmp[idx3] = '0;
-        end
-        s3_term_tmp[0] = extend_align_term(s2_q.c_aligned);
-        for (idx3 = 0; idx3 < DOT_F4F6F8_NUM_ELEMS; idx3 = idx3 + 1) begin
-            s3_term_tmp[idx3+1] =
-                extend_align_term(s2_aligned_prod_q_flat[idx3*DOT_F4F6F8_ALIGN_TERM_W +: DOT_F4F6F8_ALIGN_TERM_W]);
-        end
-
-    end
-
-    always @(*) begin
-        s3_d = s3_pre_d;
-        s3_partial_sum_flat_tmp = '0;
-        s3_partial_sum_tmp[0] = s3_sum8_out[0];
-        s3_partial_sum_tmp[1] = s3_sum8_out[1];
-        s3_partial_sum_tmp[2] = s3_sum8_out[2];
-        s3_partial_sum_tmp[3] = s3_sum8_out[3];
-        s3_partial_sum_tmp[4] = s3_term_tmp[32];
-
-        s3_partial_sum_flat_tmp[0*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] = s3_partial_sum_tmp[0];
-        s3_partial_sum_flat_tmp[1*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] = s3_partial_sum_tmp[1];
-        s3_partial_sum_flat_tmp[2*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] = s3_partial_sum_tmp[2];
-        s3_partial_sum_flat_tmp[3*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] = s3_partial_sum_tmp[3];
-        s3_partial_sum_flat_tmp[4*DOT_F4F6F8_SUM_W +: DOT_F4F6F8_SUM_W] = s3_partial_sum_tmp[4];
-        s3_d.partial_sum_flat = s3_partial_sum_flat_tmp;
-    end
-
-    always @(*) begin
-        s4_d = '0;
-        s4_d.special_vld    = s3_q.special_vld;
-        s4_d.special_result = s3_q.special_result;
-        s4_d.base_exp       = s3_q.base_exp;
-        s4_d.sum            = s4_sum_tree;
-    end
-
-    always @(*) begin
-        s5_d = '0;
-        s5_d.result = s5_pack_result;
-    end
-
-    dot_fp32_rz_norm_pack #(
-        .SUM_W(DOT_F4F6F8_SUM_W),
-        .EXP_W(DOT_F4F6F8_FULL_EXP_W),
-        .CANONICALIZE_ZERO_RESULT(1'b0)
-    ) u_dot_fp32_rz_norm_pack (
-        .sum_i           (s4_q.sum),
-        .base_exp_i      (s4_q.base_exp),
-        .special_vld_i   (s4_q.special_vld),
-        .special_result_i(s4_q.special_result),
-        .result_o        (s5_pack_result)
-    );
 
     pipeline_reg #(
         .W($bits(stage0_data_t))
@@ -806,50 +668,15 @@ module f4f6f8_dot_prod (
         .in_ready (s2_rdy),
         .in_data  (s2_d),
         .out_valid(s2_vld_q),
-        .out_ready(s3_rdy),
+        .out_ready(out_rdy_i),
         .out_data (s2_q)
     );
 
-    pipeline_reg #(
-        .W($bits(stage3_data_t))
-    ) u_stage3_reg (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .in_valid (s2_vld_q),
-        .in_ready (s3_rdy),
-        .in_data  (s3_d),
-        .out_valid(s3_vld_q),
-        .out_ready(s4_rdy),
-        .out_data (s3_q)
-    );
-
-    pipeline_reg #(
-        .W($bits(stage4_data_t))
-    ) u_stage4_reg (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .in_valid (s3_vld_q),
-        .in_ready (s4_rdy),
-        .in_data  (s4_d),
-        .out_valid(s4_vld_q),
-        .out_ready(s5_rdy),
-        .out_data (s4_q)
-    );
-
-    pipeline_reg #(
-        .W($bits(stage5_data_t))
-    ) u_stage5_reg (
-        .clk      (clk),
-        .rst_n    (rst_n),
-        .in_valid (s4_vld_q),
-        .in_ready (s5_rdy),
-        .in_data  (s5_d),
-        .out_valid(s5_vld_q),
-        .out_ready(out_rdy_i),
-        .out_data (s5_q)
-    );
-
-    assign out_vld_o = s5_vld_q;
-    assign d_o       = s5_q.result;
+    assign out_vld_o        = s2_vld_q;
+    assign term_flat_o      = s2_q.term_flat;
+    assign base_exp_o       = s2_q.base_exp;
+    assign special_vld_o    = s2_q.special_vld;
+    assign special_result_o = s2_q.special_result;
+    assign meta_o           = s2_q.meta;
 
 endmodule

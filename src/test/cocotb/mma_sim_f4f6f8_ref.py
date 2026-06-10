@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import sys
+import math
 from pathlib import Path
 
 
@@ -11,7 +12,7 @@ if str(MMA_SIM_ROOT) not in sys.path:
     sys.path.insert(0, str(MMA_SIM_ROOT))
 
 import torch
-from mmasim.simulator.arithmetic import nv_fused_dot_add
+from mmasim.simulator.arithmetic import extract_significand_exponent, fused_sum
 
 
 FP8_E4M3 = 0
@@ -79,6 +80,10 @@ def is_fp32_inf(bits: int) -> bool:
     exponent = (bits >> 23) & 0xFF
     fraction = bits & 0x7FFFFF
     return exponent == 0xFF and fraction == 0
+
+
+def is_fp32_zero(bits: int) -> bool:
+    return (bits & 0x7FFFFFFF) == 0
 
 
 def fp32_sign(bits: int) -> int:
@@ -207,12 +212,6 @@ def f4f6f8_tensor(raw_values: list[int], value_type: int) -> torch.Tensor:
     return fp6_tensor(raw_values, FP6_E2M3)
 
 
-def e8m0_scale(raw: int) -> torch.Tensor:
-    if raw == 0xFF:
-        return torch.tensor(float("nan"), dtype=torch.float64)
-    return torch.tensor(2.0 ** (raw - E8M0_BIAS), dtype=torch.float64)
-
-
 class F4F6F8DotMmaSimGolden:
     def __init__(self, n_fractional_bits: int = FP8_ACC_FRAC_BITS):
         self.n_fractional_bits = n_fractional_bits
@@ -294,13 +293,34 @@ class F4F6F8DotMmaSimGolden:
         a = f4f6f8_tensor(a_raw, a_type)
         b = f4f6f8_tensor(b_raw, b_type)
         c = torch.tensor(bits_to_float32(c_bits), dtype=torch.float32)
-        result = nv_fused_dot_add(
-            a=a,
-            b=b,
-            c=c,
-            n_fractional_bits=self.n_fractional_bits,
-            output_type="f32",
-            scale_a=e8m0_scale(a_mx_scale) if mxfp8_en else None,
-            scale_b=e8m0_scale(b_mx_scale) if mxfp8_en else None,
-        )
-        return float32_to_bits(result.item())
+
+        scale_exp_sum = (a_mx_scale - E8M0_BIAS) + (b_mx_scale - E8M0_BIAS) if mxfp8_en else 0
+        significands = []
+        exponents = []
+
+        if not is_fp32_zero(c_bits):
+            sc, ec = extract_significand_exponent(c, torch.float32)
+            significands.append(sc)
+            exponents.append(ec)
+
+        for lane_idx, (a_lane, b_lane) in enumerate(zip(a_raw, b_raw)):
+            if f4f6f8_is_zero(a_lane, a_type) or f4f6f8_is_zero(b_lane, b_type):
+                continue
+
+            sa, ea = extract_significand_exponent(a[lane_idx])
+            sb, eb = extract_significand_exponent(b[lane_idx])
+            significands.append(sa * sb)
+            exponents.append(ea + eb + scale_exp_sum)
+
+        if not significands:
+            return 0
+
+        s, e = fused_sum(significands, exponents, self.n_fractional_bits)
+        if s != s:
+            return CANONICAL_NAN_BITS
+        if s + 1 == s:
+            return float32_to_bits(torch.tensor(s, dtype=torch.float32).item())
+
+        s, e = extract_significand_exponent(s * 2.0**e, torch.float32)
+        s = math.trunc(s * 2.0**23) * 2.0**-23
+        return float32_to_bits(torch.tensor(s * 2.0**e, dtype=torch.float32).item())

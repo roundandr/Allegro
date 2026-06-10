@@ -1,4 +1,4 @@
-# MID-FP Dot Product FDA Unit Spec
+# F16TF32 Dot Product FDA Unit Spec
 
 ## 1. 设计目标
 
@@ -13,8 +13,8 @@ D = C + Σ(A[k] × B[k])
 
 | 项目 | 规格 |
 | --- | --- |
-| 主 RTL 文件 | `src/main/mid_fp_dot_prod.sv` |
-| 主模块 | `mid_fp_dot_prod` |
+| 主 RTL 文件 | `src/main/f16tf32_dot_prod.sv` |
+| 主模块 | `f16tf32_dot_prod` |
 | 输入 A/B | TF32 模式为 8 个 FP32 编码值；BF16/FP16 模式为 16 个 16-bit 编码值 |
 | 输入 C | FP32 |
 | 输出 D | FP32 |
@@ -34,7 +34,7 @@ D = C + Σ(A[k] × B[k])
 1. 删除独立 TF32 dot8 core 与 FP16/BF16 dot16 core 之间重复的 mantissa multiplier、exponent add、align、accumulate、pack 硬件。
 2. 保持 TF32 单 request 只占 1 个 cycle 输入吞吐，不把 TF32 K8 拆成两拍或与 FP16 做 time-mux。
 3. 将 TF32/BF16/FP16 的输入 decode 差异限制在 S0，其后进入统一 11-bit significand + signed unbiased exponent datapath。
-4. 允许 `a_mode_i` / `b_mode_i` 随 request 逐拍变化；是否禁止不同 dtype 短窗口交错由上层 `dot_cluster_top` 的 admission policy 决定。
+4. 允许 `a_dtype_i` / `b_dtype_i` 随 request 逐拍变化；是否禁止不同 dtype 短窗口交错由上层 `dot_cluster_top` 的 admission policy 决定。
 
 ## 2. 顶层接口
 
@@ -43,13 +43,13 @@ D = C + Σ(A[k] × B[k])
 实现采用工程内统一 valid-ready 风格，输入向量为 flat packed bus。
 
 ```systemverilog
-module mid_fp_dot_prod (
+module f16tf32_dot_prod (
     input  logic         clk,
     input  logic         rst_n,
     input  logic         in_vld_i,
     output logic         in_rdy_o,
-    input  logic [1:0]   a_mode_i,
-    input  logic [1:0]   b_mode_i,
+    input  logic [1:0]   a_dtype_i,
+    input  logic [1:0]   b_dtype_i,
     input  logic [255:0] a_vec_i,
     input  logic [255:0] b_vec_i,
     input  logic [31:0]  c_i,
@@ -66,8 +66,8 @@ module mid_fp_dot_prod (
 | `rst_n` | 1 | input | 低有效异步复位 |
 | `in_vld_i` | 1 | input | 输入有效 |
 | `in_rdy_o` | 1 | output | 输入可接收 |
-| `a_mode_i` | 2 | input | A 输入格式模式，编码见 2.2 |
-| `b_mode_i` | 2 | input | B 输入格式模式，编码见 2.2 |
+| `a_dtype_i` | 2 | input | A 输入格式模式，编码见 2.2 |
+| `b_dtype_i` | 2 | input | B 输入格式模式，编码见 2.2 |
 | `a_vec_i` | 256 | input | A packed 输入向量 |
 | `b_vec_i` | 256 | input | B packed 输入向量 |
 | `c_i` | 32 | input | FP32 累加输入 C |
@@ -93,12 +93,12 @@ out_fire = out_vld_o & out_rdy_i
 ### 2.2 模式编码
 
 ```systemverilog
-localparam logic [1:0] MID_FP_MODE_TF32 = 2'd0;
-localparam logic [1:0] MID_FP_MODE_BF16 = 2'd1;
-localparam logic [1:0] MID_FP_MODE_FP16 = 2'd2;
+localparam logic [1:0] F16TF32_MODE_TF32 = 2'd0;
+localparam logic [1:0] F16TF32_MODE_BF16 = 2'd1;
+localparam logic [1:0] F16TF32_MODE_FP16 = 2'd2;
 ```
 
-| `a_mode_i` / `b_mode_i` | 模式 | Dot width | A/B packed 布局 |
+| `a_dtype_i` / `b_dtype_i` | 模式 | Dot width | A/B packed 布局 |
 | --- | --- | ---: | --- |
 | `2'd0` | TF32 | 8 | `a_vec_i[k*32 +: 32]` / `b_vec_i[k*32 +: 32]`, `k=0..7` |
 | `2'd1` | BF16 | 16 | `a_vec_i[k*16 +: 16]` / `b_vec_i[k*16 +: 16]`, `k=0..15` |
@@ -109,9 +109,9 @@ TF32 模式下，`a_vec_i[255:0]` 正好承载 8 个 FP32 bit pattern。共享 d
 
 ### 2.3 集成边界
 
-RTL 只提供一个综合/集成入口：`mid_fp_dot_prod`。TF32、BF16、FP16 由同一套 shared datapath 执行，上层通过 `a_mode_i` / `b_mode_i` 分别选择 A/B 精度。
+RTL 只提供一个综合/集成入口：`f16tf32_dot_prod`。TF32、BF16、FP16 由同一套 shared datapath 执行，上层通过 `a_dtype_i` / `b_dtype_i` 分别选择 A/B 精度。
 
-不再提供按精度拆分的兼容 wrapper，避免上层误实例化多个 wrapper 后复制多份 mid-FP core。若某个旧单元测试需要数组形式输入，应在 testbench 内完成 pack，不应在 RTL 中增加 wrapper module。
+不再提供按精度拆分的兼容 wrapper，避免上层误实例化多个 wrapper 后复制多份 f16tf32 core。若某个旧单元测试需要数组形式输入，应在 testbench 内完成 pack，不应在 RTL 中增加 wrapper module。
 
 ## 3. Pipeline
 
@@ -119,15 +119,15 @@ RTL 只提供一个综合/集成入口：`mid_fp_dot_prod`。TF32、BF16、FP16 
 
 | Stage | RTL payload | 功能 |
 | --- | --- | --- |
-| S0 | `stage0_data_t` | 输入寄存；按 `a_mode_i` / `b_mode_i` 解码 TF32/BF16/FP16 A/B；生成 lane valid mask；执行 C operand `scale-input-d` 预处理并解码 FP32 C；NaN/Inf/`0*Inf` 特殊值检测 |
-| S1 | `stage1_data_t` | 16 路 11-bit significand 乘法；product sign/exponent/zero 生成；平衡比较树搜索并寄存 `emax` |
+| S0 | `stage0_data_t` | 输入寄存；按 `a_dtype_i` / `b_dtype_i` 解码 TF32/BF16/FP16 A/B；生成 lane valid mask；执行 C operand `scale-input-d` 预处理并解码 FP32 C；NaN/Inf/`0*Inf` 特殊值检测；生成 16 路 product sign/significand/exponent/zero |
+| S1 | `stage1_data_t` | 透传 product payload；平衡比较树搜索并寄存 `emax` |
 | S2 | `stage2_data_t` | product/C 转换到 F=25；使用寄存后的 `emax` 对齐到 signed Q7.25 |
 | S3 | `stage3_data_t` | 16 products + C 的 33-bit signed Q7.25 累加；无效 lane 累加项为 0 |
 | S4 | `stage4_data_t` | 特殊值选择或 FP32 normalize + RZ pack |
 
 Latency 为 5 个 `pipeline_reg` stage。无 stall 时，输入 fire 后第 5 个有效流水输出对应结果；持续 ready 时可每周期吞吐 1 个 dot。
 
-说明：当前 TF32 独立实现是 4-stage。合并到 `mid_fp_dot_prod` 后，TF32 latency 增加到 5-stage，但吞吐保持 1 req/cycle。
+说明：当前 TF32 独立实现是 4-stage。合并到 `f16tf32_dot_prod` 后，TF32 latency 增加到 5-stage，但吞吐保持 1 req/cycle。
 
 ## 4. TF32/BF16/FP16 解码
 
@@ -142,7 +142,7 @@ typedef struct packed {
     logic                    is_zero;
     logic                    is_inf;
     logic                    is_nan;
-} mid_fp_dec_t;
+} f16tf32_dec_t;
 ```
 
 `valid=0` 的 lane 必须满足：
@@ -291,7 +291,7 @@ typedef struct packed {
 C 是 NaN
 任意 valid A[k] × B[k] 出现 0 × ∞ 或 ∞ × 0
 同时存在 +∞ 和 -∞
-`a_mode_i` 或 `b_mode_i` 为 reserved 且实现选择防御性返回 NaN
+`a_dtype_i` 或 `b_dtype_i` 为 reserved 且实现选择防御性返回 NaN
 ```
 
 输出：
@@ -324,7 +324,7 @@ C 是 NaN
 | 只存在 `-∞` | `32'hff80_0000` |
 | 不存在 Inf / NaN | 进入普通 datapath |
 
-## 7. MID-FP Product
+## 7. F16TF32 Product
 
 对每个 lane：
 
@@ -509,7 +509,7 @@ sum_fixed = aligned_c_signed
 
 TF32 模式下，`aligned_p_signed[8..15]` 必须为 0，因此数学等价于 K=8 dot。
 
-实现中可以沿用 combinational loop 累加到 `sum_acc_tmp`。由于所有输入都已经完成 F=25 RZ 对齐，累加过程不再产生额外舍入。数学上加法顺序不影响结果；实现形式可后续替换为 balanced adder tree 以优化时序。
+实现中使用固定层级的 balanced adder tree 将 17 个 term 规约为 1 个 `sum_fixed`。由于所有输入都已经完成 F=25 RZ 对齐，累加过程不再产生额外舍入；按本规格数值边界，tree 内部使用 `SUM_W` 宽度不会溢出。
 
 ## 11. FP32 Normalize + RZ Pack
 
@@ -582,13 +582,13 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 
 ## 12. RTL 结构
 
-建议实现将这些功能以内联 function、struct payload 和 5 个 `pipeline_reg` 实例组织在 `mid_fp_dot_prod` 中。
+建议实现将这些功能以内联 function、struct payload 和 5 个 `pipeline_reg` 实例组织在 `f16tf32_dot_prod` 中。
 
 | 规格功能 | RTL 实现 |
 | --- | --- |
-| TF32/BF16/FP16 decode | `function automatic mid_fp_dec_t decode_mid_fp` |
+| TF32/BF16/FP16 decode | `function automatic f16tf32_dec_t decode_f16tf32` |
 | FP32 decode | `function automatic fp32_dec_t decode_fp32` |
-| lane valid mask | S0 根据 `a_mode_i` / `b_mode_i` 和 lane index 生成 |
+| lane valid mask | S0 根据 `a_dtype_i` / `b_dtype_i` 和 lane index 生成 |
 | special case handler | S0 `always_comb`，所有 A/B special 统计受 `lane_valid` gating |
 | shared product array | S1 `always_comb` loop，16 路 `11 × 11` |
 | product exponent adder | S1 `a_exp + b_exp`，16 路 signed 10-bit |
@@ -613,8 +613,8 @@ sig24    = norm_sum[SUM_W-1 -: 24]
 
 | 设计点 | RTL 对齐后的规格 |
 | --- | --- |
-| 主模块 | `mid_fp_dot_prod` |
-| 输入格式 | `a_mode_i` / `b_mode_i` = TF32/BF16/FP16 |
+| 主模块 | `f16tf32_dot_prod` |
+| 输入格式 | `a_dtype_i` / `b_dtype_i` = TF32/BF16/FP16 |
 | valid-ready | 主模块支持 `in_vld_i/in_rdy_o/out_vld_o/out_rdy_i` |
 | TF32 packed 布局 | `a_vec_i[k*32 +: 32]` / `b_vec_i[k*32 +: 32]`，`k=0..7` |
 | BF16/FP16 packed 布局 | `a_vec_i[k*16 +: 16]` / `b_vec_i[k*16 +: 16]`，`k=0..15` |
@@ -694,26 +694,26 @@ TF32_RZ(x) = {x.sign, x.exp, x.frac[22:13]}
 随机等价覆盖：
 
 ```text
-mid_fp_dot_prod(mode=TF32) == tf32_dot_prod
-mid_fp_dot_prod(mode=BF16) == fp16_dot_prod(fmt_is_bf16_i=1)
-mid_fp_dot_prod(mode=FP16) == fp16_dot_prod(fmt_is_bf16_i=0)
+f16tf32_dot_prod(mode=TF32) == tf32_dot_prod
+f16tf32_dot_prod(mode=BF16) == fp16_dot_prod(fmt_is_bf16_i=1)
+f16tf32_dot_prod(mode=FP16) == fp16_dot_prod(fmt_is_bf16_i=0)
 ```
 
 顶层集成覆盖：
 
 | 类型 | 场景 |
 | --- | --- |
-| Dense dispatch | `dot_cluster_top` 将 TF32/BF16/FP16 发入同一个 `mid_fp_dot_prod` |
-| Sparse dispatch | A-side 2:4 compaction 后的 physical vector 发入 `mid_fp_dot_prod` |
+| Dense dispatch | `dot_cluster_top` 将 TF32/BF16/FP16 发入同一个 `f16tf32_dot_prod` |
+| Sparse dispatch | B-side 2:4 compaction 后的 physical vector 发入 `f16tf32_dot_prod` |
 | Metadata alignment | TF32/BF16/FP16 response metadata 均使用 5-cycle latency |
-| Resource group | TF32/BF16/FP16 均归入 `SHARE_GROUP_MIDFP` |
+| Resource group | TF32/BF16/FP16 均归入 `SHARE_GROUP_F16TF32` |
 
 目标：
 
 ```text
 Verilator lint clean
-MID-FP unit directed/regression PASS
+F16TF32 unit directed/regression PASS
 dot_cluster_top regression PASS
-mid_fp_dot_prod line/branch coverage >= 90%
+f16tf32_dot_prod line/branch coverage >= 90%
 dot_cluster_top branch coverage = 100%
 ```
