@@ -1,0 +1,16 @@
+src/main/blackwell_pkg.sv
+src/main/tcgen05_mma_pkg.sv
+src/main/utils/dot_prod_pkg.sv
+src/main/utils/dot_fp32_rz_norm_pack.sv
+src/main/utils/dot_signed_reduce_tree.sv
+src/main/utils/dot_emax_tree.sv
+src/main/utils/dot_align_fixed_rz.sv
+src/main/utils/pipeline_reg.sv
+src/main/f16tf32_dot_prod.sv
+src/main/f4f6f8_dot_prod.sv
+src/main/int8_dot_prod.sv
+src/main/fp4_dot_prod.sv
+src/main/tcgen05_dot_adapter.sv
+src/main/tmem_array.sv
+src/main/tcgen05_tensor_wrapper.sv
+src/main/blackwell_tensor_subsystem.sv

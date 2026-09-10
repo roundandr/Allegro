@@ -2,6 +2,9 @@
 
 Allegro 是一个多精度 dot-product RTL 实验仓库，当前重点是 `dot_cluster_top` 以及面向 NVIDIA-style Tensor Core 数据格式的 bit-accurate 验证。RTL 使用 SystemVerilog，参考模型使用本仓库 vendor 的 `MMA-Sim`。
 
+本分支同时包含独立的 Blackwell-style TMA、Tensor Core、mbarrier 和 TMEM
+子系统，复用同仓库的 TCGen05 算术 RTL，并提供接口规范和独立功能回归。
+
 ## Repository Layout
 
 - `src/main/`: synthesizable SystemVerilog RTL。
@@ -34,6 +37,68 @@ top request
 - `fp4_dot_prod`: NVFP4/MXFP4/FP4 block-scale dot-product 独立路径。
 
 `dot_cluster_top` 对 B operand 支持结构化 sparse compaction。A operand 不做 sparse selection。`outstanding_q` 和 `active_share_group_q` 用于 share-group admission，避免同一物理流水里跨模式乱序。
+
+## Blackwell Subsystem
+
+| 模块 | 当前实现 | 实现规范 |
+| --- | --- | --- |
+| Tensor Core | 8 路 FP16 dot，固定 `M64N8K16`，FP16×FP16→FP32，覆盖/累加 | [Tensor Core 与现有 TMEM](doc/tensor_core_spec.md) |
+| TMEM | 默认 8 banks×128×32 bit，双 tile slot，1R1W/1RW/2R1W 仲裁 | [当前实现](doc/tensor_core_spec.md#tmem-contract) |
+| TMA | 1–5D tensor 与 linear 双向搬运、descriptor cache、乱序响应及越界处理 | [TMA spec](doc/tma_spec.md) |
+| mbarrier | arrival/transaction 联合计数、phase、wait CAM、memory-backed 状态及错误恢复 | [mbarrier spec](doc/mbarrier_spec.md) |
+
+[TMEM 扩展设计目标](doc/tmem_spec.md) 仍处于尚未实现状态，其中 allocation、
+tcgen05.ld/st/cp 等能力不属于当前 `tmem_array`。原有 `doc/tma.md` 和
+`doc/mbarrier.md` 保留为背景说明；本子系统的实现接口以表中的 spec 为准。
+本工程依据公开语义设计，不是 NVIDIA 私有 RTL 或周期精确模型。
+
+```text
+blackwell_tma_mbarrier_top
+├── blackwell_tensor_subsystem
+│   ├── tcgen05_tensor_wrapper → tcgen05_dot_adapter
+│   └── tmem_array
+└── tma_mbarrier_subsystem
+    ├── tma_engine
+    └── mbarrier_unit
+```
+
+连接顶层把旧 `TMA_REQ` 转为实际的 256-byte GMEM→SMEM 搬运，并提供完整的
+TMA 与 mbarrier 命令接口。Tensor 的 SMEM A/B/写回端口与 TMA 的 SMEM 端口
+分别对外暴露，由使用方连接内存后端。参见
+[TMA/mbarrier 语义映射与集成边界](doc/tma_mbarrier_patent_mapping.md)。
+
+子系统复用当前 checkout 的 `src/main` 算术源码，版本由 Allegro 的 Git 提交
+确定，无需外部 `deps/Allegro`。FP4、INT8 等源码仍是 adapter 内部实例化所需，
+不能因子系统只开放 FP16 就移除这些编译引用。
+
+Blackwell lint 和仿真仅在配置的 RTX 5080 主机执行，使用其 CPU；本地用于编辑
+和静态文件检查。验证环境为 Bash、GNU Make、C++ 编译器、Verilator 5.020、
+Python 3、Cocotb 1.9.2 和 NumPy。在远端工程根目录运行：
+
+```bash
+make lint-blackwell
+make test-blackwell
+```
+
+`make test-blackwell` 先 lint 三个顶层，再运行五组测试的 11 个配置：
+
+- TMA/mbarrier：1–5D、所有元素宽度、双向搬运、乱序与背压、barrier 顺序与错误恢复。
+- TMEM：默认、1RW、2R1W，覆盖双 slot、bank 冲突和停顿 payload。
+- Tensor wrapper：0/1/2 级输出寄存，覆盖 8 路 FP16 和输出背压。
+- Tensor subsystem：默认和两个参数组合，覆盖完整 tile、覆盖/累加、同步和 SMEM 背压。
+- 兼容顶层：旧 `TMA_REQ` 的真实 256-byte 搬运和完成顺序。
+
+可用 `JOBS=4 make test-blackwell` 设置编译并行度，默认 4；
+`COCOTB_RANDOM_SEED` 默认 `20260813`。日志、编译文件和每个配置的 `results.xml`
+统一位于被忽略的 `build/blackwell/`，不使用原有算术测试的构建目录。
+驱动脚本位于 `src/test/blackwell_common.sh`、`src/test/lint_blackwell.sh` 和
+`src/test/run_blackwell_tests.sh`；既有 Cocotb Makefile 与命令继续可用。
+
+编译 filelist 均以仓库根目录为工作目录：
+
+- [Tensor/TMEM](src/main/blackwell_tensor_filelist.f)
+- [独立 TMA/mbarrier](src/main/tma_mbarrier_filelist.f)
+- [四模块连接顶层](src/main/blackwell_subsystem_filelist.f)
 
 ## Environment Setup
 

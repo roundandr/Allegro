@@ -12,6 +12,8 @@ src/test/cocotb/coverage_final*/
 
 obj_dir/
 
+/build/blackwell/
+
 MMA-Sim/.github/
 
 openroad/experiments/
