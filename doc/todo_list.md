@@ -1,14 +1,10 @@
 # 📋 Todo List
 
-### 🔍 Nvidia Hopper 异步拷贝及 mbarrier
-* **异步拷贝流程**
-    * 在 SMEM 中构建 mbarrier
-    * TMA 解析 TensorMap 并发出拷贝请求
-    * GMEM、SMEM 执行拷贝(mbarrier.test_wait)
-    * mbarrier complete phase 唤醒等待的 warp
-* **硬件支持**：
-  * **SMEM** (Scratchpad)
-  * **TMA** (TensorMap AddrGen, Data FIFO, Request FIFO, TMA context)
+### TMA 与 mbarrier
+
+实现状态与后续缺口统一维护在 [TMA spec](tma_spec.md) 和
+[mbarrier spec](mbarrier_spec.md)。copy 发出搬运，wait 检查完成；
+global→shared 使用 mbarrier 字节计数，shared→global 使用 bulk-group。
 ---
 
 ### 🔎 Nvidia Blackwell TensorCore 5th Generation PTX

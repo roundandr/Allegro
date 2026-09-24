@@ -3,12 +3,12 @@
 __pycache__/
 *.py[cod]
 
-src/test/cocotb/results.xml
-src/test/cocotb/sim_build/
-src/test/cocotb/sim_build_*/
-src/test/cocotb/coverage*.dat
-src/test/cocotb/coverage_annotated*/
-src/test/cocotb/coverage_final*/
+verification/cocotb/results.xml
+verification/cocotb/sim_build/
+verification/cocotb/sim_build_*/
+verification/cocotb/coverage*.dat
+verification/cocotb/coverage_annotated*/
+verification/cocotb/coverage_final*/
 
 obj_dir/
 

@@ -13,7 +13,7 @@ D = C + Σ(A[k] × B[k])
 
 | 项目 | 规格 |
 | --- | --- |
-| 主 RTL 文件 | `src/main/f16tf32_dot_prod.sv` |
+| 主 RTL 文件 | `rtl/dot/f16tf32_dot_prod.sv` |
 | 主模块 | `f16tf32_dot_prod` |
 | 输入 A/B | TF32 模式为 8 个 FP32 编码值；BF16/FP16 模式为 16 个 16-bit 编码值 |
 | 输入 C | FP32 |
@@ -672,9 +672,9 @@ TF32_RZ(x) = {x.sign, x.exp, x.frac[22:13]}
 
 | 模式 | 参考实现 |
 | --- | --- |
-| TF32 | `src/main/tf32_dot_prod.sv` |
-| BF16 | `src/main/fp16_dot_prod.sv` with `fmt_is_bf16_i=1` |
-| FP16 | `src/main/fp16_dot_prod.sv` with `fmt_is_bf16_i=0` |
+| TF32 | `rtl/dot/tf32_dot_prod.sv` |
+| BF16 | `rtl/dot/fp16_dot_prod.sv` with `fmt_is_bf16_i=1` |
+| FP16 | `rtl/dot/fp16_dot_prod.sv` with `fmt_is_bf16_i=0` |
 
 单元级 directed 覆盖：
 

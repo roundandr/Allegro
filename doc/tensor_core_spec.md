@@ -12,11 +12,11 @@ This document specifies `tcgen05_tensor_wrapper`, `tmem_array`, and
 It excludes sparse modes, dynamic precision, GPU/CTA scheduling, real SRAM
 macros, and a software-visible instruction encoding.
 
-The tensor subsystem exposes a legacy TMA proxy. The separate
-`tma_mbarrier_subsystem` implements data movement and memory-backed barriers,
-specified in [TMA](tma_spec.md) and [mbarrier](mbarrier_spec.md).
-`blackwell_tma_mbarrier_top` connects both subsystems; its legacy adapter
-performs a real 256-byte linear load before returning `tma_done`.
+The separate `tma_mbarrier_subsystem` implements data movement and barriers
+through the unified command interfaces specified in [TMA](tma_spec.md) and
+[mbarrier](mbarrier_spec.md). `blackwell_tma_mbarrier_top` exposes both control
+paths. Callers explicitly wait for TMA data before submitting dependent Tensor
+operations; Tensor COMMIT/WAIT tracks only Tensor work.
 
 The [TMEM design target](tmem_spec.md) describes future, unimplemented
 capabilities. The implemented TMEM contract is the one below.
@@ -58,22 +58,19 @@ The command channel is valid-ready. Payload remains stable while stalled.
 
 | Opcode | Value | Meaning |
 | --- | --- | --- |
-| `TMA_REQ` | 0 | Emit an asynchronous proxy transfer request |
 | `MMA` | 1 | Fetch B, process 64 A rows, and update one TMEM slot |
 | `COMMIT` | 2 | Capture accepted asynchronous-work watermark |
 | `WAIT` | 3 | Complete after all work at or before a token retires |
 | `STORE` | 4 | Read one TMEM slot and write 64 rows to SMEM |
-| `MBARRIER_WAIT` | 5 | Wait for a barrier ID to reach the requested phase |
 
 Fields are: 16-bit transaction tag, 32-bit A/B/destination bases, one-bit
-tile slot, one-bit accumulate, 4-bit barrier ID, one-bit phase, and 16-bit
+tile slot, one-bit accumulate, and 16-bit
 wait token. Completion returns tag, opcode, 8-bit status, and 16-bit token.
 
-Only one MMA or STORE is executed at a time. TMA requests may remain
-outstanding while later commands execute. The implementation conservatively
-advances its retired watermark when all outstanding asynchronous work has
-completed. This satisfies WAIT ordering, although a WAIT may be delayed by
-work newer than its token.
+Only one MMA or STORE is executed at a time. COMMIT captures the accepted
+Tensor watermark and WAIT completes after the covered Tensor operations retire.
+TMA operation completion is tracked separately by its mbarrier or bulk-group.
+Opcode values 0 and 5 are invalid; no implicit TMA dependency scoreboard exists.
 
 ## Memory interfaces
 
@@ -82,9 +79,6 @@ work newer than its token.
 - The write channel carries address, 256-bit data, 32-bit byte mask, source
   tag, and receives a tagged 2-bit-status response.
 - A and B use independent read channels.
-- The TMA proxy carries tag, source/destination address, 16-bit byte count,
-  barrier ID, and phase. The harness owns data movement and later returns
-  `TmaDone`; no GMEM or L2 is modeled here.
 
 ## TMEM contract
 
@@ -101,11 +95,9 @@ are reset, and software/tests must initialize a row before reading it.
 
 ## Synchronization
 
-- Work watermark increments when TMA, MMA, or STORE work is accepted.
+- Work watermark increments when MMA or STORE work is accepted.
 - `COMMIT` returns the current 16-bit issued watermark.
 - `WAIT(token)` completes only when the retired watermark is at least token.
-- `TmaDone(barrierId, phase)` updates a 16-entry barrier phase table.
-- `MBARRIER_WAIT` completes when the indexed phase equals the requested phase.
 - Watermark comparison is non-wrapping in v1; reset before 16-bit wrap.
 
 ## Performance counters

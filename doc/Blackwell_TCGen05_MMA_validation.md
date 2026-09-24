@@ -6,11 +6,11 @@ Date: 2026-05-22
 
 This validation covers the repo-local TCGen05 scalar-dot adapter:
 
-- RTL: `src/main/tcgen05_dot_adapter.sv`
-- Package: `src/main/tcgen05_mma_pkg.sv`
+- RTL: `rtl/tensor_core/tcgen05_dot_adapter.sv`
+- Package: `rtl/tensor_core/tcgen05_mma_pkg.sv`
 - Inventory: `doc/Blackwell_TCGen05_MMA.json`
-- Cocotb tests: `src/test/cocotb/test_tcgen05_mma.py`
-- Golden model: `src/test/cocotb/mma_sim_tcgen05_ref.py`
+- Cocotb tests: `verification/cocotb/test_tcgen05_mma.py`
+- Golden model: `verification/cocotb/mma_sim_tcgen05_ref.py`
 
 The adapter validates one `(A row, B column, C)` scalar dot selected from each
 TCGen05 semantic MMA row. It does not model TMEM allocation, TMA, commit/wait,
@@ -39,7 +39,7 @@ Total TCGen05 DUT transactions in the full run:
 ## Command
 
 ```bash
-cd /Users/liuyuxuan/work/Allegro/src/test/cocotb
+cd verification/cocotb
 PYTHONPATH=/Users/liuyuxuan/Library/Python/3.13/lib/python/site-packages \
 make SIM=verilator \
   TOPLEVEL=tcgen05_dot_adapter \
@@ -69,7 +69,7 @@ The FP4 dot unit was also run directly against the MMA-Sim NVFP4/MXFP4 golden,
 including the new `FP4_MODE_MXFP4_4X` block16 path:
 
 ```bash
-cd /Users/liuyuxuan/work/Allegro/src/test/cocotb
+cd verification/cocotb
 COMPILE_ARGS='-Wno-fatal -CFLAGS -isystem/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1' \
 PYTHONPATH=/Users/liuyuxuan/Library/Python/3.13/lib/python/site-packages \
 make SIM=verilator \

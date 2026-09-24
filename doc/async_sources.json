@@ -1,0 +1,20 @@
+{
+  "retrieved_utc": "2026-09-17T08:50:02.299033+00:00",
+  "sources": [
+    {
+      "url": "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html",
+      "sha256": "0aa31c15735a30b5d7c0fa1fe02570dcd37fe80800afca74bcc96c9132b81fed",
+      "bytes": 3928316
+    },
+    {
+      "url": "https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html",
+      "sha256": "619a5d157c831b8c066f1cd061a43b71f2117f7eaeb653c7282021aad3446d06",
+      "bytes": 203225
+    },
+    {
+      "url": "https://docs.nvidia.com/cuda/blackwell-tuning-guide/",
+      "sha256": "6139025da03bfc04274b0fb791f7c1c016b8b1cda599a0c28153e5baae01cd0b",
+      "bytes": 26365
+    }
+  ]
+}

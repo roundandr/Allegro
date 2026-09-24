@@ -1,0 +1,13 @@
+{
+  "top": "f16tf32_dot_prod",
+  "seeds": [917, 918, 919],
+  "warmup_cycles": 256,
+  "measure_cycles": 10000,
+  "period_ps": 1000,
+  "input_slew_ps": 50,
+  "io_delay_ps": 100,
+  "output_load_ff": 3.898,
+  "flops_per_result": 32,
+  "regression_cases": 1000,
+  "image": "sha256:e4e71714221bbabba09242c03d3c093af07f6231d4a76de17ecc6408061c6802"
+}

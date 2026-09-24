@@ -1,9 +1,12 @@
-# RISC-V Asynchronous Tensor Core Instruction Set (Ztma + Ztmma)
+# RISC-V Asynchronous Tensor Core Instruction Set (Ztmma proposal)
 
 **Version:** 0.1-Draft  
 **Status:** Experimental Research Proposal  
 **Authors:** Liu Yuxuan 
-**Inspired by:** NVIDIA Hopper (WGMMA / TMA / mbarrier)  
+**Inspired by:** NVIDIA Hopper WGMMA
+
+This is an unimplemented arithmetic ISA proposal. For TMA and synchronization,
+use the authoritative [TMA spec](tma_spec.md) and [mbarrier spec](mbarrier_spec.md).
 
 ---
 
@@ -12,9 +15,7 @@
 This document defines a proposed **RISC-V custom extension** for high-throughput **asynchronous matrix multiply-accumulate (MMA)** operations, modeled after NVIDIA Hopper’s **WGMMA + TMA + mbarrier** execution style.
 
 The extension enables:
-- Asynchronous tensor data movement (GMEM ↔ SMEM)
 - Warpgroup-level asynchronous tensor computation
-- Fine-grained barrier synchronization
 - Commit / wait groups for overlapped pipeline scheduling
 
 This ISA is suitable for SIMT GPUs, many-core accelerators, and experimental tensor engines.
@@ -58,23 +59,17 @@ Shape encodings are implementation-specific and programmable through instruction
 | Instruction | Syntax | Description |
 |--------------|---------|--------------|
 | `tc.sdesc.set` | `tc.sdesc.set sda, [smem_base], lda, layout, swizzle, bits, group` | Define SMEM operand descriptor (for A/B tiles). |
-| `tc.tdesc.set` | `tc.tdesc.set t0, gptr, shapeXYZ, pitchXYZ, bits, swizzle, group` | Define TMA (GMEM tensor) descriptor. |
 | `tc.acc.zero` | `tc.acc.zero cgrp` | Clear accumulator registers in the current WG. |
 | `tc.acc.scale` | `tc.acc.scale cgrp, imm|freg` | Apply scale or quantization factor. |
 | `tc.acc.cast` | `tc.acc.cast cgrp, dtype` | Convert accumulator datatype (for epilogue). |
 
 ---
 
-### 4.2 Asynchronous Tensor Memory Accelerator (TMA)
+### 4.2 Data movement and synchronization
 
-| Instruction | Syntax | Description |
-|--------------|---------|--------------|
-| `tc.tma.load.async` | `tc.tma.load.async [sda], t0, offsX, offsY, mbar` | Asynchronously load GMEM → SMEM tile; signals barrier arrival. |
-| `tc.tma.store.async` | `tc.tma.store.async t0, [sdc], offsX, offsY, mbar` | Asynchronously store SMEM → GMEM tile; barrier arrival on completion. |
-| `tc.mbarrier.init` | `tc.mbarrier.init mbar, expect` | Initialize barrier with expected arrival count. |
-| `tc.mbarrier.arrive` | `tc.mbarrier.arrive mbar, count` | Producer signals barrier arrival. |
-| `tc.mbarrier.wait` | `tc.mbarrier.wait mbar` | Consumer waits until barrier completion. |
-| `tc.mbarrier.test` | `tc.mbarrier.test p, mbar` | Non-blocking test of barrier status. |
+See [TMA completion domains](tma_spec.md) and [barrier lifecycle](mbarrier_spec.md).
+Loads account transaction bytes through mbarrier; stores use per-thread
+bulk-groups. The old custom TMA/barrier instruction proposal has been retired.
 
 ---
 
@@ -108,3 +103,4 @@ Example quantized epilogue:
 tc.acc.scale    c0, scale
 tc.acc.cast     c0, bf16
 tc.c.store.smem [sdc], c0, ldc, pack_q
+```
